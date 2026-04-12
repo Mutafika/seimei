@@ -43,7 +43,7 @@ var<uniform> light_view_proj: mat4x4<f32>;
 
 const PI: f32 = 3.14159265359;
 const SHADOW_MAP_SIZE: f32 = 2048.0;
-const SHADOW_BIAS: f32 = 0.005;
+const SHADOW_BIAS: f32 = 0.05;
 
 // === PBR Functions ===
 fn distribution_ggx(n_dot_h: f32, roughness: f32) -> f32 {
@@ -172,6 +172,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
+
+    // アルファテスト: 半透明テクスチャのZファイティング防止
+    if (tex_color.a < 0.5) {
+        discard;
+    }
 
     let metallic = clamp(in.material.x, 0.0, 1.0);
     let roughness = clamp(in.material.y, 0.04, 1.0);

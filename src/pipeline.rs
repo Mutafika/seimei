@@ -291,7 +291,16 @@ fn create_main_pipeline_impl(
             depth_write_enabled: depth_write,
             depth_compare: wgpu::CompareFunction::Less,
             stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
+            bias: if depth_write {
+                wgpu::DepthBiasState::default()
+            } else {
+                // 半透明パス: depth biasで手前に引き出してZファイティング防止
+                wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                }
+            },
         }),
         multisample: wgpu::MultisampleState {
             count: msaa_samples,

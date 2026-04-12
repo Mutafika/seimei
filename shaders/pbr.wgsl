@@ -161,6 +161,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // テクスチャサンプリング
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
 
+    // アルファテスト
+    if (tex_color.a < 0.5) {
+        discard;
+    }
+
     // マテリアルパラメータ
     let metallic = clamp(in.material.x, 0.0, 1.0);
     let roughness = clamp(in.material.y, 0.04, 1.0);
