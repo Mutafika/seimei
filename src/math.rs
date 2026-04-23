@@ -16,6 +16,10 @@ impl Point3 {
         Self { x, y, z }
     }
 
+    pub fn new_f32(x: f32, y: f32, z: f32) -> Self {
+        Self { x: x as f64, y: y as f64, z: z as f64 }
+    }
+
     pub const fn origin() -> Self {
         Self::new(0.0, 0.0, 0.0)
     }
@@ -89,6 +93,10 @@ pub struct Vec3D {
 impl Vec3D {
     pub const fn new(x: f64, y: f64, z: f64) -> Self {
         Self { x, y, z }
+    }
+
+    pub fn new_f32(x: f32, y: f32, z: f32) -> Self {
+        Self { x: x as f64, y: y as f64, z: z as f64 }
     }
 
     pub const fn zero() -> Self {

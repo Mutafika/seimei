@@ -43,5 +43,6 @@ pub use shadow::{create_shadow_pipeline, SHADOW_MAP_SIZE};
 pub use post_process::{PostProcessPipeline, GBuffer, SsaoPass, BloomPass, EdgeBevelPass};
 pub use dof::{DofPass, DofParams};
 pub use ssr::SsrPass;
+pub mod procedural;
 #[cfg(feature = "gltf")]
 pub use gltf::{load_gltf, load_gltf_from_bytes, GltfScene, GltfPrimitive, GltfMaterial, GltfError};
