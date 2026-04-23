@@ -11,7 +11,7 @@ use wgpu::util::DeviceExt;
 
 use crate::{
     Camera, CameraUniform, GpuLight, GpuVertex, InstanceData,
-    Light, LightHeader, LightKind, LightStorageData, LineVertex, TextureManager,
+    Light, LightHeader, LightKind, LightStorageData, LightUniform, LineVertex, TextureManager,
     RenderMesh, GaussianCloud,
     pipeline,
     shadow::{SHADOW_MAP_SIZE, POINT_SHADOW_ATLAS_SIZE, POINT_SHADOW_TILE_SIZE, MAX_POINT_SHADOW_CASTERS},
@@ -78,9 +78,7 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     // Group 1: Lights
-    light_header_buffer: wgpu::Buffer,
-    light_storage_buffer: wgpu::Buffer,
-    light_storage_capacity: usize,
+    light_uniform_buffer: wgpu::Buffer,
     light_bind_group: wgpu::BindGroup,
     pub light_bind_group_layout: wgpu::BindGroupLayout,
     // Group 2: Textures
@@ -100,6 +98,8 @@ pub struct Renderer {
     meshes: HashMap<String, MeshInstance>,
     // State
     clear_color: wgpu::Color,
+    /// trueの場合、render_to_viewでClearをスキップ（外部で事前描画済みの場合）
+    skip_clear: bool,
     clip_min: [f32; 4],
     clip_max: [f32; 4],
     // === Shadow Map ===
@@ -175,27 +175,15 @@ impl Renderer {
             }],
         });
 
-        // === Group 1: Lights ===
-        let initial_header = LightHeader::default_header();
-        let light_header_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Light Header Buffer"),
-            size: std::mem::size_of::<LightHeader>() as u64,
+        // === Group 1: Lights (Uniform, WebGL2互換) ===
+        let initial_light = LightUniform::default_lighting();
+        let light_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Light Uniform Buffer"),
+            size: std::mem::size_of::<LightUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&light_header_buffer, 0, bytemuck::bytes_of(&initial_header));
-
-        let initial_storage_capacity: usize = 16;
-        let light_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Light Storage Buffer"),
-            size: (std::mem::size_of::<GpuLight>() * initial_storage_capacity) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        {
-            let default_gpu = GpuLight::from_light(&Light::default_directional());
-            queue.write_buffer(&light_storage_buffer, 0, bytemuck::bytes_of(&default_gpu));
-        }
+        queue.write_buffer(&light_uniform_buffer, 0, bytemuck::bytes_of(&initial_light));
 
         let light_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -211,16 +199,6 @@ impl Renderer {
                         },
                         count: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
                 ],
             });
 
@@ -230,11 +208,7 @@ impl Renderer {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: light_header_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: light_storage_buffer.as_entire_binding(),
+                    resource: light_uniform_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -258,9 +232,10 @@ impl Renderer {
             &device, surface_format, &camera_bind_group_layout,
         )?;
 
-        // === Gaussian Splatting ===
-        let splat_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        // === Gaussian Splatting (WebGL2非対応のためWASMではスキップ) ===
+        #[cfg(not(target_arch = "wasm32"))]
+        let (splat_bind_group_layout, splat_pipeline) = {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Splat Bind Group Layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
@@ -285,10 +260,13 @@ impl Renderer {
                     },
                 ],
             });
-
-        let splat_pipeline = pipeline::create_splat_pipeline(
-            &device, surface_format, &camera_bind_group_layout, &splat_bind_group_layout,
-        )?;
+            let pipe = pipeline::create_splat_pipeline(
+                &device, surface_format, &camera_bind_group_layout, &layout,
+            )?;
+            (Some(layout), Some(pipe))
+        };
+        #[cfg(target_arch = "wasm32")]
+        let (splat_bind_group_layout, splat_pipeline): (Option<wgpu::BindGroupLayout>, Option<wgpu::RenderPipeline>) = (None, None);
 
         // === Buffers ===
         let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -323,9 +301,7 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             camera_bind_group_layout,
-            light_header_buffer,
-            light_storage_buffer,
-            light_storage_capacity: initial_storage_capacity,
+            light_uniform_buffer,
             light_bind_group,
             light_bind_group_layout,
             texture_manager,
@@ -340,6 +316,7 @@ impl Renderer {
             point_vertex_count: 0,
             meshes: HashMap::new(),
             clear_color: wgpu::Color { r: 0.1, g: 0.1, b: 0.15, a: 1.0 },
+            skip_clear: false,
             clip_min: [0.0; 4],
             clip_max: [0.0; 4],
             shadow_enabled: false,
@@ -361,8 +338,8 @@ impl Renderer {
             point_shadow_atlas: None,
             point_shadow_atlas_view: None,
             point_shadow_casters: Vec::new(),
-            splat_pipeline: Some(splat_pipeline),
-            splat_bind_group_layout: Some(splat_bind_group_layout),
+            splat_pipeline,
+            splat_bind_group_layout,
             splat_clouds: HashMap::new(),
             quality_settings: QualitySettings::default(),
             msaa_texture: None,
@@ -486,38 +463,10 @@ impl Renderer {
 
     // ── ライト ──
 
-    /// ライトを更新
-    pub fn update_lights(&mut self, ambient_color: [f32; 3], lights: &[Light], dark_room: bool) {
-        let (header, gpu_lights) = LightStorageData::build(ambient_color, lights, dark_room);
-        self.queue.write_buffer(&self.light_header_buffer, 0, bytemuck::bytes_of(&header));
-
-        if gpu_lights.len() > self.light_storage_capacity {
-            let new_capacity = gpu_lights.len().next_power_of_two().max(16);
-            self.light_storage_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Light Storage Buffer"),
-                size: (std::mem::size_of::<GpuLight>() * new_capacity) as u64,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.light_storage_capacity = new_capacity;
-
-            self.light_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Light Bind Group"),
-                layout: &self.light_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.light_header_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.light_storage_buffer.as_entire_binding(),
-                    },
-                ],
-            });
-        }
-
-        self.queue.write_buffer(&self.light_storage_buffer, 0, bytemuck::cast_slice(&gpu_lights));
+    /// ライトを更新（Uniform版、最大8ライト）
+    pub fn update_lights(&mut self, ambient_color: [f32; 3], lights: &[Light], _dark_room: bool) {
+        let uniform = LightUniform::from_lights(ambient_color, lights);
+        self.queue.write_buffer(&self.light_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
     // ── シャドウマップ ──
@@ -914,20 +863,31 @@ impl Renderer {
             && self.shadow_bind_group.is_some();
 
         {
+            let color_load = if self.skip_clear {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(self.clear_color)
+            };
+            let depth_load = if self.skip_clear {
+                wgpu::LoadOp::Load
+            } else {
+                wgpu::LoadOp::Clear(1.0)
+            };
+
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: render_view,
                     resolve_target: resolve,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(self.clear_color),
+                        load: color_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: depth_load,
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -1187,6 +1147,11 @@ impl Renderer {
 
     pub fn set_clear_color(&mut self, r: f64, g: f64, b: f64) {
         self.clear_color = wgpu::Color { r, g, b, a: 1.0 };
+    }
+
+    /// Clearをスキップするか設定（外部で事前パスを描画済みの場合にtrue）
+    pub fn set_skip_clear(&mut self, skip: bool) {
+        self.skip_clear = skip;
     }
 
     pub fn size(&self) -> (u32, u32) {

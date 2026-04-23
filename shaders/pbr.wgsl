@@ -10,27 +10,21 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
-// === Group 1: Lights (header uniform + storage buffer) ===
+// === Group 1: Lights (uniform, WebGL2互換) ===
 struct GpuLight {
-    // xyz = direction/position, w = light_type (0=directional, 1=point)
     direction_or_position_and_type: vec4<f32>,
-    // rgb = color, a = intensity
     color_and_intensity: vec4<f32>,
-    // x = range (mm), y = ies_index, z = spot_half_angle, w = reserved
     extra: vec4<f32>,
 };
 
-struct LightHeader {
+struct LightUniform {
     // rgb = ambient color, a = light_count
     ambient_and_count: vec4<f32>,
-    // x = dark_room (0/1), y = exposure, z = reserved, w = reserved
-    mode_flags: vec4<f32>,
+    lights: array<GpuLight, 8>,
 };
 
 @group(1) @binding(0)
-var<uniform> light_header: LightHeader;
-@group(1) @binding(1)
-var<storage, read> lights: array<GpuLight>;
+var<uniform> light_data: LightUniform;
 
 // === Group 2: Texture ===
 @group(2) @binding(0)
@@ -161,8 +155,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // テクスチャサンプリング
     let tex_color = textureSample(t_diffuse, s_diffuse, in.uv);
 
-    // アルファテスト
-    if (tex_color.a < 0.5) {
+    // アルファテスト（閾値を下げて半透明テクスチャの穴を防ぐ）
+    if (tex_color.a < 0.01) {
         discard;
     }
 
@@ -189,14 +183,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
 
-    let light_count = i32(light_header.ambient_and_count.a);
-    let is_dark_room = light_header.mode_flags.x > 0.5;
+    let light_count = i32(light_data.ambient_and_count.a);
+    let is_dark_room = false;
 
     // アンビエント (簡易IBL近似)
     // 暗室モード: アンビエントを大幅減衰（微小環境光のみ）
     let f_ambient = fresnel_schlick(n_dot_v, f0);
     let kd_ambient = (1.0 - f_ambient) * (1.0 - metallic);
-    var ambient_base = light_header.ambient_and_count.rgb;
+    var ambient_base = light_data.ambient_and_count.rgb;
     if (is_dark_room) {
         ambient_base = ambient_base * 0.02;
     }
@@ -206,7 +200,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // 各ライトからのPBR寄与を累積
     for (var i = 0; i < light_count; i = i + 1) {
-        let light = lights[i];
+        let light = light_data.lights[i];
         let light_type = light.direction_or_position_and_type.w;
         let light_color = light.color_and_intensity.rgb;
         let intensity = light.color_and_intensity.a;

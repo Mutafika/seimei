@@ -14,7 +14,7 @@ post-process = []
 egui = ["dep:egui", "dep:egui-wgpu"]
 
 [dependencies]
-wgpu = "24"
+wgpu = { version = "24", features = ["webgl"] }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2.0"

@@ -10,22 +10,20 @@ struct CameraUniform {
 @group(0) @binding(0)
 var<uniform> camera: CameraUniform;
 
-// === Group 1: Lights (header uniform + storage buffer) ===
+// === Group 1: Lights (uniform, WebGL2互換) ===
 struct GpuLight {
     direction_or_position_and_type: vec4<f32>,
     color_and_intensity: vec4<f32>,
     extra: vec4<f32>,
 };
 
-struct LightHeader {
+struct LightUniform {
     ambient_and_count: vec4<f32>,
-    mode_flags: vec4<f32>,
+    lights: array<GpuLight, 8>,
 };
 
 @group(1) @binding(0)
-var<uniform> light_header: LightHeader;
-@group(1) @binding(1)
-var<storage, read> lights: array<GpuLight>;
+var<uniform> light_data: LightUniform;
 
 // === Group 2: Texture ===
 @group(2) @binding(0)
@@ -195,12 +193,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
 
-    let light_count = i32(light_header.ambient_and_count.a);
-    let is_dark_room = light_header.mode_flags.x > 0.5;
+    let light_count = i32(light_data.ambient_and_count.a);
+    let is_dark_room = false;
 
     let f_ambient = fresnel_schlick(n_dot_v, f0);
     let kd_ambient = (1.0 - f_ambient) * (1.0 - metallic);
-    var ambient_base = light_header.ambient_and_count.rgb;
+    var ambient_base = light_data.ambient_and_count.rgb;
     if (is_dark_room) {
         ambient_base = ambient_base * 0.02;
     }
@@ -211,7 +209,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var lo = vec3(0.0);
 
     for (var i = 0; i < light_count; i = i + 1) {
-        let light = lights[i];
+        let light = light_data.lights[i];
         let light_type = light.direction_or_position_and_type.w;
         let light_color = light.color_and_intensity.rgb;
         let intensity = light.color_and_intensity.a;

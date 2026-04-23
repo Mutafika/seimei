@@ -204,4 +204,9 @@ impl TextureManager {
     pub fn contains(&self, id: &str) -> bool {
         self.textures.contains_key(id)
     }
+
+    /// テクスチャのwgpu::Textureへの参照を取得（copy_texture_to_texture等で使用）
+    pub fn get_texture(&self, id: &str) -> Option<&wgpu::Texture> {
+        self.textures.get(id).map(|t| &t.texture)
+    }
 }
