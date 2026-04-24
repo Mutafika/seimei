@@ -383,6 +383,11 @@ impl Renderer {
         self.meshes.contains_key(id)
     }
 
+    /// メッシュインスタンスを取得（GPUバッファへの参照）
+    pub fn get_mesh(&self, id: &str) -> Option<&MeshInstance> {
+        self.meshes.get(id)
+    }
+
     /// メッシュのテクスチャIDを設定/変更
     pub fn set_mesh_texture(&mut self, mesh_id: &str, texture_id: Option<String>) {
         if let Some(instance) = self.meshes.get_mut(mesh_id) {
