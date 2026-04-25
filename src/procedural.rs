@@ -328,3 +328,151 @@ pub fn cylinder(radius: f32, height: f32, segments: u32) -> RenderMesh {
 
     mesh
 }
+
+// ── Simple hash-based 3D noise for mesh displacement ──
+
+fn hash3(p: [f32; 3]) -> f32 {
+    let h = p[0] * 127.1 + p[1] * 311.7 + p[2] * 74.7;
+    (h.sin() * 43758.5453).fract()
+}
+
+fn smooth_noise_3d(x: f32, y: f32, z: f32) -> f32 {
+    let ix = x.floor() as i32;
+    let iy = y.floor() as i32;
+    let iz = z.floor() as i32;
+    let fx = x - x.floor();
+    let fy = y - y.floor();
+    let fz = z - z.floor();
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uy = fy * fy * (3.0 - 2.0 * fy);
+    let uz = fz * fz * (3.0 - 2.0 * fz);
+
+    let v = |dx: i32, dy: i32, dz: i32| -> f32 {
+        hash3([(ix + dx) as f32, (iy + dy) as f32, (iz + dz) as f32])
+    };
+
+    let x0 = v(0,0,0) * (1.0 - ux) + v(1,0,0) * ux;
+    let x1 = v(0,1,0) * (1.0 - ux) + v(1,1,0) * ux;
+    let x2 = v(0,0,1) * (1.0 - ux) + v(1,0,1) * ux;
+    let x3 = v(0,1,1) * (1.0 - ux) + v(1,1,1) * ux;
+    let y0 = x0 * (1.0 - uy) + x1 * uy;
+    let y1 = x2 * (1.0 - uy) + x3 * uy;
+    y0 * (1.0 - uz) + y1 * uz
+}
+
+fn fbm_3d(x: f32, y: f32, z: f32, octaves: u32) -> f32 {
+    let mut val = 0.0;
+    let mut amp = 0.5;
+    let (mut px, mut py, mut pz) = (x, y, z);
+    for _ in 0..octaves {
+        val += smooth_noise_3d(px, py, pz) * amp;
+        amp *= 0.5;
+        px *= 2.0;
+        py *= 2.0;
+        pz *= 2.0;
+    }
+    val
+}
+
+/// 不規則な岩メッシュ — icosphereの頂点をFBMノイズでずらす
+pub fn rock(base_radius: f32, subdivisions: u32, roughness: f32, seed: f32) -> RenderMesh {
+    let t = (1.0 + 5.0_f32.sqrt()) / 2.0;
+
+    let mut positions: Vec<[f32; 3]> = vec![
+        [-1.0, t, 0.0], [1.0, t, 0.0], [-1.0, -t, 0.0], [1.0, -t, 0.0],
+        [0.0, -1.0, t], [0.0, 1.0, t], [0.0, -1.0, -t], [0.0, 1.0, -t],
+        [t, 0.0, -1.0], [t, 0.0, 1.0], [-t, 0.0, -1.0], [-t, 0.0, 1.0],
+    ];
+    for p in &mut positions {
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+        p[0] /= len; p[1] /= len; p[2] /= len;
+    }
+
+    let mut indices: Vec<[u32; 3]> = vec![
+        [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
+        [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
+        [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
+        [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
+    ];
+
+    for _ in 0..subdivisions {
+        let mut new_indices = Vec::new();
+        let mut midpoint_cache = std::collections::HashMap::new();
+        for tri in &indices {
+            let a = get_midpoint(&mut positions, &mut midpoint_cache, tri[0], tri[1]);
+            let b = get_midpoint(&mut positions, &mut midpoint_cache, tri[1], tri[2]);
+            let c = get_midpoint(&mut positions, &mut midpoint_cache, tri[2], tri[0]);
+            new_indices.push([tri[0], a, c]);
+            new_indices.push([tri[1], b, a]);
+            new_indices.push([tri[2], c, b]);
+            new_indices.push([a, b, c]);
+        }
+        indices = new_indices;
+    }
+
+    // Displace vertices — angular, rocky shapes (not smooth blobs)
+    for p in &mut positions {
+        let nx = p[0]; let ny = p[1]; let nz = p[2];
+
+        // Large-scale angular shape: few big flat faces
+        let big = smooth_noise_3d(nx * 1.2 + seed, ny * 1.2 + seed * 0.7, nz * 1.2 + seed * 1.3);
+        // Quantize to create flat facets
+        let faceted = (big * 4.0).round() / 4.0;
+
+        // Ridge noise: sharp creases between flat areas
+        let ridge1 = 1.0 - (smooth_noise_3d(nx * 2.5 + seed + 5.0, ny * 2.5 + 3.0, nz * 2.5 + 7.0) * 2.0 - 1.0).abs();
+        let ridge2 = 1.0 - (smooth_noise_3d(nx * 5.0 + seed + 11.0, ny * 5.0 + 8.0, nz * 5.0 + 2.0) * 2.0 - 1.0).abs();
+
+        // Small chips and dents
+        let chip = smooth_noise_3d(nx * 8.0 + seed + 20.0, ny * 8.0 + 15.0, nz * 8.0 + 30.0);
+        let dent = (chip * 3.0).fract().min(1.0).max(0.0);
+
+        let total = (faceted * 0.5 - 0.25
+            + ridge1 * 0.15
+            + ridge2 * 0.05
+            - dent * 0.08) * roughness;
+
+        let r = base_radius * (1.0 + total);
+        p[0] = nx * r; p[1] = ny * r; p[2] = nz * r;
+    }
+
+    // Recalculate normals from geometry
+    let mut normals = vec![[0.0f32; 3]; positions.len()];
+    for tri in &indices {
+        let p0 = positions[tri[0] as usize];
+        let p1 = positions[tri[1] as usize];
+        let p2 = positions[tri[2] as usize];
+        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let face_n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        for &idx in tri {
+            let n = &mut normals[idx as usize];
+            n[0] += face_n[0]; n[1] += face_n[1]; n[2] += face_n[2];
+        }
+    }
+    for n in &mut normals {
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if len > 1e-8 { n[0] /= len; n[1] /= len; n[2] /= len; }
+    }
+
+    let mut mesh = RenderMesh::new();
+    for (i, p) in positions.iter().enumerate() {
+        let nm = normals[i];
+        let u = 0.5 + p[2].atan2(p[0]) / (2.0 * PI);
+        let v = 0.5 - (p[1] / base_radius).clamp(-1.0, 1.0).asin() / PI;
+        mesh.add_vertex(Vertex::with_uv(
+            Point3::new_f32(p[0], p[1], p[2]),
+            Vec3D::new_f32(nm[0], nm[1], nm[2]),
+            [u, v],
+        ));
+    }
+    for tri in &indices {
+        mesh.add_triangle(tri[0], tri[1], tri[2]);
+    }
+
+    mesh
+}
