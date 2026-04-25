@@ -476,3 +476,107 @@ pub fn rock(base_radius: f32, subdivisions: u32, roughness: f32, seed: f32) -> R
 
     mesh
 }
+
+/// 地形メッシュ — ノイズベースの起伏 + 中央に池の窪み
+pub fn terrain(size: f32, resolution: u32, height_scale: f32) -> RenderMesh {
+    let mut mesh = RenderMesh::new();
+    let res = resolution as usize;
+    let half = size * 0.5;
+    let step = size / resolution as f32;
+
+    let mut heights = vec![vec![0.0f32; res + 1]; res + 1];
+    for iz in 0..=res {
+        for ix in 0..=res {
+            let x = ix as f32 / res as f32 * 2.0 - 1.0;
+            let z = iz as f32 / res as f32 * 2.0 - 1.0;
+
+            let wx = x * 3.0;
+            let wz = z * 3.0;
+            let h1 = smooth_noise_3d(wx * 0.5 + 5.0, 0.0, wz * 0.5 + 3.0);
+            let h2 = smooth_noise_3d(wx * 1.0 + 2.0, 0.5, wz * 1.0 + 7.0) * 0.5;
+            let h3 = smooth_noise_3d(wx * 2.0 + 8.0, 1.0, wz * 2.0 + 1.0) * 0.25;
+            let h4 = smooth_noise_3d(wx * 4.0 + 3.0, 1.5, wz * 4.0 + 9.0) * 0.12;
+            let terrain_h = (h1 + h2 + h3 + h4 - 0.4) * height_scale;
+
+            // Pond basin
+            let dx = x - 0.1;
+            let dz = z - 0.05;
+            let pond_dist = (dx * dx + dz * dz).sqrt();
+            let pond_radius = 0.3;
+            let pond = if pond_dist < pond_radius {
+                let t = 1.0 - pond_dist / pond_radius;
+                -0.4 * height_scale * t * t * (3.0 - 2.0 * t)
+            } else {
+                0.0
+            };
+
+            let edge_dist = x.abs().max(z.abs());
+            let edge = 1.0 - ((edge_dist - 0.7) / 0.3).clamp(0.0, 1.0);
+            heights[iz][ix] = (terrain_h + pond) * edge;
+        }
+    }
+
+    for iz in 0..=res {
+        for ix in 0..=res {
+            let x = -half + ix as f32 * step;
+            let z = -half + iz as f32 * step;
+            let y = heights[iz][ix];
+
+            let hx_l = if ix > 0 { heights[iz][ix - 1] } else { y };
+            let hx_r = if ix < res { heights[iz][ix + 1] } else { y };
+            let hz_b = if iz > 0 { heights[iz - 1][ix] } else { y };
+            let hz_f = if iz < res { heights[iz + 1][ix] } else { y };
+            let nx = (hx_l - hx_r) / (2.0 * step);
+            let nz = (hz_b - hz_f) / (2.0 * step);
+            let len = (nx * nx + 1.0 + nz * nz).sqrt();
+
+            mesh.add_vertex(Vertex::with_uv(
+                Point3::new_f32(x, y, z),
+                Vec3D::new_f32(nx / len, 1.0 / len, nz / len),
+                [ix as f32 / res as f32, iz as f32 / res as f32],
+            ));
+        }
+    }
+
+    let w = (res + 1) as u32;
+    for iz in 0..res as u32 {
+        for ix in 0..res as u32 {
+            let i = iz * w + ix;
+            mesh.add_triangle(i, i + w, i + 1);
+            mesh.add_triangle(i + 1, i + w, i + w + 1);
+        }
+    }
+
+    mesh
+}
+
+/// 水面メッシュ — 指定した高さの平面
+pub fn water_plane(size: f32, y_level: f32, resolution: u32) -> RenderMesh {
+    let mut mesh = RenderMesh::new();
+    let res = resolution as usize;
+    let half = size * 0.5;
+    let step = size / resolution as f32;
+
+    for iz in 0..=res {
+        for ix in 0..=res {
+            let x = -half + ix as f32 * step;
+            let z = -half + iz as f32 * step;
+            mesh.add_vertex(Vertex::with_uv(
+                Point3::new_f32(x, y_level, z),
+                Vec3D::new_f32(0.0, 1.0, 0.0),
+                [ix as f32 / res as f32, iz as f32 / res as f32],
+            ));
+        }
+    }
+
+    let w = (res + 1) as u32;
+    for iz in 0..res as u32 {
+        for ix in 0..res as u32 {
+            let i = iz * w + ix;
+            mesh.add_triangle(i, i + w, i + 1);
+            mesh.add_triangle(i + 1, i + w, i + w + 1);
+        }
+    }
+
+    mesh
+}
