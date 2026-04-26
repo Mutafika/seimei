@@ -1195,6 +1195,33 @@ impl Renderer {
         &mut self.texture_manager
     }
 
+    // ── 外部パス向けアクセサ ──
+
+    /// カメラ bind group（Group 0）
+    pub fn camera_bind_group(&self) -> &wgpu::BindGroup {
+        &self.camera_bind_group
+    }
+
+    /// カメラ uniform バッファ
+    pub fn camera_buffer(&self) -> &wgpu::Buffer {
+        &self.camera_buffer
+    }
+
+    /// ライト bind group（Group 1）
+    pub fn light_bind_group(&self) -> &wgpu::BindGroup {
+        &self.light_bind_group
+    }
+
+    /// シャドウ bind group（Group 3, 有効時のみ）
+    pub fn shadow_bind_group(&self) -> Option<&wgpu::BindGroup> {
+        self.shadow_bind_group.as_ref()
+    }
+
+    /// シャドウ bind group layout（有効時のみ）
+    pub fn shadow_bind_group_layout(&self) -> Option<&wgpu::BindGroupLayout> {
+        self.shadow_bind_group_layout.as_ref()
+    }
+
     /// テクスチャ読み込みヘルパー
     #[cfg(feature = "gltf")]
     pub fn load_texture_from_file(
