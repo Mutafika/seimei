@@ -281,7 +281,7 @@ fn create_main_pipeline_impl(
             topology: wgpu::PrimitiveTopology::TriangleList,
             strip_index_format: None,
             front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
+            cull_mode: if depth_write { Some(wgpu::Face::Back) } else { None },
             polygon_mode: wgpu::PolygonMode::Fill,
             unclipped_depth: false,
             conservative: false,
@@ -289,7 +289,9 @@ fn create_main_pipeline_impl(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: depth_write,
-            depth_compare: wgpu::CompareFunction::Less,
+            // LessEqual: 同深度で後勝ち。VRMのBody→服のように同位置で重なる
+            // メッシュを描画順で上書きできるようにする。
+            depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: if depth_write {
                 wgpu::DepthBiasState::default()
@@ -371,7 +373,8 @@ fn create_shadow_pipeline_impl(
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            // LessEqual: 同深度で後勝ち。VRMの重なりメッシュを描画順で制御するため。
+            depth_compare: wgpu::CompareFunction::LessEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
