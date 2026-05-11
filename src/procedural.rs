@@ -496,23 +496,33 @@ pub fn terrain(size: f32, resolution: u32, height_scale: f32) -> RenderMesh {
             let h2 = smooth_noise_3d(wx * 1.0 + 2.0, 0.5, wz * 1.0 + 7.0) * 0.5;
             let h3 = smooth_noise_3d(wx * 2.0 + 8.0, 1.0, wz * 2.0 + 1.0) * 0.25;
             let h4 = smooth_noise_3d(wx * 4.0 + 3.0, 1.5, wz * 4.0 + 9.0) * 0.12;
-            let terrain_h = (h1 + h2 + h3 + h4 - 0.4) * height_scale;
+            // Gentle terrain — low hills, not mountains
+            let terrain_h = (h1 + h2 + h3 + h4 - 0.5) * height_scale * 0.4;
 
-            // Pond basin
+            // Pond basin — wide and shallow
             let dx = x - 0.1;
             let dz = z - 0.05;
             let pond_dist = (dx * dx + dz * dz).sqrt();
-            let pond_radius = 0.3;
+            let pond_radius = 0.35;
             let pond = if pond_dist < pond_radius {
                 let t = 1.0 - pond_dist / pond_radius;
-                -0.4 * height_scale * t * t * (3.0 - 2.0 * t)
+                // Shallow bowl shape
+                -0.15 * height_scale * t * t * (3.0 - 2.0 * t)
+            } else {
+                0.0
+            };
+
+            // Raise rim slightly around pond (natural bank)
+            let rim_dist = (pond_dist - pond_radius).abs();
+            let rim = if pond_dist > pond_radius && pond_dist < pond_radius + 0.08 {
+                0.03 * height_scale * (1.0 - rim_dist / 0.08)
             } else {
                 0.0
             };
 
             let edge_dist = x.abs().max(z.abs());
             let edge = 1.0 - ((edge_dist - 0.7) / 0.3).clamp(0.0, 1.0);
-            heights[iz][ix] = (terrain_h + pond) * edge;
+            heights[iz][ix] = (terrain_h + pond + rim) * edge;
         }
     }
 
