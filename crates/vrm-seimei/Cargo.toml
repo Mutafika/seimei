@@ -1,0 +1,11 @@
+[package]
+name = "vrm-seimei"
+description = "VRM × seimei glue — load VRM bytes into seimei meshes + drive bones via vrm-anatomy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+vrm-anatomy = { path = "../../../vrm-anatomy/crates/vrm-anatomy" }
+seimei = { path = "../.." }
+tracing = "0.1"

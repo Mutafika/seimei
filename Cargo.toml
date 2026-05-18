@@ -1,10 +1,12 @@
+[workspace]
+members = [".", "crates/vrm-seimei"]
+
 [package]
 name = "seimei"
 version = "0.1.0"
 edition = "2024"
 description = "UI-agnostic 3D rendering library — wgpu + glam"
 license = "MIT"
-authors = ["MKD"]
 
 [features]
 default = ["gltf"]
