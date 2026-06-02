@@ -388,6 +388,14 @@ impl Renderer {
         self.meshes.get(id)
     }
 
+    /// `render_to_view` の Clear 色をアルファ付きで設定する。アルファ 0 の透明
+    /// クリアにすると、オフスクリーンに描いたジオメトリだけを後段で合成できる
+    /// （ホスト UI の背景レイヤーとして埋め込む用途）。既存の `set_clear_color`
+    /// は a=1.0 固定なので、透明にしたい場合はこちらを使う。
+    pub fn set_clear_rgba(&mut self, color: wgpu::Color) {
+        self.clear_color = color;
+    }
+
     /// メッシュのテクスチャIDを設定/変更
     pub fn set_mesh_texture(&mut self, mesh_id: &str, texture_id: Option<String>) {
         if let Some(instance) = self.meshes.get_mut(mesh_id) {
