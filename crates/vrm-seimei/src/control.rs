@@ -59,6 +59,9 @@ pub struct AvatarController {
     speech: Visemes,
     speech_time: f32,
     mouth: [f32; 5], // smoothed weights for VOWELS
+    /// 腕を T-pose から脇へ下ろす量(0=T-pose で真横, 1=真下)。既定は [`ARM_DOWN`]。
+    /// 吊り下げ等で腕を開いたままにしたい外部制御から差し替えられる。
+    arm_down: f32,
     /// 直近フレームの「ポーズ済み world 変換」(native Y-up/m, node index)。外部物理が
     /// 生きた骨位置（歩行で動く手など）にアンカーできるよう毎フレーム保存する。
     last_world: Vec<Mat4>,
@@ -81,6 +84,7 @@ impl AvatarController {
             speech: Vec::new(),
             speech_time: 0.0,
             mouth: [0.0; 5],
+            arm_down: ARM_DOWN,
             last_world: Vec::new(),
         }
     }
@@ -89,6 +93,12 @@ impl AvatarController {
     /// glTF node index）。空なら未更新。外部物理のアンカー取得に使う。
     pub fn world(&self) -> &[Mat4] {
         &self.last_world
+    }
+
+    /// 腕を脇へ下ろす量(0=真横T-pose, 1=真下)を差し替える。吊り下げで腕を開いた
+    /// ままにする等、外部から腕の基本姿勢を制御するための seam。既定は 0.72。
+    pub fn set_arm_down(&mut self, fraction: f32) {
+        self.arm_down = fraction.clamp(0.0, 1.0);
     }
 
     /// The wrapped avatar (materials, presets, spring info, etc.).
@@ -237,7 +247,7 @@ impl AvatarController {
         } else {
             (0.0, 0.0)
         };
-        pose.extend(self.avatar.arms_pose(ARM_DOWN, ls, rs));
+        pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs));
 
         // Lip-sync: walk the viseme schedule, ease the mouth toward the current
         // vowel. Touches only the 5 vowel presets, so an emotion/blink stays on.
