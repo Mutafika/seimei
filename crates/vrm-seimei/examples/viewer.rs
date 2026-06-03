@@ -19,7 +19,7 @@ use std::sync::Arc;
 use glam::Mat4;
 use seimei::{Camera, InstanceData, Light, Point3, Renderer};
 use vrm_anatomy::animation::{AnimationClip, AnimationPlayer, BoneTrack, Easing, Keyframe, LoopMode};
-use vrm_seimei::VrmAvatar;
+use vrm_seimei::{ExpressionPreset, VrmAvatar};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -38,6 +38,10 @@ const DT: f32 = 1.0 / 60.0;
 /// LBS — with skinning correct this should hang cleanly. Tune by eye.
 const ARM_DOWN: f32 = 0.72;
 
+/// Idle auto-blink: one quick close/open every `BLINK_PERIOD` s, lasting `BLINK_DUR`.
+const BLINK_PERIOD: f32 = 3.4;
+const BLINK_DUR: f32 = 0.14;
+
 /// A control action — emitted by both the egui buttons and the keyboard.
 enum Act {
     Bind,
@@ -49,6 +53,18 @@ enum Act {
     Spring,
     TurnL,
     TurnR,
+    Expr(ExpressionPreset), // set one emotion/vowel exclusively (blink stays)
+    ExprClear,              // back to neutral face
+    AutoBlink,              // toggle the idle auto-blink
+}
+
+/// Blink presets are exempt from "exclusive emotion" clearing (a blink overlays
+/// any face), and from the auto-blink driver.
+fn is_blink(p: ExpressionPreset) -> bool {
+    matches!(
+        p,
+        ExpressionPreset::Blink | ExpressionPreset::BlinkLeft | ExpressionPreset::BlinkRight
+    )
 }
 
 fn onoff(b: bool) -> &'static str {
@@ -203,6 +219,8 @@ struct Gpu {
     spinning: bool,
     body_yaw: f32,    // accumulated hips-Y rotation when "Spin" turns the body
     gait_period: f32, // current locomotion period (s); 0 = no walk → no arm swing
+    auto_blink: bool, // idle auto-blink driver on/off
+    blink_phase: f32, // seconds into the current blink cycle
     // egui button bar overlay
     window: Arc<Window>,
     egui_ctx: egui::Context,
@@ -269,6 +287,11 @@ impl Gpu {
             "[viewer] spring joints (揺れもの): {}  colliders: {}",
             avatar.spring_joints(),
             avatar.spring_colliders()
+        );
+        eprintln!(
+            "[viewer] expression presets ({}): {:?}",
+            avatar.available_presets().len(),
+            avatar.available_presets()
         );
         let meshes = avatar.skin(&[]); // bind pose to start
         let prims = avatar.primitives();
@@ -379,6 +402,8 @@ impl Gpu {
             spinning: false,
             body_yaw: 0.0,
             gait_period: 0.0,
+            auto_blink: true,
+            blink_phase: 0.0,
             window,
             egui_ctx,
             egui_state,
@@ -416,6 +441,29 @@ impl Gpu {
             }
             Act::TurnL => self.azim -= 0.35,
             Act::TurnR => self.azim += 0.35,
+            Act::Expr(p) => {
+                // exclusive: clear every non-blink expression, then set this one
+                for pr in self.avatar.available_presets() {
+                    if !is_blink(pr) {
+                        self.avatar.set_expression(pr, 0.0);
+                    }
+                }
+                self.avatar.set_expression(p, 1.0);
+            }
+            Act::ExprClear => {
+                for pr in self.avatar.available_presets() {
+                    if !is_blink(pr) {
+                        self.avatar.set_expression(pr, 0.0);
+                    }
+                }
+            }
+            Act::AutoBlink => {
+                self.auto_blink = !self.auto_blink;
+                self.blink_phase = 0.0;
+                if !self.auto_blink {
+                    self.avatar.set_expression(ExpressionPreset::Blink, 0.0);
+                }
+            }
         }
     }
 
@@ -472,6 +520,17 @@ impl Gpu {
             (0.0, 0.0)
         };
         pose.extend(self.avatar.arms_pose(ARM_DOWN, ls, rs));
+        // Idle auto-blink: a quick close/open overlaid on whatever face is set.
+        if self.auto_blink && self.avatar.has_expression(ExpressionPreset::Blink) {
+            self.blink_phase += DT;
+            let t = self.blink_phase % BLINK_PERIOD;
+            let w = if t < BLINK_DUR {
+                (t / BLINK_DUR * std::f32::consts::PI).sin()
+            } else {
+                0.0
+            };
+            self.avatar.set_expression(ExpressionPreset::Blink, w);
+        }
         // skin_dynamic advances the spring-bone (揺れもの) sim by DT each frame.
         let meshes = self.avatar.skin_dynamic(&pose, DT);
         for (i, m) in meshes.iter().enumerate().take(self.n_prims) {
@@ -502,6 +561,22 @@ impl Gpu {
         // --- egui button bar (drawn over the 3D render) ---
         let raw_input = self.egui_state.take_egui_input(&self.window);
         let (spinning, paused, spring_on) = (self.spinning, self.paused, self.avatar.spring_enabled());
+        let auto_blink = self.auto_blink;
+        // Only offer buttons for the presets this model actually defines.
+        let expr_buttons: Vec<(ExpressionPreset, &'static str)> = [
+            (ExpressionPreset::Happy, "Joy"),
+            (ExpressionPreset::Angry, "Angry"),
+            (ExpressionPreset::Sad, "Sorrow"),
+            (ExpressionPreset::Relaxed, "Fun"),
+            (ExpressionPreset::Aa, "A"),
+            (ExpressionPreset::Ih, "I"),
+            (ExpressionPreset::Ou, "U"),
+            (ExpressionPreset::Ee, "E"),
+            (ExpressionPreset::Oh, "O"),
+        ]
+        .into_iter()
+        .filter(|(p, _)| self.avatar.has_expression(*p))
+        .collect();
         let mut act: Option<Act> = None;
         let full = self.egui_ctx.run(raw_input, |ctx| {
             egui::TopBottomPanel::bottom("controls").show(ctx, |ui| {
@@ -515,6 +590,16 @@ impl Gpu {
                     if ui.button(format!("Spring: {}", onoff(spring_on))).clicked() { act = Some(Act::Spring); }
                     if ui.button("Turn <").clicked() { act = Some(Act::TurnL); }
                     if ui.button("Turn >").clicked() { act = Some(Act::TurnR); }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Face:");
+                    for (p, label) in &expr_buttons {
+                        if ui.button(*label).clicked() { act = Some(Act::Expr(*p)); }
+                    }
+                    if ui.button("Neutral").clicked() { act = Some(Act::ExprClear); }
+                    if ui.button(format!("Blink auto: {}", onoff(auto_blink))).clicked() {
+                        act = Some(Act::AutoBlink);
+                    }
                 });
             });
         });

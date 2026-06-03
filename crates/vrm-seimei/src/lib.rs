@@ -24,6 +24,10 @@ use seimei::gltf::GltfAlphaMode;
 use seimei::math::Vec3D;
 use seimei::{Point3, RenderMesh, Vertex};
 use vrm_anatomy::{cpu_skin_lbs, parse_vrm0, parse_vrmc_vrm, SkinMesh, SkinVertex};
+use vrm_anatomy::expression::{
+    Expressions, MorphAddressing, parse_vrm0_blend_shapes, parse_vrmc_expressions, resolve_weights,
+};
+pub use vrm_anatomy::expression::ExpressionPreset;
 
 mod spring;
 pub use spring::SpringSystem;
@@ -82,6 +86,13 @@ pub struct VrmPrimitive {
     joint_nodes: Vec<usize>,
     inv_bind: Vec<Mat4>,
     joint_names: Vec<String>,
+    /// glTF mesh this primitive belongs to — expression binds address morphs by
+    /// `(mesh, target_index)` (0.x) or `(node→mesh, target_index)` (1.0).
+    mesh_index: usize,
+    /// Per morph-target vertex position deltas, in **native** space (raw glTF —
+    /// same space as `skin` positions, so they add directly). Index = morph target
+    /// index, matching the expression bind's `index`.
+    morph_deltas: Vec<Vec<[f32; 3]>>,
     pub base_color: [f32; 4],
     pub metallic: f32,
     pub roughness: f32,
@@ -109,6 +120,11 @@ pub struct VrmAvatar {
     humanoid: HashMap<String, usize>, // VRM humanoid bone name -> glTF node index
     is_vrm0: bool,                    // VRM 0.x faces +Y in seimei space (vs -Y for 1.0)
     spring: Option<SpringSystem>,     // 揺れもの (hair/skirt) secondary motion, if any
+
+    // --- 表情 (facial expressions / blendshapes) ---
+    expressions: Expressions,                  // model-authored presets (0.x or 1.0)
+    node_mesh: Vec<Option<usize>>,             // glTF node index -> mesh index (for 1.0 binds)
+    expr_weights: HashMap<ExpressionPreset, f32>, // currently requested preset weights
 }
 
 impl VrmAvatar {
@@ -182,6 +198,16 @@ impl VrmAvatar {
                 joint_nodes,
                 inv_bind,
                 joint_names: b.joint_names.clone(),
+                // seimei BAKES morph position deltas into its space (yup_to_zup ×1000),
+                // exactly like vertex positions. Un-bake each delta back to native
+                // (m, Y-up) with the inverse linear map so it adds onto the native
+                // skin positions at the right scale and axis. Per-vertex order matches.
+                mesh_index: p.mesh_index,
+                morph_deltas: p
+                    .morph_targets
+                    .iter()
+                    .map(|mt| mt.position_deltas.iter().map(|d| pos_seimei_to_native(*d)).collect())
+                    .collect(),
                 base_color: p.material.base_color,
                 metallic: p.material.metallic,
                 roughness: p.material.roughness,
@@ -205,6 +231,18 @@ impl VrmAvatar {
                 SpringSystem::from_vrm0(ext, &nodes_t, &nodes_r, &nodes_s, &nodes_parent, &world_bind)
             });
 
+        // 表情: normalize VRM 1.0 expressions or 0.x blendShapeMaster into one model.
+        let expressions = scene
+            .extensions_json
+            .as_ref()
+            .and_then(|ext| parse_vrmc_expressions(ext).or_else(|| parse_vrm0_blend_shapes(ext)))
+            .unwrap_or_default();
+        // node index -> mesh index, for VRM 1.0 binds that address morphs by node.
+        let mut node_mesh = vec![None; nn];
+        for nd in &scene.nodes {
+            node_mesh[nd.index] = nd.mesh;
+        }
+
         Ok(VrmAvatar {
             primitives,
             nodes_t,
@@ -216,6 +254,9 @@ impl VrmAvatar {
             humanoid,
             is_vrm0,
             spring,
+            expressions,
+            node_mesh,
+            expr_weights: HashMap::new(),
         })
     }
 
@@ -243,8 +284,69 @@ impl VrmAvatar {
         self.skin_with_world(&world)
     }
 
+    // --- 表情 (facial expressions) -------------------------------------------
+
+    /// The expression presets this model actually defines (a subset of the VRM
+    /// standard set — e.g. happy/angry/sad/relaxed, the aa/ih/ou/ee/oh vowels,
+    /// blink). Drive them with [`set_expression`].
+    pub fn available_presets(&self) -> Vec<ExpressionPreset> {
+        self.expressions.presets.keys().copied().collect()
+    }
+
+    /// Whether the model defines `preset`.
+    pub fn has_expression(&self, preset: ExpressionPreset) -> bool {
+        self.expressions.presets.contains_key(&preset)
+    }
+
+    /// Set a preset's weight in `0..=1`. `0` clears it. Presets overlay additively
+    /// (e.g. a blink over a smile); the next `skin`/`skin_dynamic` blends the morph
+    /// deltas in. No-op if the model lacks the preset.
+    pub fn set_expression(&mut self, preset: ExpressionPreset, weight: f32) {
+        let w = weight.clamp(0.0, 1.0);
+        if w <= 0.0 {
+            self.expr_weights.remove(&preset);
+        } else {
+            self.expr_weights.insert(preset, w);
+        }
+    }
+
+    /// Clear all active expressions (back to the neutral mesh).
+    pub fn clear_expressions(&mut self) {
+        self.expr_weights.clear();
+    }
+
+    /// Accumulate the currently-active presets into per-mesh `(morph_index, weight)`
+    /// lists. Empty when no expression is active (the common case → no morph work).
+    fn active_morphs(&self) -> HashMap<usize, Vec<(usize, f32)>> {
+        let mut out: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        if self.expr_weights.is_empty() {
+            return out;
+        }
+        for (preset, w) in resolve_weights(&self.expressions, &self.expr_weights) {
+            if w <= 0.0 {
+                continue;
+            }
+            let Some(expr) = self.expressions.get_preset(preset) else { continue };
+            for bind in &expr.morph_target_binds {
+                let mesh = match bind.addressing {
+                    MorphAddressing::MeshIndex => Some(bind.target),
+                    MorphAddressing::NodeIndex => {
+                        self.node_mesh.get(bind.target).copied().flatten()
+                    }
+                };
+                let Some(mesh) = mesh else { continue };
+                let weight = w * bind.weight;
+                if weight != 0.0 {
+                    out.entry(mesh).or_default().push((bind.index, weight));
+                }
+            }
+        }
+        out
+    }
+
     /// Skin every primitive against an already-computed node world-transform array.
     fn skin_with_world(&self, world: &[Mat4]) -> Vec<RenderMesh> {
+        let morphs = self.active_morphs();
         self.primitives
             .iter()
             .map(|prim| {
@@ -255,7 +357,14 @@ impl VrmAvatar {
                     .zip(&prim.inv_bind)
                     .map(|(&node, ib)| to_row_major(world[node] * *ib))
                     .collect();
-                let skinned = cpu_skin_lbs(&prim.skin, &jm);
+                // Apply active morph deltas to the bind positions (native space)
+                // before skinning. No active morph on this mesh → skin as-is.
+                let morphed: Option<SkinMesh> = morphs
+                    .get(&prim.mesh_index)
+                    .filter(|a| !a.is_empty())
+                    .map(|active| apply_morphs(&prim.skin, &prim.morph_deltas, active));
+                let skin_ref = morphed.as_ref().unwrap_or(&prim.skin);
+                let skinned = cpu_skin_lbs(skin_ref, &jm);
                 let vertices: Vec<Vertex> = skinned
                     .iter()
                     .map(|sv| {
@@ -496,6 +605,21 @@ fn normalize_weights(w: [f32; 4]) -> [f32; 4] {
     } else {
         [1.0, 0.0, 0.0, 0.0]
     }
+}
+
+/// Build a morphed copy of `base` by adding each active target's per-vertex
+/// position deltas (scaled by weight). `active` is `(morph_index, weight)`.
+fn apply_morphs(base: &SkinMesh, deltas: &[Vec<[f32; 3]>], active: &[(usize, f32)]) -> SkinMesh {
+    let mut vertices = base.vertices.clone();
+    for &(ti, w) in active {
+        let Some(td) = deltas.get(ti) else { continue };
+        for (v, d) in vertices.iter_mut().zip(td.iter()) {
+            v.position[0] += d[0] * w;
+            v.position[1] += d[1] * w;
+            v.position[2] += d[2] * w;
+        }
+    }
+    SkinMesh { vertices, indices: base.indices.clone() }
 }
 
 /// Topologically order node indices so every parent precedes its children (sort

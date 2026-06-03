@@ -70,6 +70,10 @@ pub struct GltfPrimitive {
     pub material: GltfMaterial,
     pub morph_targets: Vec<GltfMorphTarget>,
     pub default_morph_weights: Vec<f32>,
+    /// glTF mesh index this primitive belongs to. VRM 0.x expression binds address
+    /// morph targets by `(mesh, index)`, so consumers need to know each primitive's
+    /// source mesh to map a bind onto its morph deltas.
+    pub mesh_index: usize,
     pub skin: Option<GltfSkinBinding>,
 }
 
@@ -82,6 +86,9 @@ pub struct GltfNodeInfo {
     pub translation: [f32; 3],
     pub rotation: [f32; 4],
     pub scale: [f32; 3],
+    /// glTF mesh index this node references, if any. VRM 1.0 expression binds
+    /// address morphs by node index → this resolves the node to its mesh.
+    pub mesh: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -217,6 +224,7 @@ fn load_from_document(
                 material,
                 morph_targets,
                 default_morph_weights: default_weights.clone(),
+                mesh_index: mesh.index(),
                 skin: skin_binding,
             });
         }
@@ -354,6 +362,7 @@ fn extract_nodes(document: &gltf::Document) -> Vec<GltfNodeInfo> {
             translation,
             rotation,
             scale,
+            mesh: node.mesh().map(|m| m.index()),
         }
     }).collect();
 
