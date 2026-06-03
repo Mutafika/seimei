@@ -202,7 +202,7 @@ impl AvatarController {
         let (ls, rs) = if self.gait_period > 0.0 {
             let phase = self.player.current_time() / self.gait_period * std::f32::consts::TAU;
             let s = ARM_SWING * phase.sin();
-            (-s, s)
+            (s, -s)
         } else {
             (0.0, 0.0)
         };

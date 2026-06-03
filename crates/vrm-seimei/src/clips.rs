@@ -107,10 +107,10 @@ pub fn locomotion_clip(name: &str, dur: f32, hip: f32, knee: f32, foot: f32) -> 
 
 /// Walk preset (cadence + amplitudes tuned by eye). Period = `duration` = 1.0 s.
 pub fn walk_clip() -> AnimationClip {
-    locomotion_clip("walk", 1.0, 0.45, -0.8, -0.15)
+    locomotion_clip("walk", 1.0, -0.45, 0.8, 0.15)
 }
 
 /// Run preset. Period = `duration` = 0.6 s.
 pub fn run_clip() -> AnimationClip {
-    locomotion_clip("run", 0.6, 0.7, -1.2, -0.2)
+    locomotion_clip("run", 0.6, -0.7, 1.2, 0.2)
 }

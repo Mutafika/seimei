@@ -310,10 +310,11 @@ impl SceneApp for ViewerApp {
             .expect("renderer");
         renderer.set_clear_rgba(wgpu::Color { r: 0.08, g: 0.08, b: 0.10, a: 1.0 });
         renderer.update_lights(
-            [0.62, 0.62, 0.66],
+            // アンビエントを下げてコントラストを出す（高すぎると白飛びして色が薄く見える）
+            [0.32, 0.32, 0.36],
             &[
-                Light::directional([0.3, -0.6, 0.5], [1.0, 1.0, 1.0], 0.85),
-                Light::directional([-0.4, 0.5, 0.25], [0.6, 0.6, 0.7], 0.4),
+                Light::directional([0.3, -0.6, 0.5], [1.0, 1.0, 1.0], 0.95),
+                Light::directional([-0.4, 0.5, 0.25], [0.6, 0.6, 0.7], 0.35),
             ],
             false,
         );
