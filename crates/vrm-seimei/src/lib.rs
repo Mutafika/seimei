@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use glam::{EulerRot, Mat4, Quat, Vec3};
+use rayon::prelude::*;
 use seimei::gltf::GltfAlphaMode;
 use seimei::math::Vec3D;
 use seimei::{Point3, RenderMesh, Vertex};
@@ -31,6 +32,11 @@ pub use vrm_anatomy::expression::ExpressionPreset;
 
 mod spring;
 pub use spring::SpringSystem;
+
+pub mod clips;
+pub mod control;
+pub mod lipsync;
+pub use control::AvatarController;
 
 /// Row-major 4×4 as `cpu_skin_lbs` wants it (it reads `m[row][col]`, translation
 /// at `m[i][3]`). glam is column-major, so we transpose on the way out.
@@ -347,8 +353,10 @@ impl VrmAvatar {
     /// Skin every primitive against an already-computed node world-transform array.
     fn skin_with_world(&self, world: &[Mat4]) -> Vec<RenderMesh> {
         let morphs = self.active_morphs();
+        // Each primitive skins independently → parallelize across cores. rayon's
+        // collect preserves order, so meshes stay in primitives() order.
         self.primitives
-            .iter()
+            .par_iter()
             .map(|prim| {
                 // Per-primitive joint matrices: this primitive's skin order.
                 let jm: Vec<RowMat> = prim

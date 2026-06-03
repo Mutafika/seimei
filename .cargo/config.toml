@@ -1,0 +1,8 @@
+# Fetch git dependencies via the git CLI. Several crates here pin git release tags
+# (vrm-anatomy in vrm-seimei; sabitori in vrm-viewer). The global git config
+# rewrites https://github.com/ → git@github.com: (insteadOf), and cargo's built-in
+# libgit2 can't drive the ssh-agent for that rewrite, so a plain `cargo build`
+# fails to authenticate. The git CLI has the working SSH keys, so deferring to it
+# makes the git-tag dep fetches resolve cleanly.
+[net]
+git-fetch-with-cli = true
