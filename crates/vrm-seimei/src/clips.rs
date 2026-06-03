@@ -106,11 +106,13 @@ pub fn locomotion_clip(name: &str, dur: f32, hip: f32, knee: f32, foot: f32) -> 
 }
 
 /// Walk preset (cadence + amplitudes tuned by eye). Period = `duration` = 1.0 s.
-pub fn walk_clip() -> AnimationClip {
-    locomotion_clip("walk", 1.0, -0.45, 0.8, 0.15)
+/// `dir` is the forward sign for the rig: `+1.0` for VRM 1.0 (faces +Z),
+/// `-1.0` for VRM 0.x (faces the opposite way) so the legs still step forward.
+pub fn walk_clip(dir: f32) -> AnimationClip {
+    locomotion_clip("walk", 1.0, -0.45 * dir, 0.8 * dir, 0.15 * dir)
 }
 
-/// Run preset. Period = `duration` = 0.6 s.
-pub fn run_clip() -> AnimationClip {
-    locomotion_clip("run", 0.6, -0.7, 1.2, 0.2)
+/// Run preset. Period = `duration` = 0.6 s. `dir`: see [`walk_clip`].
+pub fn run_clip(dir: f32) -> AnimationClip {
+    locomotion_clip("run", 0.6, -0.7 * dir, 1.2 * dir, 0.2 * dir)
 }

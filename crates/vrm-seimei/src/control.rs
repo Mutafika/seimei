@@ -91,6 +91,17 @@ impl AvatarController {
 
     // --- locomotion ---------------------------------------------------------
 
+    /// Forward sign for the gait. VRM 0.x faces the opposite way from VRM 1.0
+    /// (see `lib.rs` `is_vrm0`), so its legs and arms need the inverted sign to
+    /// step *forward*. Mirrors the per-version camera flip in vrm-viewer.
+    fn gait_dir(&self) -> f32 {
+        if self.avatar.is_vrm0() {
+            -1.0
+        } else {
+            1.0
+        }
+    }
+
     /// Stop animating → return to the bind pose.
     pub fn bind(&mut self) {
         self.player.stop();
@@ -102,13 +113,13 @@ impl AvatarController {
         self.gait_period = 0.0;
     }
     pub fn play_walk(&mut self) {
-        let c = walk_clip();
+        let c = walk_clip(self.gait_dir());
         self.gait_period = c.duration;
         self.player.play(c);
         self.paused = false;
     }
     pub fn play_run(&mut self) {
-        let c = run_clip();
+        let c = run_clip(self.gait_dir());
         self.gait_period = c.duration;
         self.player.play(c);
         self.paused = false;
@@ -198,10 +209,11 @@ impl AvatarController {
             pose.push(("hips", [0.0, self.body_yaw, 0.0]));
         }
         // Arms down out of the T-pose, swinging front/back (opposite each other)
-        // when walking — the clips don't touch the arms.
+        // when walking — the clips don't touch the arms. `gait_dir` flips the
+        // swing for VRM 0.x so the arm leads the correct (forward) step.
         let (ls, rs) = if self.gait_period > 0.0 {
             let phase = self.player.current_time() / self.gait_period * std::f32::consts::TAU;
-            let s = ARM_SWING * phase.sin();
+            let s = ARM_SWING * self.gait_dir() * phase.sin();
             (s, -s)
         } else {
             (0.0, 0.0)
