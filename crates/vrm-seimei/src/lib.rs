@@ -271,6 +271,13 @@ impl VrmAvatar {
         &self.primitives
     }
 
+    /// glTF node index of a VRM humanoid bone (e.g. `"leftLowerLeg"`), or `None`
+    /// if the model lacks it. Use to index the world-transform array returned by
+    /// [`Self::world_for_pose`] when inserting a physics stage.
+    pub fn bone_node(&self, vrm_bone: &str) -> Option<usize> {
+        self.humanoid.get(vrm_bone).copied()
+    }
+
     /// Skin every primitive for `pose` (a list of VRM humanoid bone name → local
     /// euler `[roll(X), pitch(Y), yaw(Z)]` radians). Empty pose = bind pose.
     /// Returns posed `RenderMesh`es in **seimei** space, in `primitives()` order.
@@ -351,7 +358,12 @@ impl VrmAvatar {
     }
 
     /// Skin every primitive against an already-computed node world-transform array.
-    fn skin_with_world(&self, world: &[Mat4]) -> Vec<RenderMesh> {
+    ///
+    /// Public half of the **physics-insertion seam**: a consumer can do
+    /// `let mut w = avatar.world_for_pose(pose); my_physics.step(&mut w, dt);
+    /// avatar.skin_with_world(&w)` — exactly where the built-in spring stage sits
+    /// in [`skin_dynamic`]. Index `w` by glTF node; map bones via [`Self::bone_node`].
+    pub fn skin_with_world(&self, world: &[Mat4]) -> Vec<RenderMesh> {
         let morphs = self.active_morphs();
         // Each primitive skins independently → parallelize across cores. rayon's
         // collect preserves order, so meshes stay in primitives() order.
@@ -489,7 +501,9 @@ impl VrmAvatar {
     /// `[roll(X), pitch(Y), yaw(Z)]`, applied Z·Y·X). Unknown bone names are
     /// ignored. Per-primitive `jm[j] = world[joint_nodes[j]] · inv_bind[j]`; at
     /// bind (empty pose) `world = world_bind` so every `jm = I`.
-    fn world_for_pose(&self, pose: &[(&str, [f32; 3])]) -> Vec<Mat4> {
+    ///
+    /// Public half of the **physics-insertion seam** (see [`Self::skin_with_world`]).
+    pub fn world_for_pose(&self, pose: &[(&str, [f32; 3])]) -> Vec<Mat4> {
         let nn = self.nodes_t.len();
         let mut anim: Vec<Quat> = vec![Quat::IDENTITY; nn];
         for (bone, e) in pose {
