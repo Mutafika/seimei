@@ -1,13 +1,19 @@
 //! VRM spring-bone (揺れもの) simulator — secondary motion for hair / skirt / etc.
 //!
-//! Parses VRM 0.x `VRM.secondaryAnimation` and runs the UniVRM verlet step every
-//! frame in glTF-**native** space (Y-up, metres — where the bridge's skeleton
-//! lives), updating the world transforms of spring joints so the skinning that
-//! follows makes them sway. Stateful: each joint's previous tail position persists
-//! across frames, which is what produces lag/overshoot.
+//! Parses both VRM **0.x** (`VRM.secondaryAnimation`) and VRM **1.0**
+//! (`VRMC_springBone`) into one internal joint/collider model, then runs the UniVRM
+//! verlet step every frame in glTF-**native** space (Y-up, metres — where the
+//! bridge's skeleton lives), updating the world transforms of spring joints so the
+//! skinning that follows makes them sway. Stateful: each joint's previous tail
+//! position persists across frames, which is what produces lag/overshoot.
+//!
+//! Differences the parsers normalize away: 0.x groups bones into chains via the
+//! node hierarchy with one shared param set, while 1.0 lists each chain explicitly
+//! with per-joint params; 0.x colliders are spheres only, 1.0 adds capsules.
 //!
 //! One simplification vs. full UniVRM: every spring joint collides with *all*
-//! colliders (the per-group collider assignment is ignored). Fine for a first cut.
+//! colliders (the per-group / per-spring collider assignment is ignored). Fine for
+//! a first cut.
 
 use std::collections::HashSet;
 
@@ -44,11 +50,26 @@ struct Joint {
     cur_tail: Vec3,     // world (native)
 }
 
+/// Collision shape carried in the collider's local `node` space (native, metres).
+/// 0.x only emits `Sphere`; 1.0 adds `Capsule` (a sphere swept along a segment).
+#[derive(Clone)]
+enum ColliderShape {
+    Sphere { offset: Vec3, radius: f32 },
+    Capsule { offset: Vec3, tail: Vec3, radius: f32 },
+}
+
 #[derive(Clone)]
 struct Collider {
     node: usize,
-    offset: Vec3, // local offset in `node` space (native, metres)
-    radius: f32,
+    shape: ColliderShape,
+}
+
+/// Closest point on segment `a`–`b` to `p` (used to collapse a capsule to the
+/// sphere nearest the tail being constrained).
+fn closest_on_segment(a: Vec3, b: Vec3, p: Vec3) -> Vec3 {
+    let ab = b - a;
+    let t = (p - a).dot(ab) / ab.length_squared().max(1e-12);
+    a + ab * t.clamp(0.0, 1.0)
 }
 
 /// Parsed-and-built spring-bone system for one avatar.
@@ -121,7 +142,8 @@ impl SpringSystem {
                         let o = c.get("offset");
                         let ov = |k: &str| o.and_then(|d| d.get(k)).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                         let radius = c.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
-                        colliders.push(Collider { node, offset: Vec3::new(ov("x"), ov("y"), ov("z")), radius });
+                        let shape = ColliderShape::Sphere { offset: Vec3::new(ov("x"), ov("y"), ov("z")), radius };
+                        colliders.push(Collider { node, shape });
                     }
                 }
             }
@@ -193,6 +215,118 @@ impl SpringSystem {
         Some(SpringSystem { joints, colliders, enabled: true })
     }
 
+    /// Build from VRM 1.0 `VRMC_springBone`. Unlike 0.x, every chain is listed
+    /// explicitly (`springs[].joints[]`, root-first) and each joint carries its own
+    /// params; colliders may be spheres or capsules. Returns `None` if absent/empty.
+    pub fn from_vrm1(
+        ext: &serde_json::Value,
+        nodes_t: &[Vec3],
+        nodes_r: &[Quat],
+        nodes_s: &[Vec3],
+        nodes_parent: &[Option<usize>],
+        world_bind: &[Mat4],
+    ) -> Option<SpringSystem> {
+        let sb = ext.get("VRMC_springBone")?;
+        let nn = nodes_t.len();
+
+        // glTF arrays store vectors as [x, y, z] (vs 0.x's {x, y, z} objects).
+        let arr3 = |v: Option<&serde_json::Value>, dflt: Vec3| -> Vec3 {
+            v.and_then(|a| a.as_array())
+                .map(|a| {
+                    let g = |i: usize| a.get(i).and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
+                    Vec3::new(g(0), g(1), g(2))
+                })
+                .unwrap_or(dflt)
+        };
+
+        // --- colliders (sphere or capsule, flattened; every joint collides with all) ---
+        let mut colliders = Vec::new();
+        if let Some(cs) = sb.get("colliders").and_then(|c| c.as_array()) {
+            for c in cs {
+                let Some(node) = c.get("node").and_then(|v| v.as_u64()).map(|n| n as usize) else {
+                    continue;
+                };
+                let Some(shape) = c.get("shape") else { continue };
+                let r = |s: &serde_json::Value| s.get("radius").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                if let Some(sp) = shape.get("sphere") {
+                    colliders.push(Collider {
+                        node,
+                        shape: ColliderShape::Sphere { offset: arr3(sp.get("offset"), Vec3::ZERO), radius: r(sp) },
+                    });
+                } else if let Some(cap) = shape.get("capsule") {
+                    colliders.push(Collider {
+                        node,
+                        shape: ColliderShape::Capsule {
+                            offset: arr3(cap.get("offset"), Vec3::ZERO),
+                            tail: arr3(cap.get("tail"), Vec3::ZERO),
+                            radius: r(cap),
+                        },
+                    });
+                }
+            }
+        }
+
+        // --- springs: each is an explicit, root-first joint chain ---
+        let mut joints = Vec::new();
+        for spring in sb.get("springs")?.as_array()? {
+            let Some(jarr) = spring.get("joints").and_then(|j| j.as_array()) else { continue };
+            // (node, stiffness, gravity_power, gravity_dir, drag, hit_radius), in order
+            let chain: Vec<(usize, f32, f32, Vec3, f32, f32)> = jarr
+                .iter()
+                .filter_map(|jj| {
+                    let node = jj.get("node")?.as_u64()? as usize;
+                    let f = |k: &str, d: f32| jj.get(k).and_then(|v| v.as_f64()).unwrap_or(d as f64) as f32;
+                    let gdir = arr3(jj.get("gravityDir"), Vec3::NEG_Y).normalize_or(Vec3::NEG_Y);
+                    Some((node, f("stiffness", 1.0), f("gravityPower", 0.0), gdir, f("dragForce", 0.4), f("hitRadius", 0.02)))
+                })
+                .collect();
+
+            // Each chain node becomes a simulated joint; its tail is the next node in
+            // the chain (last joint extends its own bone, matching the 0.x leaf rule).
+            for i in 0..chain.len() {
+                let (node, stiffness, gravity_power, gravity_dir, drag, hit_radius) = chain[i];
+                if node >= nn {
+                    continue;
+                }
+                let parent = nodes_parent[node].unwrap_or(node);
+                let (bone_axis, length) = match chain.get(i + 1) {
+                    Some(&(child, ..)) if child < nn => {
+                        let tl = nodes_t[child]; // child's local translation = node->child offset
+                        let l = tl.length();
+                        if l > 1e-6 { (tl / l, l) } else { (Vec3::NEG_Y, 0.07) }
+                    }
+                    _ => {
+                        let tl = nodes_t[node];
+                        let l = tl.length();
+                        if l > 1e-6 { (tl / l, 0.07) } else { (Vec3::NEG_Y, 0.07) }
+                    }
+                };
+                let tail_world = world_bind[node].transform_point3(bone_axis * length);
+                joints.push(Joint {
+                    node,
+                    parent,
+                    bone_axis,
+                    length,
+                    rest_local_rot: nodes_r[node],
+                    local_t: nodes_t[node],
+                    local_s: nodes_s[node],
+                    stiffness: stiffness * STIFFNESS_SCALE,
+                    gravity_dir,
+                    gravity_power,
+                    drag: (drag * DRAG_SCALE).clamp(0.0, 1.0),
+                    radius: hit_radius,
+                    prev_tail: tail_world,
+                    cur_tail: tail_world,
+                });
+            }
+        }
+
+        if joints.is_empty() {
+            return None;
+        }
+        Some(SpringSystem { joints, colliders, enabled: true })
+    }
+
     pub fn joint_count(&self) -> usize {
         self.joints.len()
     }
@@ -208,11 +342,20 @@ impl SpringSystem {
         if !self.enabled || dt <= 0.0 {
             return;
         }
-        // collider world centres for this frame
-        let centers: Vec<(Vec3, f32)> = self
+        // collider world geometry for this frame. Spheres collapse to (centre, _, r);
+        // capsules keep both endpoints so each joint can pick its nearest point.
+        let worlds: Vec<(Vec3, Option<Vec3>, f32)> = self
             .colliders
             .iter()
-            .map(|c| (world[c.node].transform_point3(c.offset), c.radius))
+            .map(|c| {
+                let w = world[c.node];
+                match &c.shape {
+                    ColliderShape::Sphere { offset, radius } => (w.transform_point3(*offset), None, *radius),
+                    ColliderShape::Capsule { offset, tail, radius } => {
+                        (w.transform_point3(*offset), Some(w.transform_point3(*tail)), *radius)
+                    }
+                }
+            })
             .collect();
 
         for j in &mut self.joints {
@@ -229,13 +372,18 @@ impl SpringSystem {
             let mut next = j.cur_tail + inertia + stiff + ext;
             next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
 
-            // collisions: push the tail out of each sphere, then re-constrain length
-            for (center, cr) in &centers {
+            // collisions: push the tail out of each collider, then re-constrain length.
+            // A capsule reduces to the sphere at its nearest point to the tail.
+            for (a, b, cr) in &worlds {
+                let center = match b {
+                    None => *a,
+                    Some(b) => closest_on_segment(*a, *b, next),
+                };
                 let r = cr * COLLIDER_INFLATE + j.radius;
-                let d = next - *center;
+                let d = next - center;
                 let dl = d.length();
                 if dl > 1e-9 && dl < r {
-                    next = *center + d / dl * r;
+                    next = center + d / dl * r;
                 }
             }
             next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
@@ -254,5 +402,94 @@ impl SpringSystem {
             let local_rot = parent_rot.inverse() * rot_world;
             world[j.node] = parent_world * Mat4::from_scale_rotation_translation(j.local_s, local_rot, j.local_t);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A 3-node skeleton: head(0) → hairRoot(1) → hairTip(2), each child offset 0.1m
+    /// down in its parent's space. Returns the (t, r, s, parent, world_bind) arrays.
+    fn rig() -> (Vec<Vec3>, Vec<Quat>, Vec<Vec3>, Vec<Option<usize>>, Vec<Mat4>) {
+        let t = vec![Vec3::new(0.0, 1.5, 0.0), Vec3::new(0.0, -0.1, 0.0), Vec3::new(0.0, -0.1, 0.0)];
+        let r = vec![Quat::IDENTITY; 3];
+        let s = vec![Vec3::ONE; 3];
+        let parent = vec![None, Some(0), Some(1)];
+        // world_bind = parent_world * local TRS, walked root-first
+        let mut world = vec![Mat4::IDENTITY; 3];
+        for i in 0..3 {
+            let local = Mat4::from_scale_rotation_translation(s[i], r[i], t[i]);
+            world[i] = match parent[i] {
+                Some(p) => world[p] * local,
+                None => local,
+            };
+        }
+        (t, r, s, parent, world)
+    }
+
+    fn springbone_ext() -> serde_json::Value {
+        json!({
+            "VRMC_springBone": {
+                "specVersion": "1.0",
+                "colliders": [
+                    { "node": 0, "shape": { "sphere": { "offset": [0.0, 0.0, 0.0], "radius": 0.08 } } },
+                    { "node": 0, "shape": { "capsule": { "offset": [0.0, 0.0, 0.0], "tail": [0.0, -0.2, 0.0], "radius": 0.05 } } }
+                ],
+                "colliderGroups": [{ "name": "head", "colliders": [0, 1] }],
+                "springs": [{
+                    "name": "hair",
+                    "joints": [
+                        { "node": 1, "hitRadius": 0.02, "stiffness": 1.0, "gravityPower": 0.5, "gravityDir": [0.0, -1.0, 0.0], "dragForce": 0.4 },
+                        { "node": 2, "hitRadius": 0.02, "stiffness": 1.0, "gravityPower": 0.5, "gravityDir": [0.0, -1.0, 0.0], "dragForce": 0.4 }
+                    ],
+                    "colliderGroups": [0]
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn parses_vrm1_springs_and_both_collider_shapes() {
+        let (t, r, s, parent, world) = rig();
+        let sys = SpringSystem::from_vrm1(&springbone_ext(), &t, &r, &s, &parent, &world)
+            .expect("VRMC_springBone should build a system");
+        // both chain nodes become joints; sphere + capsule both parsed
+        assert_eq!(sys.joint_count(), 2);
+        assert_eq!(sys.collider_count(), 2);
+        // chain wiring: joint 0 anchors to the head (node 0), joint 1 to its parent (node 1)
+        assert_eq!(sys.joints[0].parent, 0);
+        assert_eq!(sys.joints[1].parent, 1);
+        // STIFFNESS_SCALE / DRAG_SCALE applied from the per-joint params
+        assert!((sys.joints[0].stiffness - STIFFNESS_SCALE).abs() < 1e-6);
+        assert!((sys.joints[0].drag - (0.4 * DRAG_SCALE)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn from_vrm1_returns_none_without_extension() {
+        let (t, r, s, parent, world) = rig();
+        assert!(SpringSystem::from_vrm1(&json!({ "VRM": {} }), &t, &r, &s, &parent, &world).is_none());
+    }
+
+    #[test]
+    fn sideways_gravity_swings_tail() {
+        // Hair hangs straight down; a *sideways* gravity must bend it toward +X
+        // (vertical gravity on a vertical strand is a degenerate equilibrium).
+        let (t, r, s, parent, world_bind) = rig();
+        let mut ext = springbone_ext();
+        for j in ext["VRMC_springBone"]["springs"][0]["joints"].as_array_mut().unwrap() {
+            j["gravityDir"] = json!([1.0, 0.0, 0.0]);
+            j["gravityPower"] = json!(1.0);
+        }
+        let mut sys = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        let tail0 = sys.joints[1].cur_tail;
+        let mut world = world_bind.clone();
+        for _ in 0..60 {
+            sys.step(&mut world, 1.0 / 60.0);
+        }
+        let tail1 = sys.joints[1].cur_tail;
+        assert!(tail1.is_finite());
+        assert!(tail1.x > tail0.x + 1e-3, "tail should swing toward +X under sideways gravity");
     }
 }

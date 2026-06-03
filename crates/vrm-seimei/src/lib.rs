@@ -53,6 +53,12 @@ fn pos_seimei_to_native(p: [f32; 3]) -> [f32; 3] {
 fn pos_native_to_seimei(p: [f32; 3]) -> [f32; 3] {
     [p[0] * 1000.0, -p[2] * 1000.0, p[1] * 1000.0]
 }
+/// Public alias: glTF-native (Y-up/metres, where `world_for_pose` lives) → seimei
+/// render space (Z-up/millimetres). For callers placing physics zones in seimei space.
+#[inline]
+pub fn yup_m_to_zup_mm(p: [f32; 3]) -> [f32; 3] {
+    pos_native_to_seimei(p)
+}
 #[inline]
 fn dir_seimei_to_native(d: [f32; 3]) -> [f32; 3] {
     [d[0], d[2], -d[1]]
@@ -229,12 +235,14 @@ impl VrmAvatar {
             return Err("vrm has no skinned primitive".into());
         }
 
-        // VRM 0.x spring bones (揺れもの), if the model defines any.
+        // Spring bones (揺れもの), if the model defines any: VRM 1.0 (VRMC_springBone)
+        // first, falling back to 0.x (VRM.secondaryAnimation).
         let spring = scene
             .extensions_json
             .as_ref()
             .and_then(|ext| {
-                SpringSystem::from_vrm0(ext, &nodes_t, &nodes_r, &nodes_s, &nodes_parent, &world_bind)
+                SpringSystem::from_vrm1(ext, &nodes_t, &nodes_r, &nodes_s, &nodes_parent, &world_bind)
+                    .or_else(|| SpringSystem::from_vrm0(ext, &nodes_t, &nodes_r, &nodes_s, &nodes_parent, &world_bind))
             });
 
         // 表情: normalize VRM 1.0 expressions or 0.x blendShapeMaster into one model.
