@@ -193,6 +193,14 @@ impl AvatarController {
     /// Advance all motion by `dt` seconds and return the posed meshes, one per
     /// primitive (same order as `self.avatar().primitives()`).
     pub fn update(&mut self, dt: f32) -> Vec<RenderMesh> {
+        self.update_with_overlay(dt, &[])
+    }
+
+    /// Like [`update`](Self::update), but **adds** `overlay` rotations (VRM bone
+    /// name → local euler `[X,Y,Z]` rad) onto the composed pose just before
+    /// skinning. The joint-control seam for external physics: feed PD wobble,
+    /// active-ragdoll targets, etc. Unknown bones are pushed as new entries.
+    pub fn update_with_overlay(&mut self, dt: f32, overlay: &[(&str, [f32; 3])]) -> Vec<RenderMesh> {
         if !self.paused {
             self.player.update(dt);
         }
@@ -266,6 +274,17 @@ impl AvatarController {
                 0.0
             };
             self.avatar.set_expression(ExpressionPreset::Blink, w);
+        }
+
+        // 外部物理オーバーレイ（PD揺れ・active-ragdoll目標等）を pose に加算。
+        for (bone, e) in overlay {
+            if let Some(p) = pose.iter_mut().find(|(n, _)| n == bone) {
+                p.1[0] += e[0];
+                p.1[1] += e[1];
+                p.1[2] += e[2];
+            } else {
+                pose.push((bone, *e));
+            }
         }
 
         // skin_dynamic advances the spring-bone (揺れもの) sim by dt each frame.
