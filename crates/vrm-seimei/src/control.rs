@@ -6,6 +6,7 @@
 //! UI-agnostic: no window, camera, or egui here — embed it under any renderer
 //! (the dev `vrm-viewer` binary is one such host; mearie's persona is another).
 
+use glam::Mat4;
 use seimei::RenderMesh;
 use vrm_anatomy::animation::AnimationPlayer;
 
@@ -58,6 +59,9 @@ pub struct AvatarController {
     speech: Visemes,
     speech_time: f32,
     mouth: [f32; 5], // smoothed weights for VOWELS
+    /// 直近フレームの「ポーズ済み world 変換」(native Y-up/m, node index)。外部物理が
+    /// 生きた骨位置（歩行で動く手など）にアンカーできるよう毎フレーム保存する。
+    last_world: Vec<Mat4>,
 }
 
 impl AvatarController {
@@ -77,7 +81,14 @@ impl AvatarController {
             speech: Vec::new(),
             speech_time: 0.0,
             mouth: [0.0; 5],
+            last_world: Vec::new(),
         }
+    }
+
+    /// 直近 [`update`](Self::update) 時点のポーズ済み world 変換（native Y-up/m、
+    /// glTF node index）。空なら未更新。外部物理のアンカー取得に使う。
+    pub fn world(&self) -> &[Mat4] {
+        &self.last_world
     }
 
     /// The wrapped avatar (materials, presets, spring info, etc.).
@@ -286,6 +297,10 @@ impl AvatarController {
                 pose.push((bone, *e));
             }
         }
+
+        // 外部物理アンカー用に「ポーズ済み world 変換」を保存（skin_dynamic と同じ
+        // pose から計算）。歩行で動く手などの生きた位置をここから取れる。
+        self.last_world = self.avatar.world_for_pose(&pose);
 
         // skin_dynamic advances the spring-bone (揺れもの) sim by dt each frame.
         self.avatar.skin_dynamic(&pose, dt)
