@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "seimei"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bytemuck",
  "egui",
@@ -3499,7 +3499,7 @@ dependencies = [
 
 [[package]]
 name = "vrm-seimei"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "glam",
  "rayon",
