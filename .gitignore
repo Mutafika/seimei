@@ -7,3 +7,7 @@ Thumbs.db
 # Editor
 *.swp
 *.swo
+
+# Downloaded / sample VRM assets — large binaries, not redistributed.
+# Examples take the model path as an arg, so the repo doesn't need them.
+*.vrm

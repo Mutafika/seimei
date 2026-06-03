@@ -2,6 +2,8 @@
 //!
 //! Y-up → Z-up 座標系変換、メートル → ミリメートル スケール変換
 
+use std::collections::HashMap;
+
 use crate::math::{Point3, Vec3D};
 use crate::mesh::{RenderMesh, Vertex};
 use thiserror::Error;
@@ -46,6 +48,10 @@ pub struct GltfTextureData {
 #[derive(Clone, Debug)]
 pub struct GltfSkinBinding {
     pub joint_names: Vec<String>,
+    /// glTF node index of each joint (same order as `joint_names` / IBMs). Needed
+    /// to rebuild the skeleton hierarchy — node indices are the unambiguous key
+    /// (names can collide), e.g. for CPU skinning in the `vrm-seimei` bridge.
+    pub joint_nodes: Vec<usize>,
     pub joints_per_vertex: Vec<[u32; 4]>,
     pub weights_per_vertex: Vec<[f32; 4]>,
     pub inverse_bind_matrices: Vec<[[f32; 4]; 4]>,
@@ -119,11 +125,22 @@ fn load_from_document(
 ) -> Result<GltfScene, GltfError> {
     let mut primitives = Vec::new();
 
-    let (skin_joint_names, skin_ibms) = extract_skin_data(document, buffers);
+    let mesh_skin = build_mesh_skin_map(document);
 
     for mesh in document.meshes() {
         let mesh_name = mesh.name().unwrap_or("unnamed");
         debug!("メッシュ処理: {} (プリミティブ数: {})", mesh_name, mesh.primitives().count());
+
+        // Each mesh is skinned by the skin on the node that references it. VRM
+        // exports one skin per mesh chunk, so a single global skin would interpret
+        // every other chunk's JOINTS_0 against the wrong joint list (scrambling).
+        let (skin_joint_names, skin_joint_nodes, skin_ibms) = match mesh_skin.get(&mesh.index()) {
+            Some(skin) => {
+                let (n, ni, ib) = extract_one_skin(skin, buffers);
+                (Some(n), Some(ni), Some(ib))
+            }
+            None => (None, None, None),
+        };
 
         let target_names = extract_target_names(&mesh);
         let default_weights: Vec<f32> = mesh.weights().unwrap_or(&[]).to_vec();
@@ -154,7 +171,7 @@ fn load_from_document(
                 None => (0..positions.len() as u32).collect(),
             };
 
-            let skin_binding = read_skin_binding(&primitive, buffers, &positions, &skin_joint_names, &skin_ibms);
+            let skin_binding = read_skin_binding(&primitive, buffers, &positions, &skin_joint_names, &skin_joint_nodes, &skin_ibms);
 
             let vertices: Vec<Vertex> = positions.iter()
                 .zip(normals.iter())
@@ -212,27 +229,39 @@ fn load_from_document(
     Ok(GltfScene { primitives, extensions_json, nodes })
 }
 
-fn extract_skin_data(
-    document: &gltf::Document,
-    buffers: &[gltf::buffer::Data],
-) -> (Option<Vec<String>>, Option<Vec<[[f32; 4]; 4]>>) {
-    let best_skin = document.skins().max_by_key(|s| s.joints().count());
-    match best_skin {
-        Some(skin) => {
-            let names: Vec<String> = skin.joints()
-                .map(|node| node.name().unwrap_or("unnamed_joint").to_string())
-                .collect();
-            let ibms = skin.reader(|buf| Some(&buffers[buf.index()]))
-                .read_inverse_bind_matrices()
-                .map(|iter| iter.collect())
-                .unwrap_or_else(|| {
-                    vec![[[1.0,0.0,0.0,0.0],[0.0,1.0,0.0,0.0],[0.0,0.0,1.0,0.0],[0.0,0.0,0.0,1.0]]; names.len()]
-                });
-            info!("glTFスキン検出: {}ジョイント", names.len());
-            (Some(names), Some(ibms))
+/// Map each mesh index to the skin of a node that references it. VRM exports one
+/// skin per mesh chunk; first writer wins if a mesh is instanced by many nodes.
+fn build_mesh_skin_map(document: &gltf::Document) -> HashMap<usize, gltf::Skin<'_>> {
+    let mut map = HashMap::new();
+    for node in document.nodes() {
+        if let (Some(mesh), Some(skin)) = (node.mesh(), node.skin()) {
+            map.entry(mesh.index()).or_insert(skin);
         }
-        None => (None, None),
     }
+    map
+}
+
+/// Extract one skin's joint names, joint node indices, and inverse-bind matrices.
+fn extract_one_skin(
+    skin: &gltf::Skin,
+    buffers: &[gltf::buffer::Data],
+) -> (Vec<String>, Vec<usize>, Vec<[[f32; 4]; 4]>) {
+    let names: Vec<String> = skin
+        .joints()
+        .map(|node| node.name().unwrap_or("unnamed_joint").to_string())
+        .collect();
+    let node_indices: Vec<usize> = skin.joints().map(|node| node.index()).collect();
+    let ibms = skin
+        .reader(|buf| Some(&buffers[buf.index()]))
+        .read_inverse_bind_matrices()
+        .map(|iter| iter.collect())
+        .unwrap_or_else(|| {
+            vec![
+                [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+                node_indices.len()
+            ]
+        });
+    (names, node_indices, ibms)
 }
 
 fn extract_target_names(mesh: &gltf::Mesh) -> Vec<String> {
@@ -251,6 +280,7 @@ fn read_skin_binding(
     buffers: &[gltf::buffer::Data],
     positions: &[[f32; 3]],
     skin_joint_names: &Option<Vec<String>>,
+    skin_joint_nodes: &Option<Vec<usize>>,
     skin_ibms: &Option<Vec<[[f32; 4]; 4]>>,
 ) -> Option<GltfSkinBinding> {
     let joints_opt = primitive.reader(|b| Some(&buffers[b.index()])).read_joints(0);
@@ -266,6 +296,7 @@ fn read_skin_binding(
             if joints.len() == positions.len() && weights.len() == positions.len() {
                 Some(GltfSkinBinding {
                     joint_names: joint_names.clone(),
+                    joint_nodes: skin_joint_nodes.clone().unwrap_or_default(),
                     joints_per_vertex: joints,
                     weights_per_vertex: weights,
                     inverse_bind_matrices: skin_ibms.clone().unwrap_or_default(),
