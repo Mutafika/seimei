@@ -98,6 +98,11 @@ pub struct SpringSystem {
     /// gusted per joint. `wind_strength == 0` means no wind.
     wind_dir: Vec3,
     wind_strength: f32,
+    /// Extra steady downward gravity (native -Y) added to every joint on top of the
+    /// per-joint `gravity_power`. Many VRM models author `gravityPower≈0` (hair held
+    /// only by stiffness), so this lets a host force the strands to hang under
+    /// gravity (e.g. a limp/hanging body). 0 = no extra gravity.
+    gravity_boost: f32,
     /// Accumulated sim time, for gust phase.
     time: f32,
 }
@@ -114,7 +119,15 @@ struct RawGroup {
 impl SpringSystem {
     /// Wrap parsed joints/colliders, defaulting wind off. Shared by both parsers.
     fn build(joints: Vec<Joint>, colliders: Vec<Collider>) -> SpringSystem {
-        SpringSystem { joints, colliders, enabled: true, wind_dir: Vec3::X, wind_strength: 0.0, time: 0.0 }
+        SpringSystem {
+            joints,
+            colliders,
+            enabled: true,
+            wind_dir: Vec3::X,
+            wind_strength: 0.0,
+            gravity_boost: 0.0,
+            time: 0.0,
+        }
     }
 
     /// Build from VRM 0.x `secondaryAnimation` in the glTF extensions JSON. Returns
@@ -374,6 +387,17 @@ impl SpringSystem {
         self.wind_strength
     }
 
+    /// Extra steady downward (native -Y) gravity added to every joint, on top of the
+    /// model's per-joint `gravityPower`. Lets a host force the strands to hang under
+    /// gravity even when the model authored ~0 gravity. 0 disables.
+    pub fn set_gravity_boost(&mut self, power: f32) {
+        self.gravity_boost = power.max(0.0);
+    }
+
+    pub fn gravity_boost(&self) -> f32 {
+        self.gravity_boost
+    }
+
     /// Advance one step and overwrite `world[node]` for every spring joint. `world`
     /// must be the animation-posed skeleton (native space); the head/skirt anchors
     /// (non-spring parents) are read from it, so the springs follow the body.
@@ -383,6 +407,7 @@ impl SpringSystem {
         }
         // Wind for this frame (copied out so the &mut self.joints loop can read them).
         let (wind_dir, wind_strength) = (self.wind_dir, self.wind_strength);
+        let gravity_boost = self.gravity_boost;
         self.time += dt;
         let time = self.time;
         // Heading wanders slowly around vertical so it's not a fixed vector.
@@ -418,7 +443,8 @@ impl SpringSystem {
             // verlet integrate the tail
             let inertia = (j.cur_tail - j.prev_tail) * (1.0 - j.drag);
             let stiff = rest_dir * (j.stiffness * dt);
-            let ext = j.gravity_dir * (j.gravity_power * dt);
+            // per-joint gravity ＋ ホスト指定の追加重力（native -Y, steady）。
+            let ext = j.gravity_dir * (j.gravity_power * dt) + Vec3::NEG_Y * (gravity_boost * dt);
             // wind: gusty envelope (calm↔gust) + wandering heading; each strand is
             // time-offset so they don't all surge together.
             let wind = if wind_strength > 0.0 {

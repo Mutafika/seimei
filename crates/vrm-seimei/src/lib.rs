@@ -455,6 +455,16 @@ impl VrmAvatar {
         }
     }
 
+    /// Add extra steady downward gravity to every 揺れもの joint (on top of the
+    /// model's authored `gravityPower`). For limp/hanging poses where the hair
+    /// should fall under gravity even though the model authored ~0 gravity. 0
+    /// disables. No-op if the model has no spring config.
+    pub fn set_gravity_boost(&mut self, power: f32) {
+        if let Some(s) = self.spring.as_mut() {
+            s.set_gravity_boost(power);
+        }
+    }
+
     /// (node index, node name, is-a-skin-joint in any primitive) for a humanoid
     /// bone — debug.
     pub fn debug_bone_info(&self, bone: &str) -> Option<(usize, String, bool)> {
