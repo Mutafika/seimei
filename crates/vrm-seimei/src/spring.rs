@@ -30,6 +30,23 @@ const COLLIDER_INFLATE: f32 = 1.0;
 const STIFFNESS_SCALE: f32 = 0.45;
 const DRAG_SCALE: f32 = 0.8;
 
+/// Wind turbulence. The steady wind is modulated by a non-repeating gust envelope
+/// (layered incommensurate sines — no RNG, so the sim stays deterministic) that
+/// ranges from near-calm (`WIND_LULL`) up to full gust, while the heading slowly
+/// wanders by ±`WIND_WANDER` rad around vertical. Each strand is phase-shifted by
+/// `WIND_PHASE_STEP * index` so gusts hit them at slightly different moments.
+const WIND_LULL: f32 = 0.15; // envelope floor (0 = dead calm between gusts)
+const WIND_WANDER: f32 = 0.5; // heading wander amplitude (rad)
+const WIND_PHASE_STEP: f32 = 0.35;
+
+/// Non-repeating gust envelope in ~[0,1] from layered incommensurate sines. The
+/// frequencies (≈7s/2.7s/1.2s periods) don't share a common multiple, so the sum
+/// never visibly repeats — reads as natural gustiness rather than a pulse.
+fn gust_env(t: f32) -> f32 {
+    let n = 0.5 * (t * 0.9).sin() + 0.3 * (t * 2.3 + 1.7).sin() + 0.2 * (t * 5.1 + 4.2).sin();
+    (n * 0.5 + 0.5).clamp(0.0, 1.0)
+}
+
 /// A simulated spring joint. Order in `SpringSystem::joints` is parent-before-child
 /// so a joint's parent world is already finalized when we reach it.
 #[derive(Clone)]
@@ -77,6 +94,12 @@ pub struct SpringSystem {
     joints: Vec<Joint>,
     colliders: Vec<Collider>,
     pub enabled: bool,
+    /// Steady wind direction (native space, unit). Force = `wind_dir * wind_strength`,
+    /// gusted per joint. `wind_strength == 0` means no wind.
+    wind_dir: Vec3,
+    wind_strength: f32,
+    /// Accumulated sim time, for gust phase.
+    time: f32,
 }
 
 struct RawGroup {
@@ -89,6 +112,11 @@ struct RawGroup {
 }
 
 impl SpringSystem {
+    /// Wrap parsed joints/colliders, defaulting wind off. Shared by both parsers.
+    fn build(joints: Vec<Joint>, colliders: Vec<Collider>) -> SpringSystem {
+        SpringSystem { joints, colliders, enabled: true, wind_dir: Vec3::X, wind_strength: 0.0, time: 0.0 }
+    }
+
     /// Build from VRM 0.x `secondaryAnimation` in the glTF extensions JSON. Returns
     /// `None` if there's no spring config (or it's empty).
     pub fn from_vrm0(
@@ -212,7 +240,7 @@ impl SpringSystem {
         if joints.is_empty() {
             return None;
         }
-        Some(SpringSystem { joints, colliders, enabled: true })
+        Some(SpringSystem::build(joints, colliders))
     }
 
     /// Build from VRM 1.0 `VRMC_springBone`. Unlike 0.x, every chain is listed
@@ -324,7 +352,7 @@ impl SpringSystem {
         if joints.is_empty() {
             return None;
         }
-        Some(SpringSystem { joints, colliders, enabled: true })
+        Some(SpringSystem::build(joints, colliders))
     }
 
     pub fn joint_count(&self) -> usize {
@@ -335,6 +363,17 @@ impl SpringSystem {
         self.colliders.len()
     }
 
+    /// Set the steady wind (native space). `strength` 0 disables it; the direction is
+    /// normalized. Gusts and per-strand desync are applied internally in `step`.
+    pub fn set_wind(&mut self, dir: Vec3, strength: f32) {
+        self.wind_dir = dir.normalize_or(Vec3::X);
+        self.wind_strength = strength.max(0.0);
+    }
+
+    pub fn wind_strength(&self) -> f32 {
+        self.wind_strength
+    }
+
     /// Advance one step and overwrite `world[node]` for every spring joint. `world`
     /// must be the animation-posed skeleton (native space); the head/skirt anchors
     /// (non-spring parents) are read from it, so the springs follow the body.
@@ -342,6 +381,17 @@ impl SpringSystem {
         if !self.enabled || dt <= 0.0 {
             return;
         }
+        // Wind for this frame (copied out so the &mut self.joints loop can read them).
+        let (wind_dir, wind_strength) = (self.wind_dir, self.wind_strength);
+        self.time += dt;
+        let time = self.time;
+        // Heading wanders slowly around vertical so it's not a fixed vector.
+        let gust_dir = if wind_strength > 0.0 {
+            let yaw = WIND_WANDER * ((time * 0.27).sin() + 0.5 * (time * 0.6 + 2.0).sin());
+            Quat::from_rotation_y(yaw) * wind_dir
+        } else {
+            wind_dir
+        };
         // collider world geometry for this frame. Spheres collapse to (centre, _, r);
         // capsules keep both endpoints so each joint can pick its nearest point.
         let worlds: Vec<(Vec3, Option<Vec3>, f32)> = self
@@ -358,7 +408,7 @@ impl SpringSystem {
             })
             .collect();
 
-        for j in &mut self.joints {
+        for (idx, j) in self.joints.iter_mut().enumerate() {
             let parent_world = world[j.parent];
             let (_, parent_rot, _) = parent_world.to_scale_rotation_translation();
             let world_pos = parent_world.transform_point3(j.local_t);
@@ -369,7 +419,16 @@ impl SpringSystem {
             let inertia = (j.cur_tail - j.prev_tail) * (1.0 - j.drag);
             let stiff = rest_dir * (j.stiffness * dt);
             let ext = j.gravity_dir * (j.gravity_power * dt);
-            let mut next = j.cur_tail + inertia + stiff + ext;
+            // wind: gusty envelope (calm↔gust) + wandering heading; each strand is
+            // time-offset so they don't all surge together.
+            let wind = if wind_strength > 0.0 {
+                let env = gust_env(time + idx as f32 * WIND_PHASE_STEP);
+                let speed = wind_strength * (WIND_LULL + (1.0 - WIND_LULL) * env);
+                gust_dir * (speed * dt)
+            } else {
+                Vec3::ZERO
+            };
+            let mut next = j.cur_tail + inertia + stiff + ext + wind;
             next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
 
             // collisions: push the tail out of each collider, then re-constrain length.
@@ -491,5 +550,37 @@ mod tests {
         let tail1 = sys.joints[1].cur_tail;
         assert!(tail1.is_finite());
         assert!(tail1.x > tail0.x + 1e-3, "tail should swing toward +X under sideways gravity");
+    }
+
+    #[test]
+    fn wind_blows_strands_and_toggles_off() {
+        // Gravity-free strand: with no wind it stays put; +X wind blows it toward +X.
+        let (t, r, s, parent, world_bind) = rig();
+        let mut ext = springbone_ext();
+        for j in ext["VRMC_springBone"]["springs"][0]["joints"].as_array_mut().unwrap() {
+            j["gravityPower"] = json!(0.0);
+        }
+        let step60 = |sys: &mut SpringSystem| {
+            let mut world = world_bind.clone();
+            for _ in 0..60 {
+                sys.step(&mut world, 1.0 / 60.0);
+            }
+        };
+
+        // no wind → essentially static
+        let mut calm = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        assert_eq!(calm.wind_strength(), 0.0);
+        let tip0 = calm.joints[1].cur_tail;
+        step60(&mut calm);
+        assert!((calm.joints[1].cur_tail - tip0).length() < 1e-4, "no wind, no gravity → no drift");
+
+        // +X wind → tip is pushed toward +X
+        let mut windy = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        windy.set_wind(Vec3::X, 2.0);
+        assert!(windy.wind_strength() > 0.0);
+        step60(&mut windy);
+        let tip = windy.joints[1].cur_tail;
+        assert!(tip.is_finite());
+        assert!(tip.x > tip0.x + 1e-3, "wind should blow the tip toward +X");
     }
 }

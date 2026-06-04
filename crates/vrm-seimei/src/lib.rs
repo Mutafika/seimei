@@ -442,6 +442,19 @@ impl VrmAvatar {
         }
     }
 
+    /// Current wind strength on the spring bones (0 = no wind).
+    pub fn wind_strength(&self) -> f32 {
+        self.spring.as_ref().map(|s| s.wind_strength()).unwrap_or(0.0)
+    }
+
+    /// Set wind on the 揺れもの (native space dir; strength 0 disables). No-op if
+    /// the model has no spring config.
+    pub fn set_wind(&mut self, dir: glam::Vec3, strength: f32) {
+        if let Some(s) = self.spring.as_mut() {
+            s.set_wind(dir, strength);
+        }
+    }
+
     /// (node index, node name, is-a-skin-joint in any primitive) for a humanoid
     /// bone — debug.
     pub fn debug_bone_info(&self, bone: &str) -> Option<(usize, String, bool)> {
