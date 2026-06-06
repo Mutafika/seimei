@@ -6,6 +6,8 @@
 //! UI-agnostic: no window, camera, or egui here — embed it under any renderer
 //! (the dev `vrm-viewer` binary is one such host; mearie's persona is another).
 
+use std::collections::HashMap;
+
 use glam::Mat4;
 use seimei::RenderMesh;
 use vrm_anatomy::animation::AnimationPlayer;
@@ -26,6 +28,8 @@ const BLINK_DUR: f32 = 0.14;
 /// per frame (a low lerp avoids snapping between visemes → a continuous flap).
 const MOUTH_OPEN: f32 = 0.9;
 const MOUTH_LERP: f32 = 0.3;
+/// 表情(emotion)の weight が目標へ寄る速さ /s。大きいほど速くフェード（スナップ防止）。
+const EMOTION_EASE_RATE: f32 = 9.0;
 
 /// The 5 mouth/vowel presets, indexed by the lip-sync viseme index 0..=4.
 const VOWELS: [ExpressionPreset; 5] = [
@@ -59,6 +63,11 @@ pub struct AvatarController {
     speech: Visemes,
     speech_time: f32,
     mouth: [f32; 5], // smoothed weights for VOWELS
+    /// 表情の目標 weight（preset→0..1）。set_emotion 系で設定し、毎フレーム emotion_now を
+    /// これへ ease させる＝スナップせず滑らかにフェード。blink/母音(lip-sync)は対象外。
+    emotion_target: HashMap<ExpressionPreset, f32>,
+    /// 現在の実 weight（ease の途中値）。emotion_target へ寄せながら set_expression する。
+    emotion_now: HashMap<ExpressionPreset, f32>,
     /// 腕を T-pose から脇へ下ろす量(0=T-pose で真横, 1=真下)。既定は [`ARM_DOWN`]。
     /// 吊り下げ等で腕を開いたままにしたい外部制御から差し替えられる。
     arm_down: f32,
@@ -84,6 +93,8 @@ impl AvatarController {
             speech: Vec::new(),
             speech_time: 0.0,
             mouth: [0.0; 5],
+            emotion_target: HashMap::new(),
+            emotion_now: HashMap::new(),
             arm_down: ARM_DOWN,
             last_world: Vec::new(),
         }
@@ -179,22 +190,35 @@ impl AvatarController {
         self.set_auto_blink(!self.auto_blink);
     }
 
-    /// Set one emotion/vowel exclusively (clears every other non-blink preset).
+    /// Set one emotion exclusively at full strength (others fade out). Eased.
     pub fn set_emotion(&mut self, p: ExpressionPreset) {
-        for pr in self.avatar.available_presets() {
-            if !is_blink(pr) {
-                self.avatar.set_expression(pr, 0.0);
-            }
-        }
-        self.avatar.set_expression(p, 1.0);
+        self.set_emotion_weighted(p, 1.0);
     }
-    /// Clear every non-blink expression (back to the neutral face).
-    pub fn clear_face(&mut self) {
-        for pr in self.avatar.available_presets() {
-            if !is_blink(pr) {
-                self.avatar.set_expression(pr, 0.0);
-            }
+
+    /// Set one emotion exclusively at strength `w` (0..1). Every other non-blink
+    /// target fades to 0. The actual weight eases toward `w` (no snap).
+    pub fn set_emotion_weighted(&mut self, p: ExpressionPreset, w: f32) {
+        self.emotion_target.clear();
+        let w = w.clamp(0.0, 1.0);
+        if w > 0.0 {
+            self.emotion_target.insert(p, w);
         }
+    }
+
+    /// Blend an emotion in at strength `w` **without** clearing the others — lets
+    /// several presets overlay (e.g. 0.7 Happy + 0.3 Surprised). `w<=0` removes it.
+    pub fn blend_emotion(&mut self, p: ExpressionPreset, w: f32) {
+        let w = w.clamp(0.0, 1.0);
+        if w <= 0.0 {
+            self.emotion_target.remove(&p);
+        } else {
+            self.emotion_target.insert(p, w);
+        }
+    }
+
+    /// Clear every non-blink expression (fades back to the neutral face).
+    pub fn clear_face(&mut self) {
+        self.emotion_target.clear();
     }
 
     // --- lip-sync -----------------------------------------------------------
@@ -248,6 +272,37 @@ impl AvatarController {
             (0.0, 0.0)
         };
         pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs));
+
+        // 表情(emotion)を毎フレーム目標 weight へ ease（スナップ防止）。blink は別管理、
+        // 母音は下の lip-sync が後で上書きするのでここで触っても問題ない。
+        if !self.emotion_target.is_empty() || !self.emotion_now.is_empty() {
+            let step = (dt * EMOTION_EASE_RATE).min(1.0);
+            // target にも now にも現れる preset を集める。
+            let mut keys: Vec<ExpressionPreset> = self.emotion_now.keys().copied().collect();
+            for &k in self.emotion_target.keys() {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+            for p in keys {
+                if is_blink(p) {
+                    continue;
+                }
+                let tgt = self.emotion_target.get(&p).copied().unwrap_or(0.0);
+                let now = self.emotion_now.get(&p).copied().unwrap_or(0.0);
+                let mut nw = now + (tgt - now) * step;
+                if (nw - tgt).abs() < 0.005 {
+                    nw = tgt;
+                }
+                if nw <= 0.001 && tgt <= 0.001 {
+                    self.emotion_now.remove(&p);
+                    self.avatar.set_expression(p, 0.0);
+                } else {
+                    self.emotion_now.insert(p, nw);
+                    self.avatar.set_expression(p, nw);
+                }
+            }
+        }
 
         // Lip-sync: walk the viseme schedule, ease the mouth toward the current
         // vowel. Touches only the 5 vowel presets, so an emotion/blink stays on.
