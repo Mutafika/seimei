@@ -63,6 +63,7 @@ struct Joint {
     gravity_power: f32,
     drag: f32,
     radius: f32,        // hit radius (metres)
+    group: u32,         // index into SpringSystem::group_names (the owning chain)
     prev_tail: Vec3,    // world (native)
     cur_tail: Vec3,     // world (native)
 }
@@ -103,11 +104,24 @@ pub struct SpringSystem {
     /// only by stiffness), so this lets a host force the strands to hang under
     /// gravity (e.g. a limp/hanging body). 0 = no extra gravity.
     gravity_boost: f32,
+    /// Names of the spring chains (vrm1 `springs[].name` / vrm0 group comment), indexed
+    /// by `Joint::group`. Lets a host address one labelled chain by name.
+    group_names: Vec<String>,
+    /// Per-group steady external force (native space) added to every joint in that group,
+    /// on top of gravity/wind. Lets a host drive one chain (e.g. a labelled secondary
+    /// bone) without disturbing the others. Parallel to `group_names`; ZERO = none.
+    group_forces: Vec<Vec3>,
+    /// Per-group drag override (parallel to `group_names`). `< 0` = no override (use each
+    /// joint's own `drag`). Lets a host temporarily over-damp one chain so it follows a
+    /// driving force smoothly instead of whipping/resonating (a soft, low-drag chain
+    /// resonates under a steady oscillating force). `< 0` restores the authored drag.
+    group_drags: Vec<f32>,
     /// Accumulated sim time, for gust phase.
     time: f32,
 }
 
 struct RawGroup {
+    name: String,
     stiffness: f32,
     gravity_power: f32,
     gravity_dir: Vec3,
@@ -118,7 +132,9 @@ struct RawGroup {
 
 impl SpringSystem {
     /// Wrap parsed joints/colliders, defaulting wind off. Shared by both parsers.
-    fn build(joints: Vec<Joint>, colliders: Vec<Collider>) -> SpringSystem {
+    fn build(joints: Vec<Joint>, colliders: Vec<Collider>, group_names: Vec<String>) -> SpringSystem {
+        let group_forces = vec![Vec3::ZERO; group_names.len()];
+        let group_drags = vec![-1.0; group_names.len()];
         SpringSystem {
             joints,
             colliders,
@@ -126,6 +142,9 @@ impl SpringSystem {
             wind_dir: Vec3::X,
             wind_strength: 0.0,
             gravity_boost: 0.0,
+            group_names,
+            group_drags,
+            group_forces,
             time: 0.0,
         }
     }
@@ -161,6 +180,7 @@ impl SpringSystem {
                     .filter_map(|b| b.as_u64().map(|n| n as usize))
                     .collect();
                 Some(RawGroup {
+                    name: g.get("comment").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     stiffness: f("stiffiness", 1.0), // NB: VRM 0.x spec misspells it "stiffiness"
                     gravity_power: f("gravityPower", 0.0),
                     gravity_dir: gravity_dir.normalize_or(Vec3::NEG_Y),
@@ -201,7 +221,8 @@ impl SpringSystem {
 
         let mut joints = Vec::new();
         let mut seen = HashSet::new();
-        for g in &groups {
+        let group_names: Vec<String> = groups.iter().map(|g| g.name.clone()).collect();
+        for (gi, g) in groups.iter().enumerate() {
             for &root in &g.bones {
                 if root >= nn {
                     continue;
@@ -240,6 +261,7 @@ impl SpringSystem {
                         gravity_power: g.gravity_power,
                         drag: (g.drag * DRAG_SCALE).clamp(0.0, 1.0),
                         radius: g.hit_radius,
+                        group: gi as u32,
                         prev_tail: tail_world,
                         cur_tail: tail_world,
                     });
@@ -253,7 +275,7 @@ impl SpringSystem {
         if joints.is_empty() {
             return None;
         }
-        Some(SpringSystem::build(joints, colliders))
+        Some(SpringSystem::build(joints, colliders, group_names))
     }
 
     /// Build from VRM 1.0 `VRMC_springBone`. Unlike 0.x, every chain is listed
@@ -309,8 +331,11 @@ impl SpringSystem {
 
         // --- springs: each is an explicit, root-first joint chain ---
         let mut joints = Vec::new();
+        let mut group_names = Vec::new();
         for spring in sb.get("springs")?.as_array()? {
             let Some(jarr) = spring.get("joints").and_then(|j| j.as_array()) else { continue };
+            let gi = group_names.len() as u32;
+            group_names.push(spring.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string());
             // (node, stiffness, gravity_power, gravity_dir, drag, hit_radius), in order
             let chain: Vec<(usize, f32, f32, Vec3, f32, f32)> = jarr
                 .iter()
@@ -356,6 +381,7 @@ impl SpringSystem {
                     gravity_power,
                     drag: (drag * DRAG_SCALE).clamp(0.0, 1.0),
                     radius: hit_radius,
+                    group: gi,
                     prev_tail: tail_world,
                     cur_tail: tail_world,
                 });
@@ -365,7 +391,7 @@ impl SpringSystem {
         if joints.is_empty() {
             return None;
         }
-        Some(SpringSystem::build(joints, colliders))
+        Some(SpringSystem::build(joints, colliders, group_names))
     }
 
     pub fn joint_count(&self) -> usize {
@@ -398,6 +424,40 @@ impl SpringSystem {
         self.gravity_boost
     }
 
+    /// Apply a steady external force (native space) to every joint whose chain name
+    /// contains `name` (case-insensitive), on top of gravity/wind. Lets a host drive
+    /// one labelled chain — e.g. orbit a force to slosh a specific secondary bone —
+    /// without touching the others. `Vec3::ZERO` clears it. Returns true if any chain
+    /// matched.
+    pub fn set_group_force(&mut self, name: &str, force: Vec3) -> bool {
+        let key = name.to_ascii_lowercase();
+        let mut hit = false;
+        for (gn, gf) in self.group_names.iter().zip(self.group_forces.iter_mut()) {
+            if gn.to_ascii_lowercase().contains(&key) {
+                *gf = force;
+                hit = true;
+            }
+        }
+        hit
+    }
+
+    /// Override the drag (0..1) of every joint whose chain name contains `name`
+    /// (case-insensitive). `Some(d)` over-damps the chain so it follows a driving force
+    /// smoothly instead of resonating/whipping; `None` restores the authored per-joint
+    /// drag. Returns true if any chain matched.
+    pub fn set_group_drag(&mut self, name: &str, drag: Option<f32>) -> bool {
+        let key = name.to_ascii_lowercase();
+        let val = drag.map(|d| d.clamp(0.0, 1.0)).unwrap_or(-1.0);
+        let mut hit = false;
+        for (gn, gd) in self.group_names.iter().zip(self.group_drags.iter_mut()) {
+            if gn.to_ascii_lowercase().contains(&key) {
+                *gd = val;
+                hit = true;
+            }
+        }
+        hit
+    }
+
     /// Advance one step and overwrite `world[node]` for every spring joint. `world`
     /// must be the animation-posed skeleton (native space); the head/skirt anchors
     /// (non-spring parents) are read from it, so the springs follow the body.
@@ -408,6 +468,8 @@ impl SpringSystem {
         // Wind for this frame (copied out so the &mut self.joints loop can read them).
         let (wind_dir, wind_strength) = (self.wind_dir, self.wind_strength);
         let gravity_boost = self.gravity_boost;
+        let group_forces = self.group_forces.clone();
+        let group_drags = self.group_drags.clone();
         self.time += dt;
         let time = self.time;
         // Heading wanders slowly around vertical so it's not a fixed vector.
@@ -440,11 +502,19 @@ impl SpringSystem {
             let rest_world_rot = parent_rot * j.rest_local_rot;
             let rest_dir = rest_world_rot * j.bone_axis;
 
-            // verlet integrate the tail
-            let inertia = (j.cur_tail - j.prev_tail) * (1.0 - j.drag);
+            // verlet integrate the tail. drag は group 上書きがあればそれを使う（揉み等で
+            // 一時的に過減衰させ、駆動力へ滑らかに追従させるため）。
+            let drag = match group_drags.get(j.group as usize) {
+                Some(&gd) if gd >= 0.0 => gd,
+                _ => j.drag,
+            };
+            let inertia = (j.cur_tail - j.prev_tail) * (1.0 - drag);
             let stiff = rest_dir * (j.stiffness * dt);
-            // per-joint gravity ＋ ホスト指定の追加重力（native -Y, steady）。
-            let ext = j.gravity_dir * (j.gravity_power * dt) + Vec3::NEG_Y * (gravity_boost * dt);
+            // per-joint gravity ＋ ホスト指定の追加重力（native -Y, steady）＋ グループ外力。
+            let group_force = group_forces.get(j.group as usize).copied().unwrap_or(Vec3::ZERO);
+            let ext = j.gravity_dir * (j.gravity_power * dt)
+                + Vec3::NEG_Y * (gravity_boost * dt)
+                + group_force * dt;
             // wind: gusty envelope (calm↔gust) + wandering heading; each strand is
             // time-offset so they don't all surge together.
             let wind = if wind_strength > 0.0 {
@@ -608,5 +678,70 @@ mod tests {
         let tip = windy.joints[1].cur_tail;
         assert!(tip.is_finite());
         assert!(tip.x > tip0.x + 1e-3, "wind should blow the tip toward +X");
+    }
+
+    #[test]
+    fn group_force_drives_named_chain_and_clears() {
+        // Gravity-free "hair" chain: a +X group force on "hair" pushes the tip toward
+        // +X; a non-matching name is a no-op; ZERO restores rest.
+        let (t, r, s, parent, world_bind) = rig();
+        let mut ext = springbone_ext();
+        for j in ext["VRMC_springBone"]["springs"][0]["joints"].as_array_mut().unwrap() {
+            j["gravityPower"] = json!(0.0);
+        }
+        let step60 = |sys: &mut SpringSystem| {
+            let mut world = world_bind.clone();
+            for _ in 0..60 {
+                sys.step(&mut world, 1.0 / 60.0);
+            }
+        };
+
+        let mut sys = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        let tip0 = sys.joints[1].cur_tail;
+
+        // unknown name → no match, no motion
+        assert!(!sys.set_group_force("skirt", Vec3::X * 5.0));
+        step60(&mut sys);
+        assert!((sys.joints[1].cur_tail - tip0).length() < 1e-4, "non-matching name must not move anything");
+
+        // matching name (case-insensitive) → tip pushed toward +X
+        assert!(sys.set_group_force("HAIR", Vec3::X * 5.0));
+        step60(&mut sys);
+        let tip = sys.joints[1].cur_tail;
+        assert!(tip.is_finite() && tip.x > tip0.x + 1e-3, "group force should push the named chain toward +X");
+
+        // ZERO clears → no further +X drift accumulates (force is truly gone)
+        assert!(sys.set_group_force("hair", Vec3::ZERO));
+        let x_after_clear = sys.joints[1].cur_tail.x;
+        step60(&mut sys);
+        assert!(
+            sys.joints[1].cur_tail.x <= x_after_clear + 1e-4,
+            "after clearing, the tip must not keep being pushed toward +X"
+        );
+    }
+
+    #[test]
+    fn group_drag_override_matches_and_clears() {
+        let (t, r, s, parent, world_bind) = rig();
+        let mut sys = SpringSystem::from_vrm1(&springbone_ext(), &t, &r, &s, &parent, &world_bind).unwrap();
+        let authored = sys.joints[0].drag;
+        // unknown name → no match, authored drag is used
+        assert!(!sys.set_group_drag("skirt", Some(0.9)));
+        assert!((effective_drag(&sys, 0) - authored).abs() < 1e-6);
+        // matching name → override is used
+        assert!(sys.set_group_drag("hair", Some(0.9)));
+        assert!((effective_drag(&sys, 0) - 0.9).abs() < 1e-6);
+        // None restores the authored per-joint drag
+        assert!(sys.set_group_drag("hair", None));
+        assert!((effective_drag(&sys, 0) - authored).abs() < 1e-6);
+    }
+
+    // Mirror the solver's drag selection so the override is testable without stepping.
+    fn effective_drag(sys: &SpringSystem, joint: usize) -> f32 {
+        let j = &sys.joints[joint];
+        match sys.group_drags.get(j.group as usize) {
+            Some(&gd) if gd >= 0.0 => gd,
+            _ => j.drag,
+        }
     }
 }

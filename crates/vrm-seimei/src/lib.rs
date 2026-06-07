@@ -465,6 +465,22 @@ impl VrmAvatar {
         }
     }
 
+    /// Apply a steady external force (native space) to one named spring chain only —
+    /// every joint whose `springs[].name` contains `name` (case-insensitive). Lets a
+    /// host drive a single labelled secondary bone (e.g. orbit a force to slosh it)
+    /// without disturbing hair/skirt. `Vec3::ZERO` clears it. Returns true if a chain
+    /// matched. No-op (false) if the model has no spring config.
+    pub fn set_group_force(&mut self, name: &str, force: glam::Vec3) -> bool {
+        self.spring.as_mut().map(|s| s.set_group_force(name, force)).unwrap_or(false)
+    }
+
+    /// Override the drag of one named spring chain. `Some(d)` over-damps it so it follows
+    /// a driving force smoothly (no resonance/whip); `None` restores the authored drag.
+    /// Returns true if a chain matched. No-op (false) if the model has no spring config.
+    pub fn set_group_drag(&mut self, name: &str, drag: Option<f32>) -> bool {
+        self.spring.as_mut().map(|s| s.set_group_drag(name, drag)).unwrap_or(false)
+    }
+
     /// (node index, node name, is-a-skin-joint in any primitive) for a humanoid
     /// bone — debug.
     pub fn debug_bone_info(&self, bone: &str) -> Option<(usize, String, bool)> {
