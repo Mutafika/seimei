@@ -481,6 +481,14 @@ impl VrmAvatar {
         self.spring.as_mut().map(|s| s.set_group_drag(name, drag)).unwrap_or(false)
     }
 
+    /// Override the stiffness of one named spring chain. `Some(s)` stiffens it so it
+    /// resists a driving force elastically (springier, smaller deflection + snappy
+    /// return); `None` restores the authored stiffness. Returns true if a chain matched.
+    /// No-op (false) if the model has no spring config.
+    pub fn set_group_stiffness(&mut self, name: &str, stiffness: Option<f32>) -> bool {
+        self.spring.as_mut().map(|s| s.set_group_stiffness(name, stiffness)).unwrap_or(false)
+    }
+
     /// (node index, node name, is-a-skin-joint in any primitive) for a humanoid
     /// bone — debug.
     pub fn debug_bone_info(&self, bone: &str) -> Option<(usize, String, bool)> {

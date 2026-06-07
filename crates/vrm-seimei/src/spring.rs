@@ -116,6 +116,11 @@ pub struct SpringSystem {
     /// driving force smoothly instead of whipping/resonating (a soft, low-drag chain
     /// resonates under a steady oscillating force). `< 0` restores the authored drag.
     group_drags: Vec<f32>,
+    /// Per-group stiffness override (parallel to `group_names`). `< 0` = no override (use
+    /// each joint's own `stiffness`). Lets a host temporarily stiffen one chain so it
+    /// resists a driving force elastically (small, proportional deflection + a snappy
+    /// return) instead of a soft chain slumping to its length limit. `< 0` restores.
+    group_stiffs: Vec<f32>,
     /// Accumulated sim time, for gust phase.
     time: f32,
 }
@@ -135,6 +140,7 @@ impl SpringSystem {
     fn build(joints: Vec<Joint>, colliders: Vec<Collider>, group_names: Vec<String>) -> SpringSystem {
         let group_forces = vec![Vec3::ZERO; group_names.len()];
         let group_drags = vec![-1.0; group_names.len()];
+        let group_stiffs = vec![-1.0; group_names.len()];
         SpringSystem {
             joints,
             colliders,
@@ -144,6 +150,7 @@ impl SpringSystem {
             gravity_boost: 0.0,
             group_names,
             group_drags,
+            group_stiffs,
             group_forces,
             time: 0.0,
         }
@@ -458,6 +465,23 @@ impl SpringSystem {
         hit
     }
 
+    /// Override the stiffness of every joint whose chain name contains `name`
+    /// (case-insensitive). `Some(s)` stiffens the chain so it resists a driving force
+    /// elastically (smaller, springier deflection + a snappy return); `None` restores
+    /// the authored per-joint stiffness. Returns true if any chain matched.
+    pub fn set_group_stiffness(&mut self, name: &str, stiffness: Option<f32>) -> bool {
+        let key = name.to_ascii_lowercase();
+        let val = stiffness.map(|s| s.max(0.0)).unwrap_or(-1.0);
+        let mut hit = false;
+        for (gn, gs) in self.group_names.iter().zip(self.group_stiffs.iter_mut()) {
+            if gn.to_ascii_lowercase().contains(&key) {
+                *gs = val;
+                hit = true;
+            }
+        }
+        hit
+    }
+
     /// Advance one step and overwrite `world[node]` for every spring joint. `world`
     /// must be the animation-posed skeleton (native space); the head/skirt anchors
     /// (non-spring parents) are read from it, so the springs follow the body.
@@ -470,6 +494,7 @@ impl SpringSystem {
         let gravity_boost = self.gravity_boost;
         let group_forces = self.group_forces.clone();
         let group_drags = self.group_drags.clone();
+        let group_stiffs = self.group_stiffs.clone();
         self.time += dt;
         let time = self.time;
         // Heading wanders slowly around vertical so it's not a fixed vector.
@@ -509,7 +534,12 @@ impl SpringSystem {
                 _ => j.drag,
             };
             let inertia = (j.cur_tail - j.prev_tail) * (1.0 - drag);
-            let stiff = rest_dir * (j.stiffness * dt);
+            // stiffness も group 上書き可（掴み/揉み中だけ硬くして弾力＝抵抗＋速い戻りを出す）。
+            let stiffness = match group_stiffs.get(j.group as usize) {
+                Some(&gs) if gs >= 0.0 => gs,
+                _ => j.stiffness,
+            };
+            let stiff = rest_dir * (stiffness * dt);
             // per-joint gravity ＋ ホスト指定の追加重力（native -Y, steady）＋ グループ外力。
             let group_force = group_forces.get(j.group as usize).copied().unwrap_or(Vec3::ZERO);
             let ext = j.gravity_dir * (j.gravity_power * dt)
@@ -742,6 +772,30 @@ mod tests {
         match sys.group_drags.get(j.group as usize) {
             Some(&gd) if gd >= 0.0 => gd,
             _ => j.drag,
+        }
+    }
+
+    #[test]
+    fn group_stiffness_override_matches_and_clears() {
+        let (t, r, s, parent, world_bind) = rig();
+        let mut sys = SpringSystem::from_vrm1(&springbone_ext(), &t, &r, &s, &parent, &world_bind).unwrap();
+        let authored = sys.joints[0].stiffness;
+        // unknown name → no match, authored stiffness is used
+        assert!(!sys.set_group_stiffness("skirt", Some(2.0)));
+        assert!((effective_stiffness(&sys, 0) - authored).abs() < 1e-6);
+        // matching name → override is used
+        assert!(sys.set_group_stiffness("hair", Some(2.0)));
+        assert!((effective_stiffness(&sys, 0) - 2.0).abs() < 1e-6);
+        // None restores the authored per-joint stiffness
+        assert!(sys.set_group_stiffness("hair", None));
+        assert!((effective_stiffness(&sys, 0) - authored).abs() < 1e-6);
+    }
+
+    fn effective_stiffness(sys: &SpringSystem, joint: usize) -> f32 {
+        let j = &sys.joints[joint];
+        match sys.group_stiffs.get(j.group as usize) {
+            Some(&gs) if gs >= 0.0 => gs,
+            _ => j.stiffness,
         }
     }
 }
