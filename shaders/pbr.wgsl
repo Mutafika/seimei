@@ -141,8 +141,54 @@ fn ior_to_f0(ior: f32) -> f32 {
     return r * r;
 }
 
+// === 水(water): material[3] > 5.0 をフラグに専用シェーディングへ分岐。屈折用シーンカラーが無い
+// ので核は (1)ワールド座標駆動のリップル法線＝ジオメトリが毎フレーム動くので流れて見える,
+// (2)視線依存の透明(中心は透け縁は反射), (3)控えめなスペキュラ。emissive 経路の白飛びを回避し、
+// 「青く透ける水」を作る（白く塗り潰さない）。
+fn water_shade(in: VertexOutput) -> vec4<f32> {
+    let n0 = normalize(in.world_normal);
+    let v = normalize(camera.position.xyz - in.world_position);
+    let wp = in.world_position;
+    var up = vec3<f32>(0.0, 0.0, 1.0);
+    if (abs(n0.z) > 0.9) { up = vec3<f32>(1.0, 0.0, 0.0); }
+    let t = normalize(cross(up, n0));
+    let b = cross(n0, t);
+    let ph = wp.z * 0.10;
+    let w1 = sin(ph + dot(wp, t) * 0.6);
+    let w2 = sin(ph * 1.9 + dot(wp, b) * 0.4 + 2.0);
+    let bump = 0.12;
+    let n = normalize(n0 + t * (w1 * bump) + b * (w2 * bump));
+    let ndv = max(dot(n, v), 1e-3);
+    let fres = clamp(0.03 + 0.35 * pow(1.0 - ndv, 4.0), 0.0, 0.32);
+    var spec = 0.0;
+    let lc = i32(light_data.ambient_and_count.a);
+    for (var i = 0; i < lc; i = i + 1) {
+        let lt = light_data.lights[i];
+        var ld: vec3<f32>;
+        if (lt.direction_or_position_and_type.w < 0.5) {
+            ld = normalize(lt.direction_or_position_and_type.xyz);
+        } else {
+            ld = normalize(lt.direction_or_position_and_type.xyz - wp);
+        }
+        let h = normalize(ld + v);
+        spec = spec + pow(max(dot(n, h), 0.0), 70.0) * lt.color_and_intensity.a;
+    }
+    spec = clamp(spec, 0.0, 1.5) * 0.25;
+    let tint = in.color.rgb;
+    let sky = vec3<f32>(0.62, 0.76, 0.96);
+    var col = mix(tint, sky, fres) + vec3<f32>(spec);
+    col = aces_tonemap(col);
+    col = pow(col, vec3<f32>(1.0 / 2.2));
+    let alpha = clamp(0.10 + fres * 0.4 + spec * 0.4, 0.0, 0.5);
+    return vec4<f32>(col, alpha);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // 水マテリアル（material[3] > 5）は専用シェーディングへ（テクスチャ判定前に分岐）。
+    if (in.material.w > 5.0) {
+        return water_shade(in);
+    }
     // クリップボックス判定
     if (camera.clip_min.w > 0.5) {
         let p = in.world_position;
