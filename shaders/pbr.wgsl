@@ -146,6 +146,8 @@ fn ior_to_f0(ior: f32) -> f32 {
 // (2)視線依存の透明(中心は透け縁は反射), (3)控えめなスペキュラ。emissive 経路の白飛びを回避し、
 // 「青く透ける水」を作る（白く塗り潰さない）。
 fn water_shade(in: VertexOutput) -> vec4<f32> {
+    // material.x = 粘性(0=サラサラ水, 1=どろどろ)。水↔粘液を 1 本のシェーダでブレンド。
+    let visc = clamp(in.material.x, 0.0, 1.0);
     let n0 = normalize(in.world_normal);
     let v = normalize(camera.position.xyz - in.world_position);
     let wp = in.world_position;
@@ -156,10 +158,11 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     let ph = wp.z * 0.10;
     let w1 = sin(ph + dot(wp, t) * 0.6);
     let w2 = sin(ph * 1.9 + dot(wp, b) * 0.4 + 2.0);
-    let bump = 0.12;
+    let bump = 0.12 * (1.0 - 0.7 * visc); // 粘い液ほど波立たず滑らかな表面
     let n = normalize(n0 + t * (w1 * bump) + b * (w2 * bump));
     let ndv = max(dot(n, v), 1e-3);
     let fres = clamp(0.03 + 0.35 * pow(1.0 - ndv, 4.0), 0.0, 0.32);
+    let shin = mix(70.0, 220.0, visc); // 粘い液は鋭くテラテラのハイライト
     var spec = 0.0;
     let lc = i32(light_data.ambient_and_count.a);
     for (var i = 0; i < lc; i = i + 1) {
@@ -171,15 +174,21 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
             ld = normalize(lt.direction_or_position_and_type.xyz - wp);
         }
         let h = normalize(ld + v);
-        spec = spec + pow(max(dot(n, h), 0.0), 70.0) * lt.color_and_intensity.a;
+        spec = spec + pow(max(dot(n, h), 0.0), shin) * lt.color_and_intensity.a;
     }
-    spec = clamp(spec, 0.0, 1.5) * 0.25;
+    spec = clamp(spec, 0.0, 1.5) * mix(0.25, 0.65, visc);
     let tint = in.color.rgb;
     let sky = vec3<f32>(0.62, 0.76, 0.96);
-    var col = mix(tint, sky, fres) + vec3<f32>(spec);
+    // 粘い液は空の反射が乏しく地色(tint)が主役。水は反射で青空が乗る。
+    let skymix = fres * (1.0 - 0.85 * visc);
+    var col = mix(tint, sky, skymix) + vec3<f32>(spec);
+    col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（白濁を白く保つ）
     col = aces_tonemap(col);
     col = pow(col, vec3<f32>(1.0 / 2.2));
-    let alpha = clamp(0.10 + fres * 0.4 + spec * 0.4, 0.0, 0.5);
+    // 水: 視線依存の薄い透過(≤0.5)。粘液: tint.a を不透明度目標にして濁らせる。
+    let water_a = clamp(0.10 + fres * 0.4 + spec * 0.4, 0.0, 0.5);
+    let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
+    let alpha = mix(water_a, thick_a, visc);
     return vec4<f32>(col, alpha);
 }
 
