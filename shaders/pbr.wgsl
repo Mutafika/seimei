@@ -176,7 +176,7 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
         let h = normalize(ld + v);
         spec = spec + pow(max(dot(n, h), 0.0), shin) * lt.color_and_intensity.a;
     }
-    spec = clamp(spec, 0.0, 1.5) * mix(0.25, 0.65, visc);
+    spec = clamp(spec, 0.0, 1.5) * mix(0.12, 0.65, visc); // 水(低粘性)は白いハイライトを抑えて透明に
     let tint = in.color.rgb;
     let sky = vec3<f32>(0.62, 0.76, 0.96);
     // 粘い液は空の反射が乏しく地色(tint)が主役。水は反射で青空が乗る。
@@ -185,10 +185,16 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（白濁を白く保つ）
     col = aces_tonemap(col);
     col = pow(col, vec3<f32>(1.0 / 2.2));
-    // 水: 視線依存の薄い透過(≤0.5)。粘液: tint.a を不透明度目標にして濁らせる。
-    let water_a = clamp(0.10 + fres * 0.4 + spec * 0.4, 0.0, 0.5);
+    // 透過度の決め方は flag で分岐。
+    //  flag>=7.5 (ぶっかけ等): tint.a(=透過度スライダー)を不透明度として直接使う＝粘性とは無関係。
+    //    粘性は色/艶(spec/bump/skymix)だけに効かせ、透け具合はスライダーで独立制御する。
+    //  flag in (5,7.5) (水/お漏らし): 従来どおり視線依存の薄い透過↔濁りを粘性でブレンド。
+    let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて白濁らない
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
-    let alpha = mix(water_a, thick_a, visc);
+    var alpha = mix(water_a, thick_a, visc);
+    if (in.material.w >= 7.5) {
+        alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0); // 透過度スライダー直結＋ハイライトだけ僅かに
+    }
     return vec4<f32>(col, alpha);
 }
 
