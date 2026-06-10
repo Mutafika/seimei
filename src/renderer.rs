@@ -42,6 +42,8 @@ pub struct MeshInstance {
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
     pub texture_id: Option<String>,
+    /// 体表塗布マップ（group 3 で合成）。None なら透明(__paint_none__)。
+    pub paint_texture_id: Option<String>,
 }
 
 /// Splatクラウドのレンダリングインスタンス
@@ -375,6 +377,7 @@ impl Renderer {
             index_buffer,
             index_count: mesh.indices.len() as u32,
             texture_id,
+            paint_texture_id: None,
         });
     }
 
@@ -401,6 +404,18 @@ impl Renderer {
         if let Some(instance) = self.meshes.get_mut(mesh_id) {
             instance.texture_id = texture_id;
         }
+    }
+
+    /// メッシュの体表塗布マップ（group 3）を設定/変更。None で透明（塗布なし）へ戻す。
+    pub fn set_mesh_paint(&mut self, mesh_id: &str, paint_texture_id: Option<String>) {
+        if let Some(instance) = self.meshes.get_mut(mesh_id) {
+            instance.paint_texture_id = paint_texture_id;
+        }
+    }
+
+    /// 既存テクスチャの中身を差し替える（塗布マップの毎フレーム更新用。バインドグループは保持）。
+    pub fn update_texture_rgba(&self, id: &str, width: u32, height: u32, rgba: &[u8]) {
+        self.texture_manager.update_rgba(&self.queue, id, width, height, rgba);
     }
 
     /// メッシュの頂点データを更新
@@ -430,12 +445,23 @@ impl Renderer {
             })
             .collect();
         let byte_size = (std::mem::size_of::<GpuVertex>() * gpu_vertices.len()) as u64;
+        let idx_size = (std::mem::size_of::<u32>() * mesh.indices.len()) as u64;
 
-        if let Some(existing) = self.meshes.get(id) {
-            if byte_size <= existing.vertex_buffer.size() {
-                self.queue.write_buffer(&existing.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
-                return;
+        // 既存バッファに頂点・インデックスとも収まるなら再利用（GPU 確保を避ける）。
+        // 重要: 縮小時はインデックスと index_count も更新しないと、旧トポロジで古い頂点を
+        // 描き続けてメッシュが消えない（潰しメッシュで隠せない）。
+        let reuse = self
+            .meshes
+            .get(id)
+            .map_or(false, |e| byte_size <= e.vertex_buffer.size() && idx_size <= e.index_buffer.size());
+        if reuse {
+            {
+                let e = self.meshes.get(id).unwrap();
+                self.queue.write_buffer(&e.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
+                self.queue.write_buffer(&e.index_buffer, 0, bytemuck::cast_slice(&mesh.indices));
             }
+            self.meshes.get_mut(id).unwrap().index_count = mesh.indices.len() as u32;
+            return;
         }
         let texture_id = self.meshes.get(id).and_then(|m| m.texture_id.clone());
         self.meshes.remove(id);
@@ -1332,6 +1358,11 @@ impl Renderer {
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                 render_pass.set_bind_group(2, tex_bind_group, &[]);
+                // group 3 = 体表塗布マップ（無ければ透明 __paint_none__）。
+                let paint_bg = self.texture_manager.get_bind_group(Some(
+                    mesh.paint_texture_id.as_deref().unwrap_or(crate::texture::PAINT_NONE_ID),
+                ));
+                render_pass.set_bind_group(3, paint_bg, &[]);
                 let offset = idx as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
@@ -1350,6 +1381,10 @@ impl Renderer {
                 if let Some(mesh) = self.meshes.get(mesh_id) {
                     let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                     render_pass.set_bind_group(2, tex_bind_group, &[]);
+                    let paint_bg = self.texture_manager.get_bind_group(Some(
+                        mesh.paint_texture_id.as_deref().unwrap_or(crate::texture::PAINT_NONE_ID),
+                    ));
+                    render_pass.set_bind_group(3, paint_bg, &[]);
                     let idx = opaque_count + i;
                     let offset = idx as u64 * instance_size;
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));

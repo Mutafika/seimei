@@ -252,9 +252,16 @@ fn create_main_pipeline_impl(
         source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
     });
 
+    // group 3 = 体表塗布マップ（テクスチャと同じ layout を流用＝texture+sampler）。
+    // シャドウ無効時のメイン/半透明パイプラインに常設し、pbr.wgsl の @group(3) と対応させる。
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout],
+        bind_group_layouts: &[
+            camera_bind_group_layout,
+            light_bind_group_layout,
+            texture_bind_group_layout,
+            texture_bind_group_layout,
+        ],
         push_constant_ranges: &[],
     });
 

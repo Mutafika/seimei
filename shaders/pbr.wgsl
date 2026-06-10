@@ -32,6 +32,13 @@ var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1)
 var s_diffuse: sampler;
 
+// === Group 3: Paint map (体表塗布: 白濁等を UV 空間に塗り込み、面に合成) ===
+// rgb=塗布色, a=被覆率(0=素肌/1=塗り潰し)。塗布なしメッシュは透明(__paint_none__)が入る。
+@group(3) @binding(0)
+var t_paint: texture_2d<f32>;
+@group(3) @binding(1)
+var s_paint: sampler;
+
 const PI: f32 = 3.14159265359;
 
 // === PBR Functions ===
@@ -221,9 +228,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // 体表塗布マップ（白濁等）。被覆率 paint.a で素肌色↔塗布色を混ぜ、濡れて滑らかに（roughness↓）。
+    let paint = textureSample(t_paint, s_paint, in.uv);
+    let paint_a = clamp(paint.a, 0.0, 1.0);
+    // 立体感: 被覆率を「厚み」とみなし、その勾配で法線を起伏させる＝粘液が盛り上がって見え、
+    // 縁が丸く光る（平らな塗料でなく濡れた塊に）。近傍4点の差分で UV 勾配→TBN で世界法線へ。
+    let psz = vec2<f32>(textureDimensions(t_paint));
+    let ptx = 1.0 / max(psz, vec2<f32>(1.0));
+    let h_l = textureSample(t_paint, s_paint, in.uv - vec2<f32>(ptx.x, 0.0)).a;
+    let h_r = textureSample(t_paint, s_paint, in.uv + vec2<f32>(ptx.x, 0.0)).a;
+    let h_d = textureSample(t_paint, s_paint, in.uv - vec2<f32>(0.0, ptx.y)).a;
+    let h_u = textureSample(t_paint, s_paint, in.uv + vec2<f32>(0.0, ptx.y)).a;
+    let paint_grad = vec2<f32>(h_r - h_l, h_u - h_d);
+
     // マテリアルパラメータ
     let metallic = clamp(in.material.x, 0.0, 1.0);
-    let roughness = clamp(in.material.y, 0.04, 1.0);
+    // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。
+    let roughness = mix(clamp(in.material.y, 0.04, 1.0), 0.10, paint_a);
     let mat_z = in.material.z;
     // material[2]: 正=SSS、負=transmission
     let is_transmission = mat_z < 0.0;
@@ -231,8 +252,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let transmission = select(0.0, clamp(-mat_z, 0.0, 1.0), is_transmission);
     let emissive_strength = max(in.material.w, 0.0); // 発光強度
 
-    // ベースカラー = インスタンスカラー * テクスチャカラー
-    let albedo = in.color.rgb * tex_color.rgb;
+    // ベースカラー = インスタンスカラー * テクスチャカラー。塗布があれば被覆率で塗布色へ寄せる。
+    let albedo = mix(in.color.rgb * tex_color.rgb, paint.rgb, paint_a);
 
     // 誘電体の基本反射率 (F0)
     // ガラスの場合: IOR 1.52 → F0 ≈ 0.0425
@@ -240,7 +261,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let f0_dielectric = select(vec3(0.04), vec3(glass_f0), is_transmission);
     let f0 = mix(f0_dielectric, albedo, metallic);
 
-    let n = normalize(in.world_normal);
+    // 塗布の厚み勾配で法線を起伏（盛り上がり）。bump 強めで粒の丸み/縁の艶が出る。
+    let n_geo = normalize(in.world_normal);
+    let tb_t = normalize(in.world_tangent);
+    let tb_b = normalize(in.world_bitangent);
+    let paint_bump = 14.0;
+    let n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
 

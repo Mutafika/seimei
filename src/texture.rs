@@ -17,6 +17,10 @@ pub enum TextureError {
 /// デフォルト白テクスチャのID
 pub const DEFAULT_TEXTURE_ID: &str = "__default_white__";
 
+/// 「塗布なし」の既定テクスチャID（透明 RGBA=0）。塗布マップ(group 3)を持たないメッシュ用。
+/// 白(DEFAULT)だと alpha=1 で全面が塗られてしまうため、塗布のフォールバックは透明にする。
+pub const PAINT_NONE_ID: &str = "__paint_none__";
+
 /// GPU上のテクスチャとバインドグループ
 pub struct GpuTexture {
     pub texture: wgpu::Texture,
@@ -74,7 +78,29 @@ impl TextureManager {
         };
 
         manager.create_from_rgba(device, queue, DEFAULT_TEXTURE_ID, 1, 1, &[255, 255, 255, 255]);
+        manager.create_from_rgba(device, queue, PAINT_NONE_ID, 1, 1, &[0, 0, 0, 0]);
         manager
+    }
+
+    /// 既存テクスチャの中身だけを差し替える（バインドグループは作り直さない＝塗布マップの
+    /// 毎フレーム更新を安価に）。サイズは作成時と同じである前提。未作成 id なら何もしない。
+    pub fn update_rgba(&self, queue: &wgpu::Queue, id: &str, width: u32, height: u32, rgba: &[u8]) {
+        let Some(tex) = self.textures.get(id) else { return };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn create_from_rgba(
