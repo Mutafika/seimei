@@ -131,6 +131,15 @@ pub struct Renderer {
     msaa_view: Option<wgpu::TextureView>,
     // === Post Process ===
     post_process: Option<PostProcessPipeline>,
+    // === Screen-Space Refraction (水専用) ===
+    // 不透明描画後の HDR シーンカラーを copy_texture_to_texture でここへ複製し、
+    // 半透明の屈折パスから group2 でサンプルする。屈折ON(has_pp==true)時のみ使う。
+    scene_copy_texture: wgpu::Texture,
+    scene_copy_view: wgpu::TextureView,
+    scene_copy_sampler: wgpu::Sampler,
+    scene_color_bind_group_layout: wgpu::BindGroupLayout,
+    scene_color_bind_group: wgpu::BindGroup,
+    refraction_pipeline: wgpu::RenderPipeline,
 }
 
 impl Renderer {
@@ -295,6 +304,60 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // === Screen-Space Refraction ===
+        // scene_copy は HDR(Rgba16Float)と同 format/同 size。usage=TEXTURE_BINDING|COPY_DST。
+        let scene_color_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Scene Color Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let scene_copy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Scene Copy Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let (scene_copy_texture, scene_copy_view) =
+            Self::create_scene_copy_texture_impl(&device, width, height);
+        let scene_color_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scene Color Bind Group"),
+            layout: &scene_color_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene_copy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&scene_copy_sampler),
+                },
+            ],
+        });
+        let refraction_pipeline = pipeline::create_refraction_pipeline(
+            &device, surface_format,
+            &camera_bind_group_layout, &light_bind_group_layout,
+            &scene_color_bind_group_layout, 1,
+        )?;
+
         Ok(Self {
             device,
             queue,
@@ -350,7 +413,54 @@ impl Renderer {
             msaa_texture: None,
             msaa_view: None,
             post_process: None,
+            scene_copy_texture,
+            scene_copy_view,
+            scene_copy_sampler,
+            scene_color_bind_group_layout,
+            scene_color_bind_group,
+            refraction_pipeline,
         })
+    }
+
+    /// 屈折用 scene_copy テクスチャ生成（HDR と同 format/size、TEXTURE_BINDING|COPY_DST）。
+    fn create_scene_copy_texture_impl(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Scene Copy (Refraction)"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        (tex, view)
+    }
+
+    /// scene_copy テクスチャと bind group を再構築（解像度変更時）。
+    fn rebuild_scene_copy(&mut self, width: u32, height: u32) {
+        let (t, v) = Self::create_scene_copy_texture_impl(&self.device, width, height);
+        self.scene_copy_texture = t;
+        self.scene_copy_view = v;
+        self.scene_color_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Scene Color Bind Group"),
+            layout: &self.scene_color_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.scene_copy_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.scene_copy_sampler),
+                },
+            ],
+        });
     }
 
     // ── メッシュ管理 ──
@@ -498,6 +608,11 @@ impl Renderer {
         let mut uniform = CameraUniform::from_camera(camera);
         uniform.clip_min = self.clip_min;
         uniform.clip_max = self.clip_max;
+        // スクリーンスペース屈折/HDRモードのフラグ。z>=0.5 = ポストプロセス有効(HDRテクスチャへ描画)。
+        // このとき各シェーダは tonemap/gamma を行わず線形のまま出力し、合成シェーダが一括で
+        // tonemap+gamma する（二重処理＝ピンクのwashoutを防ぐ）。屈折のシーンカラーtexも有効。
+        let hdr_flag = if self.post_process.is_some() { 1.0 } else { 0.0 };
+        uniform.resolution = [self.width as f32, self.height as f32, hdr_flag, 0.0];
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
@@ -914,18 +1029,86 @@ impl Renderer {
             && self.main_pipeline_with_shadow.is_some()
             && self.shadow_bind_group.is_some();
 
-        {
-            let color_load = if self.skip_clear {
-                wgpu::LoadOp::Load
-            } else {
-                wgpu::LoadOp::Clear(self.clear_color)
-            };
-            let depth_load = if self.skip_clear {
-                wgpu::LoadOp::Load
-            } else {
-                wgpu::LoadOp::Clear(1.0)
-            };
+        let color_load = if self.skip_clear {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(self.clear_color)
+        };
+        let depth_load = if self.skip_clear {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(1.0)
+        };
 
+        if has_pp {
+            // === スクリーンスペース屈折 2パス描画 ===
+            // パスA: 不透明 + splat/point/line を HDR に描く（半透明は描かない）。
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Main Render Pass (Opaque)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_view,
+                        resolve_target: resolve,
+                        ops: wgpu::Operations { load: color_load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations { load: depth_load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                if use_shadow_pipeline {
+                    self.draw_opaque_meshes_with_shadow(&mut pass, instances, opaque_count, instance_size);
+                } else {
+                    self.draw_opaque_meshes(&mut pass, instances, opaque_count, instance_size);
+                }
+                self.draw_splats_points_lines(&mut pass);
+            }
+
+            // HDR シーンカラー → scene_copy へコピー（屈折で背景としてサンプルする）。
+            {
+                let src = self.post_process.as_ref().unwrap();
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &src.scene_color_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.scene_copy_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: self.width, height: self.height, depth_or_array_layers: 1 },
+                );
+            }
+
+            // パスB: 半透明（屈折ON）。HDR/深度は Load（clearしない）。
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Main Render Pass (Transparent/Refraction)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: render_view,
+                        resolve_target: resolve,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.draw_transparent_meshes(&mut pass, instances, opaque_count, instance_size, true);
+            }
+        } else {
+            // === 従来の単一パス描画（屈折なし、MSAA直描き可） ===
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -953,34 +1136,7 @@ impl Renderer {
             } else {
                 self.draw_meshes(&mut render_pass, instances, opaque_count, instance_size);
             }
-
-            // Gaussian Splat
-            if let Some(splat_pipeline) = &self.splat_pipeline {
-                if !self.splat_clouds.is_empty() {
-                    render_pass.set_pipeline(splat_pipeline);
-                    render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                    for instance in self.splat_clouds.values() {
-                        render_pass.set_bind_group(1, &instance.bind_group, &[]);
-                        render_pass.draw(0..4, 0..instance.data.count);
-                    }
-                }
-            }
-
-            // ポイント
-            if self.point_vertex_count > 0 {
-                render_pass.set_pipeline(&self.point_pipeline);
-                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.point_vertex_buffer.slice(..));
-                render_pass.draw(0..self.point_vertex_count, 0..1);
-            }
-
-            // 線分
-            if self.line_vertex_count > 0 {
-                render_pass.set_pipeline(&self.line_pipeline);
-                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-                render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
-                render_pass.draw(0..self.line_vertex_count, 0..1);
-            }
+            self.draw_splats_points_lines(&mut render_pass);
         }
 
         // ポストプロセス
@@ -1114,33 +1270,8 @@ impl Renderer {
 
         self.quality_settings = settings.clone();
 
-        if msaa_changed {
-            let count = settings.msaa.count();
-            if count > 1 {
-                let (tex, view) = Self::create_msaa_texture_impl(
-                    &self.device, self.width, self.height, self.surface_format, count,
-                );
-                self.msaa_texture = Some(tex);
-                self.msaa_view = Some(view);
-                let (dt, dv) = Self::create_depth_texture_impl(
-                    &self.device, self.width, self.height, count,
-                );
-                self.depth_texture = dt;
-                self.depth_view = dv;
-            } else {
-                self.msaa_texture = None;
-                self.msaa_view = None;
-                let (dt, dv) = Self::create_depth_texture_impl(
-                    &self.device, self.width, self.height, 1,
-                );
-                self.depth_texture = dt;
-                self.depth_view = dv;
-            }
-
-            self.rebuild_pipelines(count)?;
-        }
-
-        // ポストプロセス再構築
+        // ポストプロセス再構築（パイプラインの対象フォーマット判定より先に行う＝scene_render_format が
+        // post_process の有無で分岐するため）。
         if post_changed {
             if settings.needs_post_process() {
                 self.post_process = Some(PostProcessPipeline::new(
@@ -1155,6 +1286,31 @@ impl Renderer {
             } else {
                 self.post_process = None;
             }
+        }
+
+        // MSAA かポストプロセスの切替でシーン描画ターゲット（フォーマット/サンプル数）が変わる。
+        // MSAA色テクスチャ・深度テクスチャを実効サンプル数で作り直し、全パイプラインを再構築する。
+        // ポストプロセス有効時は HDR(Rgba16Float, 単一サンプル)へ描くので、ここを誤ると
+        // 「Render pipeline targets are incompatible with render pass」で落ちる。
+        if msaa_changed || post_changed {
+            let count = self.scene_sample_count();
+            if !self.quality_settings.needs_post_process() && count > 1 {
+                let (tex, view) = Self::create_msaa_texture_impl(
+                    &self.device, self.width, self.height, self.surface_format, count,
+                );
+                self.msaa_texture = Some(tex);
+                self.msaa_view = Some(view);
+            } else {
+                self.msaa_texture = None;
+                self.msaa_view = None;
+            }
+            let (dt, dv) = Self::create_depth_texture_impl(
+                &self.device, self.width, self.height, count,
+            );
+            self.depth_texture = dt;
+            self.depth_view = dv;
+
+            self.rebuild_pipelines()?;
         }
 
         info!("品質設定変更: {:?}", settings.preset);
@@ -1193,6 +1349,9 @@ impl Renderer {
             let pp_depth_view = self.depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
             pp.resize(&self.device, width, height, pp_depth_view);
         }
+
+        // 屈折用 scene_copy も同サイズで作り直す（copy_texture_to_texture のサイズ一致のため）。
+        self.rebuild_scene_copy(width, height);
     }
 
     // ── アクセサ ──
@@ -1367,7 +1526,45 @@ impl Renderer {
         opaque_count: usize,
         instance_size: u64,
     ) {
-        // 不透明パス
+        self.draw_opaque_meshes(render_pass, instances, opaque_count, instance_size);
+        self.draw_transparent_meshes(render_pass, instances, opaque_count, instance_size, false);
+    }
+
+    /// Gaussian Splat / ポイント / 線分を描画（不透明寄りの補助ジオメトリ）。
+    /// 屈折2パス描画ではパスA（不透明）側で描く＝屈折の背景に含める。
+    fn draw_splats_points_lines<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+        if let Some(splat_pipeline) = &self.splat_pipeline {
+            if !self.splat_clouds.is_empty() {
+                render_pass.set_pipeline(splat_pipeline);
+                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                for instance in self.splat_clouds.values() {
+                    render_pass.set_bind_group(1, &instance.bind_group, &[]);
+                    render_pass.draw(0..4, 0..instance.data.count);
+                }
+            }
+        }
+        if self.point_vertex_count > 0 {
+            render_pass.set_pipeline(&self.point_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.point_vertex_buffer.slice(..));
+            render_pass.draw(0..self.point_vertex_count, 0..1);
+        }
+        if self.line_vertex_count > 0 {
+            render_pass.set_pipeline(&self.line_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
+            render_pass.draw(0..self.line_vertex_count, 0..1);
+        }
+    }
+
+    /// 不透明メッシュ `[0..opaque_count)` のみを main_pipeline で描画。
+    fn draw_opaque_meshes<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        instance_size: u64,
+    ) {
         render_pass.set_pipeline(&self.main_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
@@ -1386,20 +1583,59 @@ impl Renderer {
                 render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
+    }
 
-        // 半透明パス
-        if opaque_count < instances.len() {
-            render_pass.set_pipeline(&self.transparent_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+    /// 半透明メッシュ `[opaque_count..)` を描画。
+    /// `use_refraction==true` のとき、material[3] > 5.0 のインスタンスは屈折パイプライン
+    /// (group2=scene_copy)で、それ以外は従来 transparent_pipeline で描く。
+    /// `use_refraction==false` のときは全て従来 transparent_pipeline（屈折なし）。
+    fn draw_transparent_meshes<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        instance_size: u64,
+        use_refraction: bool,
+    ) {
+        if opaque_count >= instances.len() {
+            return;
+        }
+        // パイプライン切り替えコストを抑えるため、直前のモードを覚えておく。
+        // 0=未設定 / 1=transparent / 2=refraction
+        let mut cur_mode = 0u8;
 
-            for (i, (mesh_id, _)) in instances[opaque_count..].iter().enumerate() {
-                if let Some(mesh) = self.meshes.get(mesh_id) {
+        for (i, (mesh_id, _)) in instances[opaque_count..].iter().enumerate() {
+            let idx = opaque_count + i;
+            if let Some(mesh) = self.meshes.get(mesh_id) {
+                let is_refr = use_refraction && instances[idx].1.material[3] > 5.0;
+                let want_mode = if is_refr { 2u8 } else { 1u8 };
+                if want_mode != cur_mode {
+                    if is_refr {
+                        render_pass.set_pipeline(&self.refraction_pipeline);
+                        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+                        // group2 = 不透明描画済みシーンカラーのコピー。
+                        render_pass.set_bind_group(2, &self.scene_color_bind_group, &[]);
+                    } else {
+                        render_pass.set_pipeline(&self.transparent_pipeline);
+                        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+                    }
+                    cur_mode = want_mode;
+                }
+
+                if is_refr {
+                    // 屈折パイプラインは group2 を scene_color に占有済み。group3 は使わない。
+                    let offset = idx as u64 * instance_size;
+                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                    render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                } else {
                     let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                     render_pass.set_bind_group(2, tex_bind_group, &[]);
                     let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                     render_pass.set_bind_group(3, paint_bg, &[]);
-                    let idx = opaque_count + i;
                     let offset = idx as u64 * instance_size;
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                     render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
@@ -1439,64 +1675,103 @@ impl Renderer {
             }
         }
 
-        // 半透明パス（シャドウなし）
-        if opaque_count < instances.len() {
-            render_pass.set_pipeline(&self.transparent_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+        // 半透明パス（シャドウなし）。屈折なし版（単一パス描画なので scene_copy は未確定）。
+        self.draw_transparent_meshes(render_pass, instances, opaque_count, instance_size, false);
+    }
 
-            for (i, (mesh_id, _)) in instances[opaque_count..].iter().enumerate() {
-                if let Some(mesh) = self.meshes.get(mesh_id) {
-                    let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
-                    render_pass.set_bind_group(2, tex_bind_group, &[]);
-                    let idx = opaque_count + i;
-                    let offset = idx as u64 * instance_size;
-                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
-                    render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-                }
+    /// 不透明メッシュ（シャドウ付き）のみを描画。屈折の2パス描画でパスAに使う。
+    fn draw_opaque_meshes_with_shadow<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        instance_size: u64,
+    ) {
+        let pipeline = self.main_pipeline_with_shadow.as_ref().unwrap();
+        let shadow_bg = self.shadow_bind_group.as_ref().unwrap();
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.light_bind_group, &[]);
+        render_pass.set_bind_group(3, shadow_bg, &[]);
+
+        for (idx, (mesh_id, _)) in instances[..opaque_count].iter().enumerate() {
+            if let Some(mesh) = self.meshes.get(mesh_id) {
+                let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
+                render_pass.set_bind_group(2, tex_bind_group, &[]);
+                let offset = idx as u64 * instance_size;
+                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
         }
     }
 
     /// パイプラインを再構築（MSAA変更時）
-    fn rebuild_pipelines(&mut self, msaa_samples: u32) -> Result<(), RendererError> {
+    /// シーン描画パイプラインの対象カラーフォーマット。ポストプロセス有効時は HDR テクスチャ
+    /// (Rgba16Float) へ描くのでそれに合わせる。無効時はサーフェスフォーマット直描き。
+    fn scene_render_format(&self) -> wgpu::TextureFormat {
+        if self.quality_settings.needs_post_process() {
+            wgpu::TextureFormat::Rgba16Float
+        } else {
+            self.surface_format
+        }
+    }
+
+    /// シーン描画の MSAA サンプル数。ポストプロセス有効時は HDR テクスチャが単一サンプルなので 1。
+    fn scene_sample_count(&self) -> u32 {
+        if self.quality_settings.needs_post_process() {
+            1
+        } else {
+            self.quality_settings.msaa.count()
+        }
+    }
+
+    fn rebuild_pipelines(&mut self) -> Result<(), RendererError> {
+        let fmt = self.scene_render_format();
+        let msaa_samples = self.scene_sample_count();
         self.main_pipeline = pipeline::create_main_pipeline_msaa(
-            &self.device, self.surface_format,
+            &self.device, fmt,
             &self.camera_bind_group_layout, &self.light_bind_group_layout,
             &self.texture_manager.bind_group_layout,
             &self.texture_manager.paint_bind_group_layout, msaa_samples,
         )?;
 
         self.transparent_pipeline = pipeline::create_transparent_pipeline_msaa(
-            &self.device, self.surface_format,
+            &self.device, fmt,
             &self.camera_bind_group_layout, &self.light_bind_group_layout,
             &self.texture_manager.bind_group_layout,
             &self.texture_manager.paint_bind_group_layout, msaa_samples,
         )?;
 
+        // 屈折パイプラインもシーンと同 format/同サンプル数で再構築（HDR時は Rgba16Float）。
+        self.refraction_pipeline = pipeline::create_refraction_pipeline(
+            &self.device, fmt,
+            &self.camera_bind_group_layout, &self.light_bind_group_layout,
+            &self.scene_color_bind_group_layout, msaa_samples,
+        )?;
+
         self.line_pipeline = pipeline::create_line_pipeline_msaa(
-            &self.device, self.surface_format,
+            &self.device, fmt,
             &self.camera_bind_group_layout, msaa_samples,
         )?;
 
         self.point_pipeline = pipeline::create_point_pipeline_msaa(
-            &self.device, self.surface_format,
+            &self.device, fmt,
             &self.camera_bind_group_layout, msaa_samples,
         )?;
 
         if self.shadow_enabled {
             if let Some(ref shadow_bgl) = self.shadow_bind_group_layout {
                 self.main_pipeline_with_shadow = Some(pipeline::create_main_pipeline_with_shadow_msaa(
-                    &self.device, self.surface_format,
+                    &self.device, fmt,
                     &self.camera_bind_group_layout, &self.light_bind_group_layout,
                     &self.texture_manager.bind_group_layout, shadow_bgl, msaa_samples,
                 )?);
             }
         }
 
-        info!("パイプライン再構築完了 (MSAA: {}x)", msaa_samples);
+        info!("パイプライン再構築完了 (format: {:?}, MSAA: {}x)", fmt, msaa_samples);
         Ok(())
     }
 

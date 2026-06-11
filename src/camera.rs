@@ -432,6 +432,10 @@ pub struct CameraUniform {
     pub position: [f32; 4],
     pub clip_min: [f32; 4],
     pub clip_max: [f32; 4],
+    /// スクリーンスペース屈折用の補助値。
+    /// xy = 描画ターゲットの解像度(px)、z = 屈折有効フラグ(1=シーンカラーtexが有効)、w = 予備。
+    /// `@builtin(position).xy / resolution.xy` でフラグメントのスクリーンUVを得る。
+    pub resolution: [f32; 4],
 }
 
 impl CameraUniform {
@@ -450,6 +454,8 @@ impl CameraUniform {
             ],
             clip_min: [0.0; 4],
             clip_max: [0.0; 4],
+            // 解像度/屈折フラグはレンダラ側(update_camera)で上書きする。
+            resolution: [0.0; 4],
         }
     }
 }

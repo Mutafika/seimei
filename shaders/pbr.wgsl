@@ -5,6 +5,9 @@ struct CameraUniform {
     position: vec4<f32>,
     clip_min: vec4<f32>,
     clip_max: vec4<f32>,
+    // xy=描画解像度(px), z=屈折フラグ(1=シーンカラーtex有効), w=予備。
+    // スクリーンスペース屈折のUV計算に使う。
+    resolution: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -195,9 +198,28 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     spec = clamp(spec, 0.0, 1.5) * mix(0.12, 0.65, visc); // 水(低粘性)は白いハイライトを抑えて透明に
     let tint = in.color.rgb;
     let sky = vec3<f32>(0.62, 0.76, 0.96);
+
+    // === スクリーンスペース屈折 ===
+    // フラグメントのスクリーンUV = @builtin(position).xy / 解像度。
+    // 表面法線の「view空間XY成分」に比例してUVをずらし、背景(シーンカラー)を
+    // サンプルすると歪んだ屈折像になる。粘性ほど歪み・色付けを強める。
+    // resolution.z(屈折フラグ) >= 0.5 でシーンカラーtexが配線されたら真の屈折へ昇格。
+    // 現状(<0.5)は tex 未配線なので「空ベースの屈折色」をフォールバックに使い、見た目を壊さない。
+    let res = max(camera.resolution.xy, vec2<f32>(1.0, 1.0));
+    let screen_uv = in.clip_position.xy / res;
+    // view空間法線（オフセット方向）。歪み量は粘性とフレネルで変調。
+    let n_view = (camera.view * vec4<f32>(n, 0.0)).xyz;
+    let distort = (0.03 + 0.05 * visc) * (0.5 + 0.5 * fres);
+    let refr_uv = clamp(screen_uv + n_view.xy * distort, vec2<f32>(0.0), vec2<f32>(1.0));
+    // 屈折色: シーンカラーtex が無い間は「地色×空」を近似背景として使う。
+    // （tex 配線後はここを textureSample(scene_color, samp, refr_uv).rgb に差し替える）
+    let bg_approx = mix(tint, sky, 0.25 + 0.35 * visc);
+    let refraction = bg_approx;
+
     // 粘い液は空の反射が乏しく地色(tint)が主役。水は反射で青空が乗る。
     let skymix = fres * (1.0 - 0.85 * visc);
-    var col = mix(tint, sky, skymix) + vec3<f32>(spec);
+    // 屈折(背景)と反射(空)をフレネルでブレンド。中心ほど屈折、縁ほど反射。
+    var col = mix(refraction, sky, skymix) + vec3<f32>(spec);
     col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（白濁を白く保つ）
     col = aces_tonemap(col);
     col = pow(col, vec3<f32>(1.0 / 2.2));
@@ -412,5 +434,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         alpha = 1.0 - transmittance;
     }
 
+    // HDR/ポストプロセスモード(resolution.z>=0.5)では tonemap/gamma を合成シェーダに任せ、
+    // ここは線形HDRのまま出力する（合成側で二重に tonemap+gamma すると washout=ピンクになる）。
+    if (camera.resolution.z >= 0.5) {
+        return vec4<f32>(color, alpha);
+    }
     return vec4<f32>(gamma_corrected, alpha);
 }

@@ -105,6 +105,9 @@ pub struct VrmPrimitive {
     /// same space as `skin` positions, so they add directly). Index = morph target
     /// index, matching the expression bind's `index`.
     morph_deltas: Vec<Vec<[f32; 3]>>,
+    /// Per morph-target name (same index as `morph_deltas`). Lets callers drive a
+    /// morph by name directly (体型モーフ等、表情プリセットに紐付かないもの)。
+    morph_names: Vec<String>,
     pub base_color: [f32; 4],
     pub metallic: f32,
     pub roughness: f32,
@@ -137,6 +140,12 @@ pub struct VrmAvatar {
     expressions: Expressions,                  // model-authored presets (0.x or 1.0)
     node_mesh: Vec<Option<usize>>,             // glTF node index -> mesh index (for 1.0 binds)
     expr_weights: HashMap<ExpressionPreset, f32>, // currently requested preset weights
+
+    // --- 体型モーフ (任意 morph を名前で直接駆動) ---
+    // morph 名 -> (mesh_index, target_index)。表情プリセットと同じ morph 機構を、
+    // プリセットに紐付かない morph（breast_size/waist/hips 等）にも開放する。
+    body_morph_index: HashMap<String, (usize, usize)>,
+    body_morph_weights: HashMap<String, f32>,  // 現在要求中の体型 morph weight
 }
 
 impl VrmAvatar {
@@ -220,6 +229,7 @@ impl VrmAvatar {
                     .iter()
                     .map(|mt| mt.position_deltas.iter().map(|d| pos_seimei_to_native(*d)).collect())
                     .collect(),
+                morph_names: p.morph_targets.iter().map(|mt| mt.name.clone()).collect(),
                 base_color: p.material.base_color,
                 metallic: p.material.metallic,
                 roughness: p.material.roughness,
@@ -257,6 +267,17 @@ impl VrmAvatar {
             node_mesh[nd.index] = nd.mesh;
         }
 
+        // 体型モーフ索引: morph 名 -> (mesh_index, target_index)。同一 mesh の各
+        // primitive は同じ morph 順序を共有するので、最初に見つけた対応で十分。
+        let mut body_morph_index: HashMap<String, (usize, usize)> = HashMap::new();
+        for prim in &primitives {
+            for (ti, name) in prim.morph_names.iter().enumerate() {
+                if !name.is_empty() {
+                    body_morph_index.entry(name.clone()).or_insert((prim.mesh_index, ti));
+                }
+            }
+        }
+
         Ok(VrmAvatar {
             primitives,
             nodes_t,
@@ -271,6 +292,8 @@ impl VrmAvatar {
             expressions,
             node_mesh,
             expr_weights: HashMap::new(),
+            body_morph_index,
+            body_morph_weights: HashMap::new(),
         })
     }
 
@@ -336,12 +359,60 @@ impl VrmAvatar {
         self.expr_weights.clear();
     }
 
+    // --- 体型モーフ (任意 morph を名前で駆動) --------------------------------
+
+    /// この avatar が持つ「体型モーフ」名の一覧（焼き込まれた全 morph 名。表情
+    /// プリセット用の Fcl_* も含むが、UI 側で必要な名前だけ拾えばよい）。順序安定。
+    pub fn body_morph_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.body_morph_index.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// 指定 morph があるか。
+    pub fn has_morph(&self, name: &str) -> bool {
+        self.body_morph_index.contains_key(name)
+    }
+
+    /// 体型 morph の weight を `0..=2` で設定。`0` でクリア。次の skin で反映される。
+    /// 未知の名前は no-op。表情プリセットとは独立に同じ morph 機構へ加算される。
+    pub fn set_morph(&mut self, name: &str, weight: f32) {
+        if !self.body_morph_index.contains_key(name) {
+            return;
+        }
+        let w = weight.clamp(0.0, 2.0);
+        if w <= 0.0 {
+            self.body_morph_weights.remove(name);
+        } else {
+            self.body_morph_weights.insert(name.to_string(), w);
+        }
+    }
+
+    /// 現在の体型 morph weight（未設定は 0）。
+    pub fn morph_weight(&self, name: &str) -> f32 {
+        self.body_morph_weights.get(name).copied().unwrap_or(0.0)
+    }
+
+    /// 全ての体型 morph をクリア（表情には触れない）。
+    pub fn clear_morphs(&mut self) {
+        self.body_morph_weights.clear();
+    }
+
     /// Accumulate the currently-active presets into per-mesh `(morph_index, weight)`
     /// lists. Empty when no expression is active (the common case → no morph work).
     fn active_morphs(&self) -> HashMap<usize, Vec<(usize, f32)>> {
         let mut out: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
-        if self.expr_weights.is_empty() {
+        if self.expr_weights.is_empty() && self.body_morph_weights.is_empty() {
             return out;
+        }
+        // 体型モーフ（名前で直接駆動。表情とは独立に同じ morph 機構へ合流）。
+        for (name, &w) in &self.body_morph_weights {
+            if w == 0.0 {
+                continue;
+            }
+            if let Some(&(mesh, index)) = self.body_morph_index.get(name) {
+                out.entry(mesh).or_default().push((index, w));
+            }
         }
         for (preset, w) in resolve_weights(&self.expressions, &self.expr_weights) {
             if w <= 0.0 {
@@ -723,4 +794,48 @@ fn topo_order(parents: &[Option<usize>]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by_key(|&j| depths[j]);
     order
+}
+
+#[cfg(test)]
+mod body_morph_tests {
+    use super::*;
+
+    /// 実 VRM（環境変数 `VRM_TEST_PATH`）に体型モーフが焼かれており、`set_morph` が
+    /// 頂点を動かすことを GPU 抜きで検証する。未設定なら skip（CI でこける防止）。
+    #[test]
+    fn body_morph_roundtrip() {
+        let Ok(path) = std::env::var("VRM_TEST_PATH") else {
+            eprintln!("VRM_TEST_PATH 未設定 → skip");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read vrm");
+        let mut av = VrmAvatar::load(&bytes).expect("load vrm");
+        let names = av.body_morph_names();
+        eprintln!("[test] morph 名一覧 = {names:?}");
+        for n in ["breast_size", "breast_flatten", "waist", "hips", "butt", "thigh", "shoulder_narrow"] {
+            assert!(av.has_morph(n), "体型モーフ {n} が VRM に無い");
+        }
+        let base = av.skin(&[]);
+        av.set_morph("hips", 1.0);
+        av.set_morph("breast_size", 1.0);
+        let morphed = av.skin(&[]);
+        let mut moved = 0usize;
+        let mut maxd = 0.0f64;
+        for (b, m) in base.iter().zip(&morphed) {
+            for (vb, vm) in b.vertices.iter().zip(&m.vertices) {
+                let d = ((vb.position.x - vm.position.x).powi(2)
+                    + (vb.position.y - vm.position.y).powi(2)
+                    + (vb.position.z - vm.position.z).powi(2))
+                .sqrt();
+                if d > 1e-4 {
+                    moved += 1;
+                }
+                if d > maxd {
+                    maxd = d;
+                }
+            }
+        }
+        eprintln!("[test] 動いた頂点数 = {moved}, 最大変位(mm) = {maxd:.2}");
+        assert!(moved > 0, "set_morph しても頂点が1つも動かない");
+    }
 }

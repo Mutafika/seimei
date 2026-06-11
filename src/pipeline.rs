@@ -19,6 +19,9 @@ pub const SHADER_SOURCE: &str = include_str!("../shaders/pbr.wgsl");
 /// シャドウ付きPBRシェーダーソース
 pub const SHADER_WITH_SHADOW_SOURCE: &str = include_str!("../shaders/pbr_shadow.wgsl");
 
+/// スクリーンスペース屈折シェーダソース
+pub const SHADER_REFRACTION_SOURCE: &str = include_str!("../shaders/refraction.wgsl");
+
 /// シャドウマップの解像度
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
@@ -209,6 +212,85 @@ pub fn create_splat_pipeline(
     Ok(pipeline)
 }
 
+/// スクリーンスペース屈折パイプライン（水専用）。
+/// group0=camera, group1=light, group2=scene_color(tex+sampler) の3グループのみ。
+/// 半透明と同じブレンド・深度設定（depth test有/write無）で HDR ターゲットに描く。
+/// MSAA は屈折ON時(has_pp==true)には使われないので msaa_samples=1 固定でよいが、
+/// 呼び出し側の都合で引数化しておく。
+pub fn create_refraction_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+    light_bind_group_layout: &wgpu::BindGroupLayout,
+    scene_color_bind_group_layout: &wgpu::BindGroupLayout,
+    msaa_samples: u32,
+) -> Result<wgpu::RenderPipeline, PipelineError> {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Refraction Shader"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_REFRACTION_SOURCE.into()),
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Refraction Pipeline Layout"),
+        bind_group_layouts: &[
+            camera_bind_group_layout,
+            light_bind_group_layout,
+            scene_color_bind_group_layout,
+        ],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Refraction Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None, // 半透明と同じく両面
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: false, // 半透明と同じく深度書き込みなし
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState {
+                constant: -2,
+                slope_scale: -1.0,
+                clamp: 0.0,
+            },
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    });
+
+    Ok(pipeline)
+}
+
 // ── 内部実装 ──
 
 /// ラインシェーダー
@@ -219,6 +301,7 @@ struct CameraUniform {
     position: vec4<f32>,
     clip_min: vec4<f32>,
     clip_max: vec4<f32>,
+    resolution: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 

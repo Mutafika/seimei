@@ -1208,11 +1208,42 @@ impl PostProcessPipeline {
         }
         let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Bloom テクスチャ（mip[0] or dummy）
+        // Bloom 無効時のフォールバックは「黒(0)」でなければならない（合成は color += bloom の加算。
+        // 白ダミーを使うと R8 を .rgb で読んで (1,0,0)=赤を全画面に加算しピンクに washout する）。
+        let black_dummy_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("PP Bloom Dummy (black)"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        {
+            let bv = black_dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("PP Bloom Dummy Clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &bv,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+        }
+        let black_dummy_view = black_dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Bloom テクスチャ（mip[0] or 黒ダミー）
         let bloom_view = self.bloom.as_ref()
             .and_then(|b| b.mip_textures.first())
             .map(|(_, v)| v)
-            .unwrap_or(&dummy_view);
+            .unwrap_or(&black_dummy_view);
 
         // SSAO テクスチャ（blurred or dummy）
         let ssao_view = self.ssao.as_ref()
@@ -1337,7 +1368,11 @@ fn create_hdr_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        // COPY_SRC: スクリーンスペース屈折で HDR シーンカラーを scene_copy へ
+        // copy_texture_to_texture するために必須。
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1431,6 +1466,7 @@ struct CameraUniform {
     position: vec4<f32>,
     clip_min: vec4<f32>,
     clip_max: vec4<f32>,
+    resolution: vec4<f32>,
 };
 
 @group(0) @binding(0)
