@@ -198,13 +198,13 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     // 粘い液は空の反射が乏しく地色(tint)が主役。水は反射で青空が乗る。
     let skymix = fres * (1.0 - 0.85 * visc);
     var col = mix(tint, sky, skymix) + vec3<f32>(spec);
-    col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（白濁を白く保つ）
+    col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（濃い液の色を保つ）
     col = aces_tonemap(col);
     col = pow(col, vec3<f32>(1.0 / 2.2));
     // 透過度の決め方は flag で分岐。
-    //  flag>=7.5 (ぶっかけ等): tint.a(=透過度スライダー)を不透明度として直接使う＝粘性とは無関係。
-    //  flag in (5,7.5) (水/お漏らし): 従来どおり視線依存の薄い透過↔濁りを粘性でブレンド。
-    let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて白濁らない
+    //  flag>=7.5 (濃い不透明な液): tint.a(=透過度スライダー)を不透明度として直接使う＝粘性とは無関係。
+    //  flag in (5,7.5) (水等): 従来どおり視線依存の薄い透過↔濁りを粘性でブレンド。
+    let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて濁らない
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
     if (in.material.w >= 7.5) {

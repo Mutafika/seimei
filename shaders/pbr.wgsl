@@ -35,7 +35,7 @@ var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1)
 var s_diffuse: sampler;
 
-// === Group 3: Paint map (体表塗布: 白濁等を UV 空間に塗り込み、面に合成) ===
+// === Group 3: Paint map (体表塗布: 液の付着を UV 空間に塗り込み、面に合成) ===
 // rgb=塗布色, a=被覆率(0=素肌/1=塗り潰し)。塗布なしメッシュは透明(__paint_none__)が入る。
 @group(3) @binding(0)
 var t_paint: texture_2d<f32>;
@@ -220,14 +220,14 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     let skymix = fres * (1.0 - 0.85 * visc);
     // 屈折(背景)と反射(空)をフレネルでブレンド。中心ほど屈折、縁ほど反射。
     var col = mix(refraction, sky, skymix) + vec3<f32>(spec);
-    col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（白濁を白く保つ）
+    col = mix(col, tint * 1.04, visc * 0.3); // 粘液の地色をわずかに持ち上げ（濃い液の色を保つ）
     col = aces_tonemap(col);
     col = pow(col, vec3<f32>(1.0 / 2.2));
     // 透過度の決め方は flag で分岐。
-    //  flag>=7.5 (ぶっかけ等): tint.a(=透過度スライダー)を不透明度として直接使う＝粘性とは無関係。
+    //  flag>=7.5 (濃い不透明な液): tint.a(=透過度スライダー)を不透明度として直接使う＝粘性とは無関係。
     //    粘性は色/艶(spec/bump/skymix)だけに効かせ、透け具合はスライダーで独立制御する。
-    //  flag in (5,7.5) (水/お漏らし): 従来どおり視線依存の薄い透過↔濁りを粘性でブレンド。
-    let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて白濁らない
+    //  flag in (5,7.5) (水等): 従来どおり視線依存の薄い透過↔濁りを粘性でブレンド。
+    let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて濁らない
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
     if (in.material.w >= 7.5) {
@@ -259,7 +259,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
-    // 体表塗布マップ（白濁等）。被覆率 paint.a で素肌色↔塗布色を混ぜ、濡れて滑らかに（roughness↓）。
+    // 体表塗布マップ（付着した液）。被覆率 paint.a で素肌色↔塗布色を混ぜ、濡れて滑らかに（roughness↓）。
     let paint = textureSample(t_paint, s_paint, in.uv);
     // 塗布時法線で表裏を判定: 記録法線と現在の面法線が逆向き(dot<0)なら、表のUVを共有する
     // 裏面なので塗布を消す。
@@ -273,6 +273,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let side = select(1.0, dot(normalize(in.world_normal), normalize(pn_raw)), has_n);
     let side_mask = smoothstep(-0.05, 0.35, side); // 表=1 / 裏=0 へ滑らかに
     let paint_a = clamp(paint.a, 0.0, 1.0) * side_mask;
+    // 「濡れ(wet)」と「不透明度(opaque)」を分離して液種を両立する:
+    //  - wet    = 被覆を厚みに見立てた濡れ量。艶(roughness↓)/clearcoat/凹凸に効く＝全液種共通。
+    //  - opaque = wet × 塗布色の白さ。アルベド白化＆SSS に効く＝白く塗った塗布だけ。暗く塗ると ≈0
+    //    （paint_white→0 となり、肌色を変えずテラテラの濡れだけ乗る＝透明な液の定着）。
+    // sqrt で中被覆を持ち上げ＝塊が埋まる。極低被覆の縁は薄く残りメニスカス（縁透け）を維持。
+    let wet = sqrt(paint_a);
+    let paint_luma = dot(paint.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    let paint_white = smoothstep(0.55, 0.85, paint_luma); // 白く焼かれた塗り=1 / 暗く焼かれた塗り=0
+    let opaque_body = wet * paint_white;
     // 立体感: 被覆率を「厚み」とみなし、その勾配で法線を起伏させる＝粘液が盛り上がって見え、
     // 縁が丸く光る（平らな塗料でなく濡れた塊に）。近傍4点の差分で UV 勾配→TBN で世界法線へ。
     let psz = vec2<f32>(textureDimensions(t_paint));
@@ -285,8 +294,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // マテリアルパラメータ
     let metallic = clamp(in.material.x, 0.0, 1.0);
-    // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。
-    let roughness = mix(clamp(in.material.y, 0.04, 1.0), 0.10, paint_a);
+    // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。白い/暗い塗布問わず wet で艶を出す。
+    let roughness = mix(clamp(in.material.y, 0.04, 1.0), 0.08, wet);
     let mat_z = in.material.z;
     // material[2]: 正=SSS、負=transmission
     let is_transmission = mat_z < 0.0;
@@ -294,8 +303,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let transmission = select(0.0, clamp(-mat_z, 0.0, 1.0), is_transmission);
     let emissive_strength = max(in.material.w, 0.0); // 発光強度
 
-    // ベースカラー = インスタンスカラー * テクスチャカラー。塗布があれば被覆率で塗布色へ寄せる。
-    let albedo = mix(in.color.rgb * tex_color.rgb, paint.rgb, paint_a);
+    // ベースカラー = インスタンスカラー * テクスチャカラー。塗布があれば不透明ボディ被覆で塗布色へ寄せ、
+    // さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
+    let albedo0 = mix(in.color.rgb * tex_color.rgb, paint.rgb, opaque_body);
+    let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
+    // 透明濡れ = wet のうち白くない分（暗く塗られた塗布＝肌色を変えない濡れ）。汗テカリと同様、
+    // 肌色を保ったまま「少し暗化＋艶」だけ乗せる。白い塗布(paint_white≈1)では 0＝不透明ボディが支配。
+    let wet_clear = wet * (1.0 - paint_white);
+    let albedo = albedo1 * (1.0 - 0.32 * wet_clear);
 
     // 誘電体の基本反射率 (F0)
     // ガラスの場合: IOR 1.52 → F0 ≈ 0.0425
@@ -308,7 +323,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let n_geo = normalize(in.world_normal);
     let tb_t = normalize(in.world_tangent);
     let tb_b = normalize(in.world_bitangent);
-    let paint_bump = 6.0;
+    // 起伏: 白い塗布(濃い不透明な液)は厚い塊なので強く盛り上げる。透明濡れは薄い膜＝ほぼ平ら
+    // （汗テカリと同じく面で均一にヌメッと光らせる）ので paint_white で起伏量を絞る。
+    let paint_bump = 6.0 * mix(0.18, 1.0, paint_white);
     let n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
@@ -416,7 +433,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Emissive（発光）
     let emissive = albedo * emissive_strength;
 
-    let color = ambient + lo + emissive;
+    // 塗布部に淡い白の底上げ＝影側でも透けて暗くならず「白く濁った不透明な液」に見える(擬似SSS)。
+    let opaque_floor = opaque_body * vec3<f32>(0.20, 0.19, 0.18);
+    let color = ambient + lo + emissive + opaque_floor;
 
     // ACES トーンマッピング
     let mapped = aces_tonemap(color);

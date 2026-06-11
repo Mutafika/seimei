@@ -172,7 +172,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         col = pow(col, vec3<f32>(1.0 / 2.2));
     }
 
-    // 透過度。flag>=7.5(ぶっかけ等)はスライダー直結、それ以外は視線依存。
+    // 透過度。flag>=7.5(濃い不透明な液)はスライダー直結、それ以外は視線依存。
     let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40);
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
