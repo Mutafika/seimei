@@ -39,6 +39,15 @@ var t_paint: texture_2d<f32>;
 @group(3) @binding(1)
 var s_paint: sampler;
 
+// 塗布時の面法線マップ（同 group 3 の binding 2/3。rgb=encode(n*0.5+0.5)）。
+// 表裏/左右でUVを共有するモデル（VRoid等）で、塗った時と逆を向く面の塗布を弾く＝裏に滲ませない。
+// rgb=(0,0,0) は「法線未記録」＝弾かない（後方互換）。塗布なしメッシュは透明(__paint_none__)。
+// バインドグループを増やさず1グループに2tex束ねる（max_bind_groups=4 制限のため）。
+@group(3) @binding(2)
+var t_paintn: texture_2d<f32>;
+@group(3) @binding(3)
+var s_paintn: sampler;
+
 const PI: f32 = 3.14159265359;
 
 // === PBR Functions ===
@@ -230,7 +239,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // 体表塗布マップ（白濁等）。被覆率 paint.a で素肌色↔塗布色を混ぜ、濡れて滑らかに（roughness↓）。
     let paint = textureSample(t_paint, s_paint, in.uv);
-    let paint_a = clamp(paint.a, 0.0, 1.0);
+    // 塗布時法線で表裏を判定: 記録法線と現在の面法線が逆向き(dot<0)なら、表のUVを共有する
+    // 裏面なので塗布を消す。
+    // 重要: 法線mapの未塗布texelは rgb=a=0。線形補間で塗りの縁に混ざると rgb→0＝decode で
+    // (-1,-1,-1) の「裏向き」に誤判定し、疎な塗り(顔等)が縁だらけで丸ごと消える。そこで
+    // 「塗られた寄与だけ」を alpha で割って復元（未塗布は rgb/a とも 0 寄与で打ち消える）。
+    let pn_tex = textureSample(t_paintn, s_paintn, in.uv);
+    let pn_a = pn_tex.a;
+    let has_n = pn_a > 0.02; // 塗布寄与がほぼ無い texel は法線未記録＝判定しない
+    let pn_raw = (pn_tex.xyz / max(pn_a, 0.001)) * 2.0 - 1.0;
+    let side = select(1.0, dot(normalize(in.world_normal), normalize(pn_raw)), has_n);
+    let side_mask = smoothstep(-0.05, 0.35, side); // 表=1 / 裏=0 へ滑らかに
+    let paint_a = clamp(paint.a, 0.0, 1.0) * side_mask;
     // 立体感: 被覆率を「厚み」とみなし、その勾配で法線を起伏させる＝粘液が盛り上がって見え、
     // 縁が丸く光る（平らな塗料でなく濡れた塊に）。近傍4点の差分で UV 勾配→TBN で世界法線へ。
     let psz = vec2<f32>(textureDimensions(t_paint));
@@ -261,11 +281,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let f0_dielectric = select(vec3(0.04), vec3(glass_f0), is_transmission);
     let f0 = mix(f0_dielectric, albedo, metallic);
 
-    // 塗布の厚み勾配で法線を起伏（盛り上がり）。bump 強めで粒の丸み/縁の艶が出る。
+    // 塗布の厚み勾配で法線を起伏（盛り上がり）。被覆率(=厚み)の勾配で縁が丸く盛り上がる＝
+    // 濡れた塊の艶。bump は控えめにして「粒ごとの黒い縁取り/網目」を出さず、滑らかな盛りに。
     let n_geo = normalize(in.world_normal);
     let tb_t = normalize(in.world_tangent);
     let tb_b = normalize(in.world_bitangent);
-    let paint_bump = 14.0;
+    let paint_bump = 6.0;
     let n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
@@ -359,7 +380,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let scatter_color = vec3(1.0, 0.4, 0.2); // 暖色系（血液透過色）
         let sss_contrib = scatter * scatter_color * albedo * radiance;
 
-        lo = lo + (diffuse + specular) * radiance * n_dot_l + sss_contrib;
+        // 濡れた艶（クリアコート）: 塗布部に超低roughの鋭い反射を上乗せ＝粘液がテラテラ光る。
+        // base材質と無関係に強い glint を出すので、白×白でも「濡れた塊」だと分かる。
+        let cc_ndf = distribution_ggx(n_dot_h, 0.05);
+        let cc_g = geometry_smith(n_dot_v, n_dot_l, 0.05);
+        let cc_f = fresnel_schlick(h_dot_v, vec3(0.04));
+        let clearcoat = (cc_ndf * cc_g * cc_f) / (4.0 * n_dot_v * n_dot_l + 0.0001);
+
+        lo = lo + (diffuse + specular) * radiance * n_dot_l + sss_contrib
+             + clearcoat * radiance * n_dot_l * paint_a * 2.5;
     }
 
     // Emissive（発光）

@@ -42,7 +42,8 @@ pub struct MeshInstance {
     pub index_buffer: wgpu::Buffer,
     pub index_count: u32,
     pub texture_id: Option<String>,
-    /// 体表塗布マップ（group 3 で合成）。None なら透明(__paint_none__)。
+    /// 体表塗布マップの色id（group 3 で合成）。この id で「色+被覆 / 塗布時法線」を束ねた
+    /// paint バインドグループを引く。None なら透明(__paint_none__)。
     pub paint_texture_id: Option<String>,
 }
 
@@ -222,10 +223,12 @@ impl Renderer {
         let main_pipeline = pipeline::create_main_pipeline(
             &device, surface_format,
             &camera_bind_group_layout, &light_bind_group_layout, &texture_manager.bind_group_layout,
+            &texture_manager.paint_bind_group_layout,
         )?;
         let transparent_pipeline = pipeline::create_transparent_pipeline(
             &device, surface_format,
             &camera_bind_group_layout, &light_bind_group_layout, &texture_manager.bind_group_layout,
+            &texture_manager.paint_bind_group_layout,
         )?;
         let line_pipeline = pipeline::create_line_pipeline(
             &device, surface_format, &camera_bind_group_layout,
@@ -406,10 +409,20 @@ impl Renderer {
         }
     }
 
-    /// メッシュの体表塗布マップ（group 3）を設定/変更。None で透明（塗布なし）へ戻す。
-    pub fn set_mesh_paint(&mut self, mesh_id: &str, paint_texture_id: Option<String>) {
+    /// メッシュの体表塗布マップを設定/変更。色テクスチャ(色+被覆)と法線テクスチャ(塗布時法線)を
+    /// group 3 用の1バインドグループに束ねて color_id をキーに登録し、インスタンスへ割当てる。
+    /// color_id が None なら透明（塗布なし）へ戻す。両テクスチャは事前に register 済みであること。
+    pub fn set_mesh_paint(
+        &mut self,
+        mesh_id: &str,
+        color_id: Option<String>,
+        normal_id: Option<String>,
+    ) {
+        if let (Some(cid), Some(nid)) = (color_id.as_deref(), normal_id.as_deref()) {
+            self.texture_manager.build_paint_bind_group(&self.device, cid, cid, nid);
+        }
         if let Some(instance) = self.meshes.get_mut(mesh_id) {
-            instance.paint_texture_id = paint_texture_id;
+            instance.paint_texture_id = color_id;
         }
     }
 
@@ -1271,6 +1284,11 @@ impl Renderer {
         self.texture_manager.create_from_rgba(&self.device, &self.queue, id, width, height, rgba);
     }
 
+    /// RGBAデータからリニア(非sRGB)テクスチャを登録（法線マップ等の値テクスチャ用）。
+    pub fn register_texture_rgba_linear(&mut self, id: &str, width: u32, height: u32, rgba: &[u8]) {
+        self.texture_manager.create_from_rgba_linear(&self.device, &self.queue, id, width, height, rgba);
+    }
+
     // ── 内部ヘルパー ──
 
     /// インスタンスデータをGPUに書き込み
@@ -1358,10 +1376,8 @@ impl Renderer {
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                 render_pass.set_bind_group(2, tex_bind_group, &[]);
-                // group 3 = 体表塗布マップ（無ければ透明 __paint_none__）。
-                let paint_bg = self.texture_manager.get_bind_group(Some(
-                    mesh.paint_texture_id.as_deref().unwrap_or(crate::texture::PAINT_NONE_ID),
-                ));
+                // group 3 = 体表塗布(色+被覆 / 塗布時法線 を束ねた1グループ)。無ければ透明。
+                let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                 render_pass.set_bind_group(3, paint_bg, &[]);
                 let offset = idx as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -1381,9 +1397,7 @@ impl Renderer {
                 if let Some(mesh) = self.meshes.get(mesh_id) {
                     let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                     render_pass.set_bind_group(2, tex_bind_group, &[]);
-                    let paint_bg = self.texture_manager.get_bind_group(Some(
-                        mesh.paint_texture_id.as_deref().unwrap_or(crate::texture::PAINT_NONE_ID),
-                    ));
+                    let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                     render_pass.set_bind_group(3, paint_bg, &[]);
                     let idx = opaque_count + i;
                     let offset = idx as u64 * instance_size;
@@ -1451,13 +1465,15 @@ impl Renderer {
         self.main_pipeline = pipeline::create_main_pipeline_msaa(
             &self.device, self.surface_format,
             &self.camera_bind_group_layout, &self.light_bind_group_layout,
-            &self.texture_manager.bind_group_layout, msaa_samples,
+            &self.texture_manager.bind_group_layout,
+            &self.texture_manager.paint_bind_group_layout, msaa_samples,
         )?;
 
         self.transparent_pipeline = pipeline::create_transparent_pipeline_msaa(
             &self.device, self.surface_format,
             &self.camera_bind_group_layout, &self.light_bind_group_layout,
-            &self.texture_manager.bind_group_layout, msaa_samples,
+            &self.texture_manager.bind_group_layout,
+            &self.texture_manager.paint_bind_group_layout, msaa_samples,
         )?;
 
         self.line_pipeline = pipeline::create_line_pipeline_msaa(

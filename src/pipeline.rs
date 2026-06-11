@@ -31,8 +31,9 @@ pub fn create_main_pipeline(
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     light_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
+    paint_bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, true, "Main Pipeline", 1)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, true, "Main Pipeline", 1)
 }
 
 /// 半透明用パイプライン（深度書き込みOFF）
@@ -42,8 +43,9 @@ pub fn create_transparent_pipeline(
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     light_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
+    paint_bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, false, "Transparent Pipeline", 1)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, false, "Transparent Pipeline", 1)
 }
 
 /// MSAA対応メインパイプライン
@@ -53,9 +55,10 @@ pub fn create_main_pipeline_msaa(
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     light_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
+    paint_bind_group_layout: &wgpu::BindGroupLayout,
     msaa_samples: u32,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, true, "Main Pipeline MSAA", msaa_samples)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, true, "Main Pipeline MSAA", msaa_samples)
 }
 
 /// MSAA対応半透明パイプライン
@@ -65,9 +68,10 @@ pub fn create_transparent_pipeline_msaa(
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     light_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
+    paint_bind_group_layout: &wgpu::BindGroupLayout,
     msaa_samples: u32,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, false, "Transparent Pipeline MSAA", msaa_samples)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, false, "Transparent Pipeline MSAA", msaa_samples)
 }
 
 /// 線分用パイプライン
@@ -243,6 +247,7 @@ fn create_main_pipeline_impl(
     camera_bind_group_layout: &wgpu::BindGroupLayout,
     light_bind_group_layout: &wgpu::BindGroupLayout,
     texture_bind_group_layout: &wgpu::BindGroupLayout,
+    paint_bind_group_layout: &wgpu::BindGroupLayout,
     depth_write: bool,
     label: &str,
     msaa_samples: u32,
@@ -260,7 +265,7 @@ fn create_main_pipeline_impl(
             camera_bind_group_layout,
             light_bind_group_layout,
             texture_bind_group_layout,
-            texture_bind_group_layout,
+            paint_bind_group_layout, // group 3 = 体表塗布(色+被覆 / 塗布時法線 の2tex束)
         ],
         push_constant_ranges: &[],
     });
