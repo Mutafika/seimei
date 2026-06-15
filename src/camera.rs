@@ -18,6 +18,10 @@ pub struct Camera {
     pub is_orthographic: bool,
     /// 正投影の表示幅（ワールド単位）
     pub ortho_width: f64,
+    /// レンズシフト（主点オフセット, NDC 単位 x, y）。投影像を NDC 上で平行移動する。
+    /// UI のドックパネルで隠れる分だけ可視ビューポート中心へ寄せる用途。
+    /// (0, 0) で従来どおり（無効）。view 行列には影響しない＝ピッキングと一貫。
+    pub lens_shift: (f64, f64),
 }
 
 impl Camera {
@@ -32,6 +36,7 @@ impl Camera {
             far: 1000000.0,
             is_orthographic: false,
             ortho_width: 30000.0,
+            lens_shift: (0.0, 0.0),
         }
     }
 
@@ -60,7 +65,23 @@ impl Camera {
             0.0, 0.0, 0.5, 0.0,
             0.0, 0.0, 0.5, 1.0,
         ]);
-        opengl_to_wgpu * proj
+        let base = opengl_to_wgpu * proj;
+
+        // レンズシフト: クリップ空間で平行移動 T を左から掛けると
+        // T*clip = (x + sx*w, y + sy*w, z, w) となり、NDC が (sx, sy) ずれる。
+        // 主点をずらすだけで投影の形（FOV/アス比）は変えない。
+        let (sx, sy) = self.lens_shift;
+        if sx == 0.0 && sy == 0.0 {
+            base
+        } else {
+            let shift = DMat4::from_cols_array(&[
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                sx, sy, 0.0, 1.0,
+            ]);
+            shift * base
+        }
     }
 
     /// ビュー・プロジェクション行列
@@ -377,6 +398,10 @@ impl Camera {
             far: self.far,
             is_orthographic: if t < 0.5 { self.is_orthographic } else { other.is_orthographic },
             ortho_width: self.ortho_width * inv + other.ortho_width * t,
+            lens_shift: (
+                self.lens_shift.0 * inv + other.lens_shift.0 * t,
+                self.lens_shift.1 * inv + other.lens_shift.1 * t,
+            ),
         }
     }
 
@@ -469,4 +494,49 @@ pub fn dmat4_to_f32(m: DMat4) -> [[f32; 4]; 4] {
         [cols[2][0] as f32, cols[2][1] as f32, cols[2][2] as f32, cols[2][3] as f32],
         [cols[3][0] as f32, cols[3][1] as f32, cols[3][2] as f32, cols[3][3] as f32],
     ]
+}
+
+#[cfg(test)]
+mod lens_shift_tests {
+    use super::*;
+
+    /// ワールド点を NDC（クリップ /w）へ投影
+    fn ndc_of(cam: &Camera, p: Point3) -> (f64, f64) {
+        let clip = cam.view_projection_matrix() * DVec4::new(p.x, p.y, p.z, 1.0);
+        (clip.x / clip.w, clip.y / clip.w)
+    }
+
+    #[test]
+    fn lens_shift_translates_ndc_by_exact_amount() {
+        let mut cam = Camera::new();
+        // target は光軸上 → 無シフトでは NDC 中心(0,0)
+        let (x0, y0) = ndc_of(&cam, cam.target);
+        assert!(x0.abs() < 1e-9 && y0.abs() < 1e-9, "無シフトで中心: {x0} {y0}");
+
+        // シフトすると NDC がちょうど (sx, sy) ずれる（FOV/アス比は不変）
+        cam.lens_shift = (-0.3, 0.1);
+        let (x1, y1) = ndc_of(&cam, cam.target);
+        assert!((x1 - (-0.3)).abs() < 1e-9, "x が -0.3 ずれる: {x1}");
+        assert!((y1 - 0.1).abs() < 1e-9, "y が 0.1 ずれる: {y1}");
+    }
+
+    #[test]
+    fn lens_shift_preserves_relative_geometry() {
+        // シフトは平行移動なので、2 点間の NDC 差は不変（拡大縮小しない）
+        let mut cam = Camera::new();
+        let p = Point3::new(5000.0, 0.0, 0.0);
+        let q = Point3::new(0.0, 5000.0, 0.0);
+        let d0 = {
+            let a = ndc_of(&cam, p);
+            let b = ndc_of(&cam, q);
+            (a.0 - b.0, a.1 - b.1)
+        };
+        cam.lens_shift = (0.4, -0.2);
+        let d1 = {
+            let a = ndc_of(&cam, p);
+            let b = ndc_of(&cam, q);
+            (a.0 - b.0, a.1 - b.1)
+        };
+        assert!((d0.0 - d1.0).abs() < 1e-9 && (d0.1 - d1.1).abs() < 1e-9, "相対配置は不変");
+    }
 }
