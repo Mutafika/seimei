@@ -321,12 +321,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 塗布の厚み勾配で法線を起伏（盛り上がり）。被覆率(=厚み)の勾配で縁が丸く盛り上がる＝
     // 濡れた塊の艶。bump は控えめにして「粒ごとの黒い縁取り/網目」を出さず、滑らかな盛りに。
     let n_geo = normalize(in.world_normal);
-    let tb_t = normalize(in.world_tangent);
-    let tb_b = normalize(in.world_bitangent);
-    // 起伏: 白い塗布(濃い不透明な液)は厚い塊なので強く盛り上げる。透明濡れは薄い膜＝ほぼ平ら
-    // （汗テカリと同じく面で均一にヌメッと光らせる）ので paint_white で起伏量を絞る。
-    let paint_bump = 6.0 * mix(0.18, 1.0, paint_white);
-    let n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
+    // 無塗布(paint_a==0)では塗布由来の法線起伏を一切計算しない。乗算ゲート(... * paint_a)は、
+    // paint_a==0 でも接線項(タンジェント未生成メッシュ等で normalize(0)=NaN になり得る)を
+    // 巻き込むと 0×NaN=NaN となり陰影法線 n を破壊し、塗布の無い汎用メッシュ(壁等)が脱色・
+    // 消失する回帰を生む(#2)。分岐ゲートにして未塗布は n_geo を素通しさせ、塗布導入前の描画と
+    // bit 一致させる。塗布合成(roughness/albedo/clearcoat/opaque_floor)は paint_a==0 で有限値
+    // に収束する(mix(x,_,0)=x, _*0=0)ため変更不要＝NaN源は法線起伏のみ。
+    var n = n_geo;
+    if (paint_a > 0.0) {
+        let tb_t = normalize(in.world_tangent);
+        let tb_b = normalize(in.world_bitangent);
+        // 起伏: 白い塗布(濃い不透明な液)は厚い塊なので強く盛り上げる。透明濡れは薄い膜＝ほぼ平ら
+        // （汗テカリと同じく面で均一にヌメッと光らせる）ので paint_white で起伏量を絞る。
+        let paint_bump = 6.0 * mix(0.18, 1.0, paint_white);
+        n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
+    }
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
 
