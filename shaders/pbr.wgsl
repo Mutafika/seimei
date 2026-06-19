@@ -303,13 +303,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let transmission = select(0.0, clamp(-mat_z, 0.0, 1.0), is_transmission);
     let emissive_strength = max(in.material.w, 0.0); // 発光強度
 
-    // ベースカラー = インスタンスカラー * テクスチャカラー。塗布があれば不透明ボディ被覆で塗布色へ寄せ、
-    // さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
-    let albedo0 = mix(in.color.rgb * tex_color.rgb, paint.rgb, opaque_body);
-    let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
     // 透明濡れ = wet のうち白くない分（暗く塗られた塗布＝肌色を変えない濡れ）。汗テカリと同様、
     // 肌色を保ったまま「少し暗化＋艶」だけ乗せる。白い塗布(paint_white≈1)では 0＝不透明ボディが支配。
     let wet_clear = wet * (1.0 - paint_white);
+    // 透明ジェルのレンズ屈折: ジェル表面の勾配(paint_grad=被覆の傾き)で下の肌テクスチャの UV を
+    // ズラして再サンプル＝水滴/ジェル越しに肌が歪んで見える。平らなジェル(勾配0)は歪まず、縁や
+    // 盛り上がりの所だけ曲がる＝物理的に正しい。塗布は一切動かさず陰影サンプルだけ曲げる。
+    let lens_uv = in.uv - paint_grad * (wet_clear * 0.045);
+    let skin_tex = mix(tex_color.rgb, textureSample(t_diffuse, s_diffuse, lens_uv).rgb, clamp(wet_clear, 0.0, 1.0));
+    // ベースカラー = インスタンスカラー * (レンズで歪めた)テクスチャ。塗布があれば不透明ボディ被覆で
+    // 塗布色へ寄せ、さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
+    let albedo0 = mix(in.color.rgb * skin_tex, paint.rgb, opaque_body);
+    let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
     let albedo = albedo1 * (1.0 - 0.32 * wet_clear);
 
     // 誘電体の基本反射率 (F0)
