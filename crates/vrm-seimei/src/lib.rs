@@ -37,6 +37,8 @@ pub mod clips;
 pub mod control;
 pub mod lipsync;
 pub use control::AvatarController;
+/// 外部（ticsim 等）がモーキャプ由来クリップを組み立てて `play_custom` に渡せるよう再エクスポート。
+pub use vrm_anatomy::animation::{AnimationClip, BoneTrack, Easing, Keyframe, LoopMode};
 
 /// Row-major 4×4 as `cpu_skin_lbs` wants it (it reads `m[row][col]`, translation
 /// at `m[i][3]`). glam is column-major, so we transpose on the way out.
@@ -707,6 +709,55 @@ impl VrmAvatar {
                 (prim.joint_names.get(v.joints[k] as usize).cloned().unwrap_or_default(), v.weights[k])
             })
             .collect()
+    }
+
+    /// Raise primitive `pi`'s vertex `vi` skin weight for the joint at glTF `node` to at
+    /// least `w` (0..1), scaling the other influences so the four weights still sum to 1.
+    /// If that joint isn't already an influence, it evicts the smallest one. No-op (returns
+    /// `false`) if `node` isn't one of this primitive's skin joints, the indices are out of
+    /// range, or `w` doesn't exceed the current weight. Generic skinning utility for
+    /// re-biasing a mesh region toward a bone (e.g. so a spring/animated bone drives flesh
+    /// the original rig left on a static parent).
+    pub fn raise_bone_weight_at(&mut self, pi: usize, vi: usize, node: usize, w: f32) -> bool {
+        let w = w.clamp(0.0, 1.0);
+        let Some(prim) = self.primitives.get_mut(pi) else { return false };
+        let Some(j) = prim.joint_nodes.iter().position(|&n| n == node) else { return false };
+        let j = j as u32;
+        let Some(v) = prim.skin.vertices.get_mut(vi) else { return false };
+        let slot = (0..4).find(|&k| v.joints[k] == j && v.weights[k] > 0.0);
+        let cur = slot.map(|k| v.weights[k]).unwrap_or(0.0);
+        if w <= cur {
+            return false;
+        }
+        match slot {
+            // 既存スロット: その joint を w に上げ、他3つを (1-w)/(1-cur) 倍して合計1を保つ。
+            Some(k) => {
+                let others = 1.0 - cur;
+                let scale = if others > 1e-6 { (1.0 - w) / others } else { 0.0 };
+                for t in 0..4 {
+                    if t != k {
+                        v.weights[t] *= scale;
+                    }
+                }
+                v.weights[k] = w;
+            }
+            // 未influence: 最小スロットを退避してこの joint を w で挿入。他3つは合計 (1-w) へ。
+            None => {
+                let kmin = (0..4)
+                    .min_by(|&a, &b| v.weights[a].partial_cmp(&v.weights[b]).unwrap())
+                    .unwrap();
+                let others_sum: f32 = (0..4).filter(|&t| t != kmin).map(|t| v.weights[t]).sum();
+                let scale = if others_sum > 1e-6 { (1.0 - w) / others_sum } else { 0.0 };
+                for t in 0..4 {
+                    if t != kmin {
+                        v.weights[t] *= scale;
+                    }
+                }
+                v.joints[kmin] = j;
+                v.weights[kmin] = w;
+            }
+        }
+        true
     }
 }
 

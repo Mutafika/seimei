@@ -89,6 +89,8 @@ pub struct Renderer {
     // Pipelines
     main_pipeline: wgpu::RenderPipeline,
     transparent_pipeline: wgpu::RenderPipeline,
+    /// 深度プリパス用(色なし・深度のみ書込)。透過メッシュを半透明色パス前に先書きしオーラ防止。
+    depth_prepass_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     // Buffers
@@ -239,6 +241,10 @@ impl Renderer {
             &camera_bind_group_layout, &light_bind_group_layout, &texture_manager.bind_group_layout,
             &texture_manager.paint_bind_group_layout,
         )?;
+        // 深度プリパス(has_pp の HDR は sample_count=1)。透過メッシュの深度先書き用。
+        let depth_prepass_pipeline = pipeline::create_depth_prepass_pipeline(
+            &device, &camera_bind_group_layout, 1,
+        )?;
         let line_pipeline = pipeline::create_line_pipeline(
             &device, surface_format, &camera_bind_group_layout,
         )?;
@@ -375,6 +381,7 @@ impl Renderer {
             texture_manager,
             main_pipeline,
             transparent_pipeline,
+            depth_prepass_pipeline,
             line_pipeline,
             point_pipeline,
             instance_buffer,
@@ -1088,6 +1095,23 @@ impl Renderer {
                 );
             }
 
+            // 深度プリパス: 透過(see-through)メッシュの深度を先に書き、後ろの髪等を遮蔽する
+            // （半透明色パスは深度を書かないのでオーラが出る→ここで先書きして防ぐ）。色は描かない。
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Depth Prepass (see-through)"),
+                    color_attachments: &[],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                self.draw_depth_prepass(&mut pass, instances, opaque_count, instance_size);
+            }
+
             // パスB: 半透明（屈折ON）。HDR/深度は Load（clearしない）。
             {
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1589,6 +1613,35 @@ impl Renderer {
     /// `use_refraction==true` のとき、material[3] > 5.0 のインスタンスは屈折パイプライン
     /// (group2=scene_copy)で、それ以外は従来 transparent_pipeline で描く。
     /// `use_refraction==false` のときは全て従来 transparent_pipeline（屈折なし）。
+    /// 透過(see-through)メッシュ(material[2]<0)の深度だけを先書きする。半透明色パスの前に呼び、
+    /// 後ろの髪等を深度で遮蔽して半透明ソートのオーラを消す。色は描かない。
+    fn draw_depth_prepass<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        instance_size: u64,
+    ) {
+        if opaque_count >= instances.len() {
+            return;
+        }
+        render_pass.set_pipeline(&self.depth_prepass_pipeline);
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        for (i, (mesh_id, inst)) in instances[opaque_count..].iter().enumerate() {
+            if inst.material[2] >= 0.0 {
+                continue; // 透過(負)メッシュのみ深度先書き
+            }
+            let idx = opaque_count + i;
+            if let Some(mesh) = self.meshes.get(mesh_id) {
+                let offset = idx as u64 * instance_size;
+                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            }
+        }
+    }
+
     fn draw_transparent_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,

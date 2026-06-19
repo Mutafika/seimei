@@ -51,6 +51,60 @@ pub fn create_transparent_pipeline(
     create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, false, "Transparent Pipeline", 1)
 }
 
+/// 深度プリパス用パイプライン（深度のみ書き込み・色出力なし）。
+/// 透過(see-through)メッシュを半透明色パスの前にこれで深度だけ先書きし、後ろの髪等を遮蔽して
+/// 半透明ソートのオーラを消す。vs_main は camera(group0) のみ使うので layout は camera だけ。
+pub fn create_depth_prepass_pipeline(
+    device: &wgpu::Device,
+    camera_bind_group_layout: &wgpu::BindGroupLayout,
+    msaa_samples: u32,
+) -> Result<wgpu::RenderPipeline, PipelineError> {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Depth Prepass"),
+        source: wgpu::ShaderSource::Wgsl(SHADER_SOURCE.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Depth Prepass Layout"),
+        bind_group_layouts: &[camera_bind_group_layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Depth Prepass Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: None, // 色出力なし＝深度だけ書く
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: Some(wgpu::Face::Back), // 前面のみで深度を書く
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Less,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState {
+            count: msaa_samples,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+        cache: None,
+    });
+    Ok(pipeline)
+}
+
 /// MSAA対応メインパイプライン
 pub fn create_main_pipeline_msaa(
     device: &wgpu::Device,

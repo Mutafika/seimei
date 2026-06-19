@@ -974,6 +974,13 @@ pub struct PostProcessPipeline {
     pub gbuffer: Option<GBuffer>,
     pub width: u32,
     pub height: u32,
+    /// FXAA最終アンチエイリアス用
+    pub surface_format: wgpu::TextureFormat,
+    pub fxaa_texture: wgpu::Texture,
+    pub fxaa_view: wgpu::TextureView,
+    pub fxaa_pipeline: wgpu::RenderPipeline,
+    pub fxaa_bind_group_layout: wgpu::BindGroupLayout,
+    pub fxaa_sampler: wgpu::Sampler,
 }
 
 impl PostProcessPipeline {
@@ -1127,6 +1134,86 @@ impl PostProcessPipeline {
             cache: None,
         });
 
+        // === FXAA 最終アンチエイリアスパス ===
+        // composite はこの中間LDRテクスチャへ描画し、FXAA がそれをサンプルして output_view へ
+        let (fxaa_texture, fxaa_view) =
+            create_ldr_texture(device, width, height, surface_format, "FXAA Intermediate");
+
+        let fxaa_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("FXAA Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let fxaa_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FXAA Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let fxaa_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FXAA Shader"),
+            source: wgpu::ShaderSource::Wgsl(FXAA_SHADER.into()),
+        });
+
+        let fxaa_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("FXAA Pipeline Layout"),
+                bind_group_layouts: &[&fxaa_bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+        let fxaa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("FXAA Pipeline"),
+            layout: Some(&fxaa_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fxaa_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fxaa_shader,
+                entry_point: Some("fs_fxaa"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
         Self {
             ssao,
             bloom,
@@ -1138,6 +1225,12 @@ impl PostProcessPipeline {
             gbuffer,
             width,
             height,
+            surface_format,
+            fxaa_texture,
+            fxaa_view,
+            fxaa_pipeline,
+            fxaa_bind_group_layout,
+            fxaa_sampler,
         }
     }
 
@@ -1282,8 +1375,45 @@ impl PostProcessPipeline {
             ],
         });
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Composite Pass"),
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Composite Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    // FXAA中間テクスチャへ描画（最終出力はFXAAパスが行う）
+                    view: &self.fxaa_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(0, &composite_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // === FXAA パス: 中間テクスチャをサンプルして output_view へ ===
+        let fxaa_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FXAA Bind Group"),
+            layout: &self.fxaa_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.fxaa_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.fxaa_sampler),
+                },
+            ],
+        });
+
+        let mut fxaa_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("FXAA Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
                 resolve_target: None,
@@ -1296,9 +1426,9 @@ impl PostProcessPipeline {
             timestamp_writes: None,
             occlusion_query_set: None,
         });
-        pass.set_pipeline(&self.composite_pipeline);
-        pass.set_bind_group(0, &composite_bg, &[]);
-        pass.draw(0..3, 0..1);
+        fxaa_pass.set_pipeline(&self.fxaa_pipeline);
+        fxaa_pass.set_bind_group(0, &fxaa_bg, &[]);
+        fxaa_pass.draw(0..3, 0..1);
     }
 
     /// リサイズ
@@ -1320,6 +1450,11 @@ impl PostProcessPipeline {
         if self.gbuffer.is_some() {
             self.gbuffer = Some(GBuffer::new(device, width, height, depth_view));
         }
+        // FXAA中間テクスチャ再作成
+        let (ft, fv) =
+            create_ldr_texture(device, width, height, self.surface_format, "FXAA Intermediate");
+        self.fxaa_texture = ft;
+        self.fxaa_view = fv;
         self.width = width;
         self.height = height;
     }
@@ -1344,6 +1479,32 @@ fn create_r8_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    (tex, view)
+}
+
+/// FXAA中間用のLDRテクスチャ（surface_format, RENDER_ATTACHMENT | TEXTURE_BINDING）
+fn create_ldr_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
@@ -1683,6 +1844,80 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let gamma_corrected = pow(mapped, vec3(1.0 / 2.2));
 
     return vec4<f32>(gamma_corrected, 1.0);
+}
+"#;
+
+const FXAA_SHADER: &str = r#"
+// Fullscreen triangle (matches composite vs_main pattern)
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    var out: VsOut;
+    let x = f32((vid << 1u) & 2u);
+    let y = f32(vid & 2u);
+    out.uv = vec2<f32>(x, y);
+    out.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+    return out;
+}
+
+@group(0) @binding(0) var t_color: texture_2d<f32>;
+@group(0) @binding(1) var s_color: sampler;
+
+fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
+
+@fragment
+fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(t_color));
+    let rcp = 1.0 / dims;
+    let uv = in.uv;
+
+    let EDGE_MIN: f32 = 1.0 / 24.0;
+    let EDGE_MAX: f32 = 1.0 / 8.0;
+    let SPAN_MAX: f32 = 8.0;
+    let REDUCE_MUL: f32 = 1.0 / 8.0;
+    let REDUCE_MIN: f32 = 1.0 / 128.0;
+
+    let rgbM  = textureSampleLevel(t_color, s_color, uv, 0.0).rgb;
+    let rgbNW = textureSampleLevel(t_color, s_color, uv + vec2<f32>(-1.0, -1.0) * rcp, 0.0).rgb;
+    let rgbNE = textureSampleLevel(t_color, s_color, uv + vec2<f32>( 1.0, -1.0) * rcp, 0.0).rgb;
+    let rgbSW = textureSampleLevel(t_color, s_color, uv + vec2<f32>(-1.0,  1.0) * rcp, 0.0).rgb;
+    let rgbSE = textureSampleLevel(t_color, s_color, uv + vec2<f32>( 1.0,  1.0) * rcp, 0.0).rgb;
+
+    let lM  = luma(rgbM);
+    let lNW = luma(rgbNW);
+    let lNE = luma(rgbNE);
+    let lSW = luma(rgbSW);
+    let lSE = luma(rgbSE);
+
+    let lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    let lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+
+    // Skip non-edges (cheap early-ish out via mix at the end)
+    var dir: vec2<f32>;
+    dir.x = -((lNW + lNE) - (lSW + lSE));
+    dir.y =  ((lNW + lSW) - (lNE + lSE));
+
+    let dirReduce = max((lNW + lNE + lSW + lSE) * 0.25 * REDUCE_MUL, REDUCE_MIN);
+    let rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+    dir = clamp(dir * rcpDirMin, vec2<f32>(-SPAN_MAX), vec2<f32>(SPAN_MAX)) * rcp;
+
+    let rgbA = 0.5 * (
+        textureSampleLevel(t_color, s_color, uv + dir * (1.0 / 3.0 - 0.5), 0.0).rgb +
+        textureSampleLevel(t_color, s_color, uv + dir * (2.0 / 3.0 - 0.5), 0.0).rgb);
+    let rgbB = rgbA * 0.5 + 0.25 * (
+        textureSampleLevel(t_color, s_color, uv + dir * -0.5, 0.0).rgb +
+        textureSampleLevel(t_color, s_color, uv + dir *  0.5, 0.0).rgb);
+
+    let lB = luma(rgbB);
+    var result = rgbB;
+    if (lB < lMin || lB > lMax) { result = rgbA; }
+
+    // If contrast is below threshold, keep original (no AA) to avoid over-blurring flat areas.
+    let contrast = lMax - lMin;
+    if (contrast < max(EDGE_MIN, lMax * EDGE_MAX)) { result = rgbM; }
+
+    return vec4<f32>(result, 1.0);
 }
 "#;
 

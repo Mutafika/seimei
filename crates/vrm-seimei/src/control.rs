@@ -71,6 +71,9 @@ pub struct AvatarController {
     /// 腕を T-pose から脇へ下ろす量(0=T-pose で真横, 1=真下)。既定は [`ARM_DOWN`]。
     /// 吊り下げ等で腕を開いたままにしたい外部制御から差し替えられる。
     arm_down: f32,
+    /// コントローラ合成の腕（腕下げ＋歩行スイング）を適用するか。モーキャプ等の腕トラックを
+    /// 含むカスタムクリップ再生中は false にして二重適用を避ける（play_custom が制御）。
+    synth_arms: bool,
     /// 直近フレームの「ポーズ済み world 変換」(native Y-up/m, node index)。外部物理が
     /// 生きた骨位置（歩行で動く手など）にアンカーできるよう毎フレーム保存する。
     last_world: Vec<Mat4>,
@@ -96,6 +99,7 @@ impl AvatarController {
             emotion_target: HashMap::new(),
             emotion_now: HashMap::new(),
             arm_down: ARM_DOWN,
+            synth_arms: true,
             last_world: Vec::new(),
         }
     }
@@ -138,22 +142,37 @@ impl AvatarController {
     pub fn bind(&mut self) {
         self.player.stop();
         self.gait_period = 0.0;
+        self.synth_arms = true;
     }
     pub fn play_idle(&mut self) {
         self.player.play(idle_clip());
         self.paused = false;
         self.gait_period = 0.0;
+        self.synth_arms = true;
     }
     pub fn play_walk(&mut self) {
         let c = walk_clip(self.gait_dir());
         self.gait_period = c.duration;
         self.player.play(c);
         self.paused = false;
+        self.synth_arms = true;
     }
     pub fn play_run(&mut self) {
         let c = run_clip(self.gait_dir());
         self.gait_period = c.duration;
         self.player.play(c);
+        self.paused = false;
+        self.synth_arms = true;
+    }
+
+    /// 外部生成クリップ（モーキャプ等）を再生する。`gait_period` は歩行同期系（胸ジグル等）が
+    /// 参照する周期で、ループ歩行なら clip.duration、ワンショットなら 0 を渡す。
+    /// `synth_arms=false` でコントローラ合成の腕（arms_pose の腕下げ＋振り子スイング）を止める
+    /// （モーキャプは腕トラックを含むので合成すると二重になる）。
+    pub fn play_custom(&mut self, clip: vrm_anatomy::animation::AnimationClip, gait_period: f32, synth_arms: bool) {
+        self.gait_period = gait_period;
+        self.synth_arms = synth_arms;
+        self.player.play(clip);
         self.paused = false;
     }
 
@@ -264,14 +283,16 @@ impl AvatarController {
         // Arms down out of the T-pose, swinging front/back (opposite each other)
         // when walking — the clips don't touch the arms. `gait_dir` flips the
         // swing for VRM 0.x so the arm leads the correct (forward) step.
-        let (ls, rs) = if self.gait_period > 0.0 {
-            let phase = self.player.current_time() / self.gait_period * std::f32::consts::TAU;
-            let s = ARM_SWING * self.gait_dir() * phase.sin();
-            (s, -s)
-        } else {
-            (0.0, 0.0)
-        };
-        pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs));
+        if self.synth_arms {
+            let (ls, rs) = if self.gait_period > 0.0 {
+                let phase = self.player.current_time() / self.gait_period * std::f32::consts::TAU;
+                let s = ARM_SWING * self.gait_dir() * phase.sin();
+                (s, -s)
+            } else {
+                (0.0, 0.0)
+            };
+            pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs));
+        }
 
         // 表情(emotion)を毎フレーム目標 weight へ ease（スナップ防止）。blink は別管理、
         // 母音は下の lip-sync が後で上書きするのでここで触っても問題ない。
