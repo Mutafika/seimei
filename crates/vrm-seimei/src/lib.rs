@@ -176,6 +176,41 @@ impl VrmAvatar {
         let no_anim = vec![Quat::IDENTITY; nn];
         let world_bind = compute_world(&nodes_t, &nodes_r, &nodes_s, &nodes_parent, &node_order, &no_anim);
 
+        // === ボーン rest フレームの正準化（エクスポータ差の吸収）===
+        // 外部から与えるポーズ euler は compute_world で `local = r[i] * anim[i]` ＝ボーンの rest
+        // 局所フレームで合成される。ところがエクスポータごとにボーン局所軸の規約が違う:
+        //   VRoid 純正        … 子オフセットがワールド整列(腕=+X/脚=-Y)・rest 回転ほぼ単位
+        //   Blender VRMアドオン … 子オフセットが局所+Y・脚は rest を約180°回転
+        // すると同じ euler でも膝/肘の曲げ等が逆向きになる(報告の「全向き反転」の正体)。
+        // 全ボーンの rest を「ワールド整列(局所回転=単位・子オフセット=ワールド差分)」へ書き換えて
+        // どのエクスポータでも同一規約に揃える。bind のワールド位置は保存し、inv_bind は下で
+        // world_bind から再計算するのでスキニングは不変。spring も rest をワールド位置から取るため不変。
+        {
+            let mut rerolled = 0usize;
+            let mut max_scale_dev = 0.0f32;
+            for &i in &node_order {
+                let wp_i = world_bind[i].w_axis.truncate();
+                let wp_parent = nodes_parent[i]
+                    .map(|p| world_bind[p].w_axis.truncate())
+                    .unwrap_or(Vec3::ZERO);
+                max_scale_dev = max_scale_dev.max((nodes_s[i] - Vec3::ONE).abs().max_element());
+                if nodes_r[i].normalize().dot(Quat::IDENTITY).abs() < 0.9999 {
+                    rerolled += 1;
+                }
+                // 親 rest が単位回転になるので、子オフセットはワールド差分そのもの。
+                nodes_t[i] = wp_i - wp_parent;
+                nodes_r[i] = Quat::IDENTITY;
+            }
+            if max_scale_dev > 1e-3 {
+                eprintln!(
+                    "[vrm] canonicalize: 非単位ボーンスケール {max_scale_dev:.4} 検出 — rest 正準化が不正確になる可能性"
+                );
+            }
+            eprintln!("[vrm] canonicalize rest: {rerolled}/{nn} bones をワールド整列へ再ロール");
+        }
+        // 正準化した rest で world_bind を再計算（位置は不変・回転は全て単位になる）。
+        let world_bind = compute_world(&nodes_t, &nodes_r, &nodes_s, &nodes_parent, &node_order, &no_anim);
+
         // Humanoid bone map (VRM 1.0 then 0.x): bone name -> glTF node index.
         let (humanoid, is_vrm0) = scene
             .extensions_json
