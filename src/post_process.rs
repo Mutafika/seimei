@@ -983,12 +983,12 @@ pub struct PixelArtParams {
 impl Default for PixelArtParams {
     fn default() -> Self {
         Self {
-            cell_px: 6.0,
+            cell_px: 8.0,
             palette_id: 2.0, // pico8
             dither: 1.0,
             outline: 0.5,
-            levels: 5.0,
-            sat: 1.2,
+            levels: 32.0, // 色数=フル（下げるほど減色）。palette/posterize 両モードで効く
+            sat: 1.3,
             _pad0: 0.0,
             _pad1: 0.0,
         }
@@ -2190,8 +2190,8 @@ fn posterize(c: vec3<f32>, levels: f32) -> vec3<f32> {
     return floor(c * l + 0.5) / l;
 }
 
-// 固定パレットへ最近傍マッピング
-fn nearest_palette(c: vec3<f32>, id: f32) -> vec3<f32> {
+// 固定パレットへ最近傍マッピング。cap で使用色数を制限する。
+fn nearest_palette(c: vec3<f32>, id: f32, cap: f32) -> vec3<f32> {
     var n: i32 = 0;
     var pal: array<vec3<f32>, 32>;
     if (id < 1.5) {
@@ -2306,20 +2306,41 @@ fn nearest_palette(c: vec3<f32>, id: f32) -> vec3<f32> {
         pal[1] = vec3<f32>(237.0, 237.0, 230.0) / 255.0;
         n = 2;
     }
+    // 使用色数を cap に制限。先頭N個だと暗色などに偏るのでパレット全体から
+    // ストライドで均等に間引いて選ぶ。cap>=パレット色数なら全色を使う。
+    let lim = clamp(i32(cap + 0.5), 2, n);
     var best = pal[0];
     var bestd = 1e9;
-    for (var i: i32 = 0; i < n; i = i + 1) {
-        let d = distance(c, pal[i]);
-        if (d < bestd) { bestd = d; best = pal[i]; }
+    for (var i: i32 = 0; i < lim; i = i + 1) {
+        let idx = (i * n) / lim;
+        let d = distance(c, pal[idx]);
+        if (d < bestd) { bestd = d; best = pal[idx]; }
     }
     return best;
 }
 
 fn quantize(c: vec3<f32>) -> vec3<f32> {
+    // 色数コントロール（levels=色数）。Posterizeモードは階調数、
+    // パレットモードは「使うパレット色数」としてそのまま効く。
     if (P.palette_id < 0.5) {
         return posterize(c, P.levels);
     }
-    return nearest_palette(c, P.palette_id);
+    return nearest_palette(c, P.palette_id, P.levels);
+}
+
+// セルの代表色をエリア平均で求める。中心1点サンプルだと細部ノイズが
+// 残って "低解像度の写真=モザイク" に見えるため、3x3 平均でフラットなセル色を作る。
+fn cell_color(cell_idx: vec2<f32>, cell: f32, dims: vec2<f32>) -> vec3<f32> {
+    var acc = vec3<f32>(0.0);
+    let base = cell_idx * cell;
+    for (var sy: i32 = 0; sy < 2; sy = sy + 1) {
+        for (var sx: i32 = 0; sx < 2; sx = sx + 1) {
+            let sub = (vec2<f32>(f32(sx), f32(sy)) + vec2<f32>(0.5)) / 2.0;
+            let p = (base + sub * cell) / dims;
+            acc = acc + textureSampleLevel(src_tex, samp, p, 0.0).rgb;
+        }
+    }
+    return acc / 4.0;
 }
 
 @fragment
@@ -2328,28 +2349,30 @@ fn fs_pixel_art(in: VertexOutput) -> @location(0) vec4<f32> {
     let cell = max(P.cell_px, 1.0);
     let frag = in.uv * dims;
     let cell_idx = floor(frag / cell);
-    let guv = (cell_idx + vec2<f32>(0.5)) * cell / dims;
 
-    var col = textureSampleLevel(src_tex, samp, guv, 0.0).rgb;
+    var col = cell_color(cell_idx, cell, dims);
 
-    // 彩度ブースト
+    // 彩度ブースト＋コントラスト押し（限られたパレットに色を"寄せ"て写真っぽさを除去）
     let l0 = luma(col);
     col = mix(vec3<f32>(l0), col, P.sat);
+    col = (col - vec3<f32>(0.5)) * 1.18 + vec3<f32>(0.5);
 
-    // Bayerディザ（セル単位）
+    // Bayerディザ（セル単位）。パレット間隔が広いので振幅を上げないと効かない
     if (P.dither > 0.5) {
-        let amt = select(0.06, 1.0 / max(P.levels, 2.0), P.palette_id < 0.5);
+        let amt = select(0.18, 1.0 / max(P.levels, 2.0), P.palette_id < 0.5);
         col = col + vec3<f32>(bayer4(vec2<i32>(cell_idx)) * amt);
     }
     col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
 
     var q = quantize(col);
 
-    // 輪郭線（左/上の隣セルとの輝度差）
+    // 輪郭線（左/上の隣セルとの輝度差）。fps優先で隣セルは中心1点だけサンプル
+    // （再平均は重いので使わない。エッジ判定は輝度差の閾値なので1点で十分）。
     if (P.outline > 0.01) {
         let texel = cell / dims;
-        let ln = luma(textureSampleLevel(src_tex, samp, guv - vec2<f32>(texel.x, 0.0), 0.0).rgb);
-        let lu = luma(textureSampleLevel(src_tex, samp, guv - vec2<f32>(0.0, texel.y), 0.0).rgb);
+        let here = (cell_idx + vec2<f32>(0.5)) * cell / dims;
+        let ln = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(texel.x, 0.0), 0.0).rgb);
+        let lu = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(0.0, texel.y), 0.0).rgb);
         let lc = luma(col);
         let d = max(abs(lc - ln), abs(lc - lu));
         let edge = smoothstep(0.12, 0.30, d);
