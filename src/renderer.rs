@@ -1346,6 +1346,24 @@ impl Renderer {
         &self.quality_settings
     }
 
+    /// ドット絵ポストプロセスの ON/OFF。
+    /// ポストプロセス経路が無効（ssao/bloom等が全てoff）の場合は何もせず false を返す。
+    pub fn set_pixel_art_enabled(&mut self, on: bool) -> bool {
+        if let Some(pp) = &mut self.post_process {
+            pp.set_pixel_art_enabled(on);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）
+    pub fn set_pixel_art_params(&self, params: crate::post_process::PixelArtParams) {
+        if let Some(pp) = &self.post_process {
+            pp.set_pixel_art_params(&self.queue, params);
+        }
+    }
+
     // ── リサイズ ──
 
     /// サイズ変更時に深度/MSAA/ポストプロセステクスチャを再作成
