@@ -523,6 +523,12 @@ impl VrmAvatar {
         self.humanoid.keys().map(|s| s.as_str())
     }
 
+    /// 全 glTF ノード名(スケルトン由来の生のボーン名)。MMD製リグ判定など、
+    /// humanoid 標準名ではなく元の命名規約を見たい用途向け。
+    pub fn node_names(&self) -> impl Iterator<Item = &str> {
+        self.nodes_name.iter().map(|s| s.as_str())
+    }
+
     /// True for VRM 0.x. In seimei space a VRM 0.x avatar faces **+Y** (toward the
     /// back of where a 1.0 model faces), so the camera must sit on the +Y side.
     pub fn is_vrm0(&self) -> bool {
@@ -611,7 +617,7 @@ impl VrmAvatar {
     /// back into the bone's local frame — so it's correct for any rig, no
     /// hand-tuned euler guessing. `optional_extra` lets the caller append more.
     pub fn arms_down_pose(&self, fraction: f32) -> Vec<(&'static str, [f32; 3])> {
-        self.arms_pose(fraction, 0.0, 0.0)
+        self.arms_pose(fraction, 0.0, 0.0, 0.0)
     }
 
     /// Lower the arms toward the sides by `fraction`, then swing each upper arm
@@ -619,7 +625,7 @@ impl VrmAvatar {
     /// negative = the other — opposite arms for a walk). The target is straight
     /// **down** rotated about the left-right (native X) axis by the swing, mapped
     /// back into each bone's local frame.
-    pub fn arms_pose(&self, fraction: f32, left_swing: f32, right_swing: f32) -> Vec<(&'static str, [f32; 3])> {
+    pub fn arms_pose(&self, fraction: f32, left_swing: f32, right_swing: f32, abduct: f32) -> Vec<(&'static str, [f32; 3])> {
         let no_anim = vec![Quat::IDENTITY; self.nodes_t.len()];
         let world = compute_world(
             &self.nodes_t,
@@ -630,9 +636,9 @@ impl VrmAvatar {
             &no_anim,
         );
         let mut pose = Vec::new();
-        for (upper, lower, swing) in [
-            ("leftUpperArm", "leftLowerArm", left_swing),
-            ("rightUpperArm", "rightLowerArm", right_swing),
+        for (upper, lower, swing, out) in [
+            ("leftUpperArm", "leftLowerArm", left_swing, abduct),
+            ("rightUpperArm", "rightLowerArm", right_swing, -abduct),
         ] {
             let (Some(&un), Some(&ln)) =
                 (self.humanoid.get(upper), self.humanoid.get(lower))
@@ -646,8 +652,13 @@ impl VrmAvatar {
             if arm.length_squared() < 1e-9 {
                 continue;
             }
-            // Target = straight down, swung front/back about the left-right (X) axis.
-            let target = Quat::from_axis_angle(Vec3::X, swing) * Vec3::NEG_Y;
+            // Target = straight down, swung front/back about left-right (X), then
+            // abducted outward about the forward (Z) axis so the arm clears the torso
+            // — slim torsos (e.g. MMD bodies) otherwise bury the upper arm in the
+            // body because the rest arm root sits medial to the body's side surface.
+            let target = Quat::from_axis_angle(Vec3::Z, out)
+                * Quat::from_axis_angle(Vec3::X, swing)
+                * Vec3::NEG_Y;
             // World rotation arm→target, then expressed in the joint's LOCAL frame:
             // the arm vector is rotated by M (the joint's world orientation), so a
             // world rotation R needs local R_anim = M⁻¹ · R · M.

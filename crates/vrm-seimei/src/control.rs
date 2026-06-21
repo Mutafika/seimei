@@ -71,6 +71,11 @@ pub struct AvatarController {
     /// 腕を T-pose から脇へ下ろす量(0=T-pose で真横, 1=真下)。既定は [`ARM_DOWN`]。
     /// 吊り下げ等で腕を開いたままにしたい外部制御から差し替えられる。
     arm_down: f32,
+    /// 休めの腕を外へ開く量(rad)。細い胴（MMD体型等）は腕付け根が胴の側面より内側に
+    /// あり、真下に下ろすと上腕が胴へ埋まる。これを外転させて胴をかわす。既定0=不変。
+    arm_abduct: f32,
+    /// 休めの腕を前へ振る量(rad)。+で手が体の前側へ。細い胴で手が尻/腿へ埋まるのを防ぐ。既定0。
+    arm_rest_swing: f32,
     /// コントローラ合成の腕（腕下げ＋歩行スイング）を適用するか。モーキャプ等の腕トラックを
     /// 含むカスタムクリップ再生中は false にして二重適用を避ける（play_custom が制御）。
     synth_arms: bool,
@@ -99,6 +104,8 @@ impl AvatarController {
             emotion_target: HashMap::new(),
             emotion_now: HashMap::new(),
             arm_down: ARM_DOWN,
+            arm_abduct: 0.0,
+            arm_rest_swing: 0.0,
             synth_arms: true,
             last_world: Vec::new(),
         }
@@ -114,6 +121,17 @@ impl AvatarController {
     /// ままにする等、外部から腕の基本姿勢を制御するための seam。既定は 0.72。
     pub fn set_arm_down(&mut self, fraction: f32) {
         self.arm_down = fraction.clamp(0.0, 1.0);
+    }
+
+    /// 休めの腕を外へ開く量(rad)を差し替える。細い胴で上腕が胴へ埋まるのを防ぐ。
+    /// 既定0（forticsim 等は不変）。MMD体型は ticsim 側で正値を設定する。
+    pub fn set_arm_abduct(&mut self, rad: f32) {
+        self.arm_abduct = rad;
+    }
+
+    /// 休めの腕を前へ振る量(rad)を差し替える。手を腿の前側へ逃がして尻/腿への埋まりを防ぐ。既定0。
+    pub fn set_arm_rest_swing(&mut self, rad: f32) {
+        self.arm_rest_swing = rad;
     }
 
     /// The wrapped avatar (materials, presets, spring info, etc.).
@@ -289,9 +307,10 @@ impl AvatarController {
                 let s = ARM_SWING * self.gait_dir() * phase.sin();
                 (s, -s)
             } else {
-                (0.0, 0.0)
+                // 休め: 手を腿の前側へ逃がす前振り（細い胴で手が尻/腿へ埋まるのを防ぐ）。
+                (self.arm_rest_swing, self.arm_rest_swing)
             };
-            pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs));
+            pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs, self.arm_abduct));
         }
 
         // 表情(emotion)を毎フレーム目標 weight へ ease（スナップ防止）。blink は別管理、
