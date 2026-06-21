@@ -40,7 +40,7 @@ pub use quality::{QualityPreset, QualitySettings, ShadowQuality, MsaaSamples};
 pub use ply::{PlyLoader, PlyPointCloud, GaussianCloud, GaussianPoint, PlyError};
 pub use splat::{GpuSplat, SplatCloudData, SPLAT_SHADER_SOURCE};
 pub use shadow::{create_shadow_pipeline, SHADOW_MAP_SIZE};
-pub use post_process::{PostProcessPipeline, GBuffer, SsaoPass, BloomPass, EdgeBevelPass};
+pub use post_process::{PostProcessPipeline, GBuffer, SsaoPass, BloomPass, EdgeBevelPass, PixelArtPass, PixelArtParams};
 pub use dof::{DofPass, DofParams};
 pub use ssr::SsrPass;
 pub mod procedural;

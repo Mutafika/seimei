@@ -960,6 +960,203 @@ impl BloomPass {
     }
 }
 
+/// ドット絵（ピクセルアート）ポストプロセスのパラメータ（uniform）
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PixelArtParams {
+    /// ドットセルの大きさ(px)。大きいほど粗い
+    pub cell_px: f32,
+    /// 0=ポスタライズ, 1=gameboy, 2=pico8, 3=famicom風
+    pub palette_id: f32,
+    /// Bayerディザ (0/1)
+    pub dither: f32,
+    /// 輪郭線の濃さ (0..1)
+    pub outline: f32,
+    /// ポスタライズ階調数（palette_id=0 のとき有効）
+    pub levels: f32,
+    /// 彩度ブースト (1.0=変更なし)
+    pub sat: f32,
+    pub _pad0: f32,
+    pub _pad1: f32,
+}
+
+impl Default for PixelArtParams {
+    fn default() -> Self {
+        Self {
+            cell_px: 6.0,
+            palette_id: 2.0, // pico8
+            dither: 1.0,
+            outline: 0.5,
+            levels: 5.0,
+            sat: 1.2,
+            _pad0: 0.0,
+            _pad1: 0.0,
+        }
+    }
+}
+
+/// ドット絵パス: 合成済みLDR画像をセル単位でドット化して output へ書き出す（FXAA代替）。
+/// 解像度非依存（fxaa_view をサンプルし output へ描くだけ）なので resize 不要。
+pub struct PixelArtPass {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    params_buffer: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+}
+
+impl PixelArtPass {
+    pub fn new(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        params: PixelArtParams,
+    ) -> Self {
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("PixelArt Params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("PixelArt Bind Group Layout"),
+                entries: &[
+                    // 入力（合成済みLDR）
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // パラメータ
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PixelArt Shader"),
+            source: wgpu::ShaderSource::Wgsl(PIXEL_ART_SHADER.into()),
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("PixelArt Pipeline Layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("PixelArt Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_pixel_art"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        // ニアレストでもよいが、セル中心を Linear で拾い軽く均す
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("PixelArt Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        Self { pipeline, bind_group_layout, params_buffer, sampler }
+    }
+
+    /// パラメータバッファを書き換え（毎フレーム呼んでもよい軽量更新）
+    pub fn update_params(&self, queue: &wgpu::Queue, params: PixelArtParams) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+    }
+
+    /// input_view（合成済みLDR）をドット化して output_view へ
+    pub fn execute(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        input_view: &wgpu::TextureView,
+        output_view: &wgpu::TextureView,
+    ) {
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PixelArt Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(input_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("PixelArt Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
 /// ポストプロセスパイプライン全体
 pub struct PostProcessPipeline {
     pub ssao: Option<SsaoPass>,
@@ -981,6 +1178,9 @@ pub struct PostProcessPipeline {
     pub fxaa_pipeline: wgpu::RenderPipeline,
     pub fxaa_bind_group_layout: wgpu::BindGroupLayout,
     pub fxaa_sampler: wgpu::Sampler,
+    /// ドット絵（ピクセルアート）パス。ON時は FXAA を置換して最終出力をドット化する
+    pub pixel_art: PixelArtPass,
+    pub pixel_art_enabled: bool,
 }
 
 impl PostProcessPipeline {
@@ -1231,7 +1431,19 @@ impl PostProcessPipeline {
             fxaa_pipeline,
             fxaa_bind_group_layout,
             fxaa_sampler,
+            pixel_art: PixelArtPass::new(device, surface_format, PixelArtParams::default()),
+            pixel_art_enabled: false,
         }
+    }
+
+    /// ドット絵パスの ON/OFF
+    pub fn set_pixel_art_enabled(&mut self, on: bool) {
+        self.pixel_art_enabled = on;
+    }
+
+    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）
+    pub fn set_pixel_art_params(&self, queue: &wgpu::Queue, params: PixelArtParams) {
+        self.pixel_art.update_params(queue, params);
     }
 
     /// シーンカラーHDRテクスチャビューを取得（3Dシーンの描画先）
@@ -1394,6 +1606,13 @@ impl PostProcessPipeline {
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &composite_bg, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // ドット絵ON時は合成済みLDR(fxaa_view)をドット化して output へ。
+        // ピクセルアートにアンチエイリアスは逆効果なので FXAA は通さない。
+        if self.pixel_art_enabled {
+            self.pixel_art.execute(encoder, device, &self.fxaa_view, output_view);
+            return;
         }
 
         // === FXAA パス: 中間テクスチャをサンプルして output_view へ ===
@@ -1918,6 +2137,226 @@ fn fs_fxaa(in: VsOut) -> @location(0) vec4<f32> {
     if (contrast < max(EDGE_MIN, lMax * EDGE_MAX)) { result = rgbM; }
 
     return vec4<f32>(result, 1.0);
+}
+"#;
+
+const PIXEL_ART_SHADER: &str = r#"
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct Params {
+    cell_px: f32,
+    palette_id: f32,
+    dither: f32,
+    outline: f32,
+    levels: f32,
+    sat: f32,
+    pad0: f32,
+    pad1: f32,
+};
+@group(0) @binding(2) var<uniform> P: Params;
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
+    let x = f32(i32(vi & 1u) * 4 - 1);
+    let y = f32(i32(vi & 2u) * 2 - 1);
+    out.position = vec4<f32>(x, y, 0.0, 1.0);
+    out.uv = vec2<f32>((x + 1.0) * 0.5, (1.0 - y) * 0.5);
+    return out;
+}
+
+fn luma(c: vec3<f32>) -> f32 { return dot(c, vec3<f32>(0.299, 0.587, 0.114)); }
+
+// Bayer 4x4 オーダードディザ（戻り値 -0.5..0.5）
+fn bayer4(p: vec2<i32>) -> f32 {
+    var m = array<f32, 16>(
+        0.0,  8.0,  2.0, 10.0,
+       12.0,  4.0, 14.0,  6.0,
+        3.0, 11.0,  1.0,  9.0,
+       15.0,  7.0, 13.0,  5.0
+    );
+    let idx = (p.y & 3) * 4 + (p.x & 3);
+    return m[idx] / 16.0 - 0.5;
+}
+
+fn posterize(c: vec3<f32>, levels: f32) -> vec3<f32> {
+    let l = max(levels, 2.0);
+    return floor(c * l + 0.5) / l;
+}
+
+// 固定パレットへ最近傍マッピング
+fn nearest_palette(c: vec3<f32>, id: f32) -> vec3<f32> {
+    var n: i32 = 0;
+    var pal: array<vec3<f32>, 32>;
+    if (id < 1.5) {
+        // gameboy 4色
+        pal[0] = vec3<f32>(15.0, 56.0, 15.0) / 255.0;
+        pal[1] = vec3<f32>(48.0, 98.0, 48.0) / 255.0;
+        pal[2] = vec3<f32>(139.0, 172.0, 15.0) / 255.0;
+        pal[3] = vec3<f32>(155.0, 188.0, 15.0) / 255.0;
+        n = 4;
+    } else if (id < 2.5) {
+        // pico8 16色
+        pal[0]  = vec3<f32>(0.0, 0.0, 0.0) / 255.0;
+        pal[1]  = vec3<f32>(29.0, 43.0, 83.0) / 255.0;
+        pal[2]  = vec3<f32>(126.0, 37.0, 83.0) / 255.0;
+        pal[3]  = vec3<f32>(0.0, 135.0, 81.0) / 255.0;
+        pal[4]  = vec3<f32>(171.0, 82.0, 54.0) / 255.0;
+        pal[5]  = vec3<f32>(95.0, 87.0, 79.0) / 255.0;
+        pal[6]  = vec3<f32>(194.0, 195.0, 199.0) / 255.0;
+        pal[7]  = vec3<f32>(255.0, 241.0, 232.0) / 255.0;
+        pal[8]  = vec3<f32>(255.0, 0.0, 77.0) / 255.0;
+        pal[9]  = vec3<f32>(255.0, 163.0, 0.0) / 255.0;
+        pal[10] = vec3<f32>(255.0, 236.0, 39.0) / 255.0;
+        pal[11] = vec3<f32>(0.0, 228.0, 54.0) / 255.0;
+        pal[12] = vec3<f32>(41.0, 173.0, 255.0) / 255.0;
+        pal[13] = vec3<f32>(131.0, 118.0, 156.0) / 255.0;
+        pal[14] = vec3<f32>(255.0, 119.0, 168.0) / 255.0;
+        pal[15] = vec3<f32>(255.0, 204.0, 170.0) / 255.0;
+        n = 16;
+    } else if (id < 3.5) {
+        // famicom風 16色
+        pal[0]  = vec3<f32>(0.0, 0.0, 0.0) / 255.0;
+        pal[1]  = vec3<f32>(252.0, 252.0, 252.0) / 255.0;
+        pal[2]  = vec3<f32>(188.0, 188.0, 188.0) / 255.0;
+        pal[3]  = vec3<f32>(124.0, 124.0, 124.0) / 255.0;
+        pal[4]  = vec3<f32>(0.0, 120.0, 248.0) / 255.0;
+        pal[5]  = vec3<f32>(0.0, 0.0, 252.0) / 255.0;
+        pal[6]  = vec3<f32>(104.0, 68.0, 252.0) / 255.0;
+        pal[7]  = vec3<f32>(216.0, 0.0, 204.0) / 255.0;
+        pal[8]  = vec3<f32>(228.0, 0.0, 88.0) / 255.0;
+        pal[9]  = vec3<f32>(248.0, 56.0, 0.0) / 255.0;
+        pal[10] = vec3<f32>(228.0, 92.0, 16.0) / 255.0;
+        pal[11] = vec3<f32>(172.0, 124.0, 0.0) / 255.0;
+        pal[12] = vec3<f32>(0.0, 184.0, 0.0) / 255.0;
+        pal[13] = vec3<f32>(0.0, 168.0, 68.0) / 255.0;
+        pal[14] = vec3<f32>(0.0, 136.0, 136.0) / 255.0;
+        pal[15] = vec3<f32>(248.0, 216.0, 120.0) / 255.0;
+        n = 16;
+    } else if (id < 4.5) {
+        // Endesga 32（暖色〜寒色の豊富な32色。実写が一番"映える"）
+        pal[0]  = vec3<f32>(190.0, 74.0, 47.0) / 255.0;
+        pal[1]  = vec3<f32>(215.0, 118.0, 67.0) / 255.0;
+        pal[2]  = vec3<f32>(234.0, 212.0, 170.0) / 255.0;
+        pal[3]  = vec3<f32>(228.0, 166.0, 114.0) / 255.0;
+        pal[4]  = vec3<f32>(184.0, 111.0, 80.0) / 255.0;
+        pal[5]  = vec3<f32>(115.0, 62.0, 57.0) / 255.0;
+        pal[6]  = vec3<f32>(62.0, 39.0, 49.0) / 255.0;
+        pal[7]  = vec3<f32>(162.0, 38.0, 51.0) / 255.0;
+        pal[8]  = vec3<f32>(228.0, 59.0, 68.0) / 255.0;
+        pal[9]  = vec3<f32>(247.0, 118.0, 34.0) / 255.0;
+        pal[10] = vec3<f32>(254.0, 174.0, 52.0) / 255.0;
+        pal[11] = vec3<f32>(254.0, 231.0, 97.0) / 255.0;
+        pal[12] = vec3<f32>(99.0, 199.0, 77.0) / 255.0;
+        pal[13] = vec3<f32>(62.0, 137.0, 72.0) / 255.0;
+        pal[14] = vec3<f32>(38.0, 92.0, 66.0) / 255.0;
+        pal[15] = vec3<f32>(25.0, 60.0, 62.0) / 255.0;
+        pal[16] = vec3<f32>(18.0, 78.0, 137.0) / 255.0;
+        pal[17] = vec3<f32>(0.0, 153.0, 219.0) / 255.0;
+        pal[18] = vec3<f32>(44.0, 232.0, 245.0) / 255.0;
+        pal[19] = vec3<f32>(192.0, 203.0, 220.0) / 255.0;
+        pal[20] = vec3<f32>(139.0, 155.0, 180.0) / 255.0;
+        pal[21] = vec3<f32>(90.0, 105.0, 136.0) / 255.0;
+        pal[22] = vec3<f32>(58.0, 68.0, 102.0) / 255.0;
+        pal[23] = vec3<f32>(38.0, 43.0, 68.0) / 255.0;
+        pal[24] = vec3<f32>(24.0, 20.0, 37.0) / 255.0;
+        pal[25] = vec3<f32>(255.0, 0.0, 68.0) / 255.0;
+        pal[26] = vec3<f32>(104.0, 56.0, 108.0) / 255.0;
+        pal[27] = vec3<f32>(181.0, 80.0, 136.0) / 255.0;
+        pal[28] = vec3<f32>(246.0, 117.0, 122.0) / 255.0;
+        pal[29] = vec3<f32>(232.0, 183.0, 150.0) / 255.0;
+        pal[30] = vec3<f32>(194.0, 133.0, 105.0) / 255.0;
+        pal[31] = vec3<f32>(143.0, 86.0, 59.0) / 255.0;
+        n = 32;
+    } else if (id < 5.5) {
+        // Sweetie 16（鮮やかでポップな16色）
+        pal[0]  = vec3<f32>(26.0, 28.0, 44.0) / 255.0;
+        pal[1]  = vec3<f32>(93.0, 39.0, 93.0) / 255.0;
+        pal[2]  = vec3<f32>(177.0, 62.0, 83.0) / 255.0;
+        pal[3]  = vec3<f32>(239.0, 125.0, 87.0) / 255.0;
+        pal[4]  = vec3<f32>(255.0, 205.0, 117.0) / 255.0;
+        pal[5]  = vec3<f32>(167.0, 240.0, 112.0) / 255.0;
+        pal[6]  = vec3<f32>(56.0, 183.0, 100.0) / 255.0;
+        pal[7]  = vec3<f32>(37.0, 113.0, 121.0) / 255.0;
+        pal[8]  = vec3<f32>(41.0, 54.0, 111.0) / 255.0;
+        pal[9]  = vec3<f32>(59.0, 93.0, 201.0) / 255.0;
+        pal[10] = vec3<f32>(65.0, 166.0, 246.0) / 255.0;
+        pal[11] = vec3<f32>(115.0, 239.0, 247.0) / 255.0;
+        pal[12] = vec3<f32>(244.0, 244.0, 244.0) / 255.0;
+        pal[13] = vec3<f32>(148.0, 176.0, 194.0) / 255.0;
+        pal[14] = vec3<f32>(86.0, 108.0, 134.0) / 255.0;
+        pal[15] = vec3<f32>(51.0, 60.0, 87.0) / 255.0;
+        n = 16;
+    } else if (id < 6.5) {
+        // CGA（レトロPC 4色：黒/シアン/マゼンタ/白）
+        pal[0] = vec3<f32>(0.0, 0.0, 0.0) / 255.0;
+        pal[1] = vec3<f32>(85.0, 255.0, 255.0) / 255.0;
+        pal[2] = vec3<f32>(255.0, 85.0, 255.0) / 255.0;
+        pal[3] = vec3<f32>(255.0, 255.0, 255.0) / 255.0;
+        n = 4;
+    } else {
+        // 1-bit（2色：ほぼ白黒。一番"キモく"なる極端モード）
+        pal[0] = vec3<f32>(18.0, 16.0, 28.0) / 255.0;
+        pal[1] = vec3<f32>(237.0, 237.0, 230.0) / 255.0;
+        n = 2;
+    }
+    var best = pal[0];
+    var bestd = 1e9;
+    for (var i: i32 = 0; i < n; i = i + 1) {
+        let d = distance(c, pal[i]);
+        if (d < bestd) { bestd = d; best = pal[i]; }
+    }
+    return best;
+}
+
+fn quantize(c: vec3<f32>) -> vec3<f32> {
+    if (P.palette_id < 0.5) {
+        return posterize(c, P.levels);
+    }
+    return nearest_palette(c, P.palette_id);
+}
+
+@fragment
+fn fs_pixel_art(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(src_tex));
+    let cell = max(P.cell_px, 1.0);
+    let frag = in.uv * dims;
+    let cell_idx = floor(frag / cell);
+    let guv = (cell_idx + vec2<f32>(0.5)) * cell / dims;
+
+    var col = textureSampleLevel(src_tex, samp, guv, 0.0).rgb;
+
+    // 彩度ブースト
+    let l0 = luma(col);
+    col = mix(vec3<f32>(l0), col, P.sat);
+
+    // Bayerディザ（セル単位）
+    if (P.dither > 0.5) {
+        let amt = select(0.06, 1.0 / max(P.levels, 2.0), P.palette_id < 0.5);
+        col = col + vec3<f32>(bayer4(vec2<i32>(cell_idx)) * amt);
+    }
+    col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+
+    var q = quantize(col);
+
+    // 輪郭線（左/上の隣セルとの輝度差）
+    if (P.outline > 0.01) {
+        let texel = cell / dims;
+        let ln = luma(textureSampleLevel(src_tex, samp, guv - vec2<f32>(texel.x, 0.0), 0.0).rgb);
+        let lu = luma(textureSampleLevel(src_tex, samp, guv - vec2<f32>(0.0, texel.y), 0.0).rgb);
+        let lc = luma(col);
+        let d = max(abs(lc - ln), abs(lc - lu));
+        let edge = smoothstep(0.12, 0.30, d);
+        q = q * (1.0 - edge * P.outline * 0.8);
+    }
+
+    return vec4<f32>(q, 1.0);
 }
 "#;
 
