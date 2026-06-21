@@ -171,6 +171,14 @@ impl VrmAvatar {
         }
         let node_order = topo_order(&nodes_parent);
 
+        // Humanoid bone map (VRM 1.0 then 0.x): bone name -> glTF node index.
+        // VRM 0.x かどうかを早めに確定する（下の正規化で骨/メッシュを 180°Y 回すのに使う）。
+        let (humanoid, src_is_vrm0) = scene
+            .extensions_json
+            .as_ref()
+            .map(humanoid_bone_nodes)
+            .unwrap_or_default();
+
         // Inverse-bind from OUR node chain (bind = no anim), computed once; each
         // primitive selects the nodes its own skin uses.
         let no_anim = vec![Quat::IDENTITY; nn];
@@ -208,20 +216,32 @@ impl VrmAvatar {
             }
             eprintln!("[vrm] canonicalize rest: {rerolled}/{nn} bones をワールド整列へ再ロール");
         }
-        // 正準化した rest で world_bind を再計算（位置は不変・回転は全て単位になる）。
+        // === VRM 0.x → 1.0 正準化（正面 +Z → -Z）===
+        // VRM 0.x はキャラが VRM 1.0 と 180° 逆を向く。canonicalize 済みで全ボーン局所回転は単位
+        // なので、骨ワールド位置(=局所オフセット)・メッシュ頂点/法線・モーフ差分を一律 180°Y 回転
+        // （native Y-up なので x,z を反転）すれば、向き以外を保ったまま VRM 1.0 規約へ揃う。inv_bind は
+        // 回転後の world_bind から、spring も回転後の rest から算出されるので全て自動で整合する。これで
+        // カメラ方位/歩行/拘束ジオメトリの「VRM0 だけ符号反転」特殊分岐が一切不要になる。
+        if src_is_vrm0 {
+            for i in 0..nn {
+                let t = nodes_t[i];
+                nodes_t[i] = Vec3::new(-t.x, t.y, -t.z);
+            }
+        }
+        // 正準化した rest で world_bind を再計算（VRM0 は上の 180°Y 反映済み・回転は全て単位）。
         let world_bind = compute_world(&nodes_t, &nodes_r, &nodes_s, &nodes_parent, &node_order, &no_anim);
-
-        // Humanoid bone map (VRM 1.0 then 0.x): bone name -> glTF node index.
-        let (humanoid, is_vrm0) = scene
-            .extensions_json
-            .as_ref()
-            .map(humanoid_bone_nodes)
-            .unwrap_or_default();
+        if src_is_vrm0 {
+            eprintln!("[vrm] VRM 0.x を 1.0 規約へ正規化（180°Y 回転）");
+        }
+        // 正規化後は VRM1.0 と同じ向きなので、下流の VRM0 補正は不要＝is_vrm0 は false 相当で持つ。
+        let is_vrm0 = false;
 
         // Native-space skin meshes for every skinned primitive, each carrying its
         // OWN skin's joint list (VRM uses one skin per mesh chunk — sharing one
         // global skin scrambles the joint indices of every other chunk).
         let mut primitives = Vec::new();
+        // VRM0 正規化の 180°Y 回転を頂点/法線/モーフ差分にも適用（骨と同じ native x,z 反転）。
+        let yflip = |p: [f32; 3]| if src_is_vrm0 { [-p[0], p[1], -p[2]] } else { p };
         for p in &scene.primitives {
             let Some(b) = p.skin.as_ref() else { continue };
             if b.joint_nodes.is_empty() {
@@ -233,16 +253,16 @@ impl VrmAvatar {
                 .iter()
                 .enumerate()
                 .map(|(i, v)| SkinVertex {
-                    position: pos_seimei_to_native([
+                    position: yflip(pos_seimei_to_native([
                         v.position.x as f32,
                         v.position.y as f32,
                         v.position.z as f32,
-                    ]),
-                    normal: dir_seimei_to_native([
+                    ])),
+                    normal: yflip(dir_seimei_to_native([
                         v.normal.x as f32,
                         v.normal.y as f32,
                         v.normal.z as f32,
-                    ]),
+                    ])),
                     uv: v.uv,
                     joints: b.joints_per_vertex[i],
                     weights: normalize_weights(b.weights_per_vertex[i]),
@@ -264,7 +284,7 @@ impl VrmAvatar {
                 morph_deltas: p
                     .morph_targets
                     .iter()
-                    .map(|mt| mt.position_deltas.iter().map(|d| pos_seimei_to_native(*d)).collect())
+                    .map(|mt| mt.position_deltas.iter().map(|d| yflip(pos_seimei_to_native(*d))).collect())
                     .collect(),
                 morph_names: p.morph_targets.iter().map(|mt| mt.name.clone()).collect(),
                 base_color: p.material.base_color,
