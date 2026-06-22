@@ -976,8 +976,10 @@ pub struct PixelArtParams {
     pub levels: f32,
     /// 彩度ブースト (1.0=変更なし)
     pub sat: f32,
-    pub _pad0: f32,
-    pub _pad1: f32,
+    /// #2 減色方式: 0=RGB最近傍 / 1=Oklab最近傍＋2色オーダードディザ
+    pub color_mode: f32,
+    /// #3 輪郭方式: 0=輝度差 / 1=深度(シルエット)
+    pub outline_mode: f32,
 }
 
 impl Default for PixelArtParams {
@@ -989,19 +991,34 @@ impl Default for PixelArtParams {
             outline: 0.5,
             levels: 32.0, // 色数=フル（下げるほど減色）。palette/posterize 両モードで効く
             sat: 1.3,
-            _pad0: 0.0,
-            _pad1: 0.0,
+            color_mode: 0.0,
+            outline_mode: 0.0,
         }
     }
 }
 
 /// ドット絵パス: 合成済みLDR画像をセル単位でドット化して output へ書き出す（FXAA代替）。
-/// 解像度非依存（fxaa_view をサンプルし output へ描くだけ）なので resize 不要。
+/// 通常は full-res 単パス。#1 低解像度2パス ON 時は lores へ低解像度描画→nearest 拡大。
 pub struct PixelArtPass {
-    pipeline: wgpu::RenderPipeline,
+    pipeline: wgpu::RenderPipeline,    // full-res 単パス（fs_pixel_art）
+    pipeline_lo: wgpu::RenderPipeline, // #1 Pass A（fs_dot_lo）lores へ
+    pipeline_up: wgpu::RenderPipeline, // #1 Pass B（fs_dot_up）lores→output
     bind_group_layout: wgpu::BindGroupLayout,
     params_buffer: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    surface_format: wgpu::TextureFormat,
+    /// #1 低解像度2パスの中間RT（フルサイズ確保し viewport で部分使用）
+    lores_texture: wgpu::Texture,
+    lores_view: wgpu::TextureView,
+    /// 深度なし（gbuffer 無効）時のダミー深度
+    _dummy_depth_texture: wgpu::Texture,
+    dummy_depth_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+    /// CPU 側に持つ現在のセル幅（Pass A の viewport 計算用）。update_params で同期。
+    cell_px: f32,
+    /// #1 低解像度2パス ON/OFF
+    lowres: bool,
 }
 
 impl PixelArtPass {
@@ -1009,6 +1026,8 @@ impl PixelArtPass {
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
         params: PixelArtParams,
+        width: u32,
+        height: u32,
     ) -> Self {
         let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("PixelArt Params"),
@@ -1020,7 +1039,7 @@ impl PixelArtPass {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("PixelArt Bind Group Layout"),
                 entries: &[
-                    // 入力（合成済みLDR）
+                    // 入力（合成済みLDR or lores）
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1048,6 +1067,17 @@ impl PixelArtPass {
                         },
                         count: None,
                     },
+                    // 深度（#3 アウトライン用。textureLoad なのでサンプラ不要）
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -1062,34 +1092,40 @@ impl PixelArtPass {
             push_constant_ranges: &[],
         });
 
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("PixelArt Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_pixel_art"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
-            cache: None,
-        });
+        // 3エントリポイント（fs_pixel_art / fs_dot_lo / fs_dot_up）を同レイアウト・同フォーマットで。
+        let make_pipeline = |entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("PixelArt Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                multiview: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("fs_pixel_art");
+        let pipeline_lo = make_pipeline("fs_dot_lo");
+        let pipeline_up = make_pipeline("fs_dot_up");
 
         // ニアレストでもよいが、セル中心を Linear で拾い軽く均す
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1102,29 +1138,76 @@ impl PixelArtPass {
             ..Default::default()
         });
 
-        Self { pipeline, bind_group_layout, params_buffer, sampler }
+        // #1 低解像度2パス用の中間RT（フルサイズ。viewport で部分使用）
+        let (lores_texture, lores_view) =
+            create_ldr_texture(device, width.max(1), height.max(1), surface_format, "PixelArt Lores");
+
+        // gbuffer 無効時のダミー深度（1x1）
+        let dummy_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("PixelArt Dummy Depth"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_depth_view = dummy_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        Self {
+            pipeline,
+            pipeline_lo,
+            pipeline_up,
+            bind_group_layout,
+            params_buffer,
+            sampler,
+            surface_format,
+            lores_texture,
+            lores_view,
+            _dummy_depth_texture: dummy_depth_texture,
+            dummy_depth_view,
+            width: width.max(1),
+            height: height.max(1),
+            cell_px: params.cell_px,
+            lowres: false,
+        }
     }
 
-    /// パラメータバッファを書き換え（毎フレーム呼んでもよい軽量更新）
-    pub fn update_params(&self, queue: &wgpu::Queue, params: PixelArtParams) {
+    /// パラメータバッファを書き換え（毎フレーム呼んでもよい軽量更新）。CPU側 cell も同期。
+    pub fn update_params(&mut self, queue: &wgpu::Queue, params: PixelArtParams) {
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
+        self.cell_px = params.cell_px;
     }
 
-    /// input_view（合成済みLDR）をドット化して output_view へ
-    pub fn execute(
+    /// #1 低解像度2パスの ON/OFF
+    pub fn set_lowres(&mut self, on: bool) {
+        self.lowres = on;
+    }
+
+    /// 中間RTをリサイズ（ウィンドウサイズ変更時）。
+    pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        let (t, v) =
+            create_ldr_texture(device, width.max(1), height.max(1), self.surface_format, "PixelArt Lores");
+        self.lores_texture = t;
+        self.lores_view = v;
+        self.width = width.max(1);
+        self.height = height.max(1);
+    }
+
+    fn make_bind_group(
         &self,
-        encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
-        input_view: &wgpu::TextureView,
-        output_view: &wgpu::TextureView,
-    ) {
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PixelArt Bind Group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(input_view),
+                    resource: wgpu::BindingResource::TextureView(color_view),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1134,26 +1217,93 @@ impl PixelArtPass {
                     binding: 2,
                     resource: self.params_buffer.as_entire_binding(),
                 },
-            ],
-        });
-
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("PixelArt Pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: output_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
                 },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &bg, &[]);
-        pass.draw(0..3, 0..1);
+            ],
+        })
+    }
+
+    /// input_view（合成済みLDR）をドット化して output_view へ。depth は #3 用（無ければダミー）。
+    pub fn execute(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        input_view: &wgpu::TextureView,
+        output_view: &wgpu::TextureView,
+        depth_view: Option<&wgpu::TextureView>,
+    ) {
+        let depth = depth_view.unwrap_or(&self.dummy_depth_view);
+
+        if self.lowres {
+            // === Pass A: input → lores（低解像度ビューポート。1画素=1セル）===
+            let cell = self.cell_px.max(1.0);
+            let vw = ((self.width as f32) / cell).ceil().max(1.0);
+            let vh = ((self.height as f32) / cell).ceil().max(1.0);
+            {
+                let bg = self.make_bind_group(device, input_view, depth);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("PixelArt Pass A (lores)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.lores_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline_lo);
+                pass.set_viewport(0.0, 0.0, vw, vh, 0.0, 1.0);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            // === Pass B: lores → output（full-res, nearest 拡大＋輪郭）===
+            {
+                let bg = self.make_bind_group(device, &self.lores_view, depth);
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("PixelArt Pass B (upscale)"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: output_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline_up);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+        } else {
+            // === full-res 単パス ===
+            let bg = self.make_bind_group(device, input_view, depth);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("PixelArt Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
     }
 }
 
@@ -1431,7 +1581,7 @@ impl PostProcessPipeline {
             fxaa_pipeline,
             fxaa_bind_group_layout,
             fxaa_sampler,
-            pixel_art: PixelArtPass::new(device, surface_format, PixelArtParams::default()),
+            pixel_art: PixelArtPass::new(device, surface_format, PixelArtParams::default(), width, height),
             pixel_art_enabled: false,
         }
     }
@@ -1441,8 +1591,13 @@ impl PostProcessPipeline {
         self.pixel_art_enabled = on;
     }
 
-    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）
-    pub fn set_pixel_art_params(&self, queue: &wgpu::Queue, params: PixelArtParams) {
+    /// #1 低解像度2パスの ON/OFF
+    pub fn set_pixel_art_lowres(&mut self, on: bool) {
+        self.pixel_art.set_lowres(on);
+    }
+
+    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）。CPU側 cell も同期するため &mut。
+    pub fn set_pixel_art_params(&mut self, queue: &wgpu::Queue, params: PixelArtParams) {
         self.pixel_art.update_params(queue, params);
     }
 
@@ -1610,8 +1765,10 @@ impl PostProcessPipeline {
 
         // ドット絵ON時は合成済みLDR(fxaa_view)をドット化して output へ。
         // ピクセルアートにアンチエイリアスは逆効果なので FXAA は通さない。
+        // 深度(#3 輪郭用)は gbuffer があれば渡す（無ければパス側でダミー）。
         if self.pixel_art_enabled {
-            self.pixel_art.execute(encoder, device, &self.fxaa_view, output_view);
+            let depth = self.gbuffer.as_ref().map(|g| &g.depth_view);
+            self.pixel_art.execute(encoder, device, &self.fxaa_view, output_view, depth);
             return;
         }
 
@@ -1674,6 +1831,8 @@ impl PostProcessPipeline {
             create_ldr_texture(device, width, height, self.surface_format, "FXAA Intermediate");
         self.fxaa_texture = ft;
         self.fxaa_view = fv;
+        // ドット絵 低解像度2パス(#1)の中間RTも再作成
+        self.pixel_art.resize(device, width, height);
         self.width = width;
         self.height = height;
     }
@@ -2151,10 +2310,11 @@ struct Params {
     outline: f32,
     levels: f32,
     sat: f32,
-    pad0: f32,
-    pad1: f32,
+    color_mode: f32,   // #2: 0=RGB最近傍 / 1=Oklab最近傍＋2色オーダードディザ
+    outline_mode: f32, // #3: 0=輝度差 / 1=深度(シルエット)
 };
 @group(0) @binding(2) var<uniform> P: Params;
+@group(0) @binding(3) var depth_tex: texture_depth_2d;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -2190,8 +2350,25 @@ fn posterize(c: vec3<f32>, levels: f32) -> vec3<f32> {
     return floor(c * l + 0.5) / l;
 }
 
+// sRGB(γ2近似)→Oklab。減色を知覚距離で行うと肌などの色転びが減る(#2)。
+fn rgb_to_oklab(crgb: vec3<f32>) -> vec3<f32> {
+    let c = crgb * crgb; // sRGB->linear 近似
+    let l = 0.4122214708 * c.r + 0.5363325363 * c.g + 0.0514459929 * c.b;
+    let m = 0.2119034982 * c.r + 0.6806995451 * c.g + 0.1073969566 * c.b;
+    let s = 0.0883024619 * c.r + 0.2817188376 * c.g + 0.6299787005 * c.b;
+    let l_ = pow(max(l, 0.0), 0.3333333);
+    let m_ = pow(max(m, 0.0), 0.3333333);
+    let s_ = pow(max(s, 0.0), 0.3333333);
+    return vec3<f32>(
+        0.2104542553 * l_ + 0.7936177850 * m_ - 0.0040720468 * s_,
+        1.9779984951 * l_ - 2.4285922050 * m_ + 0.4505937099 * s_,
+        0.0259040371 * l_ + 0.7827717662 * m_ - 0.8086757660 * s_
+    );
+}
+
 // 固定パレットへ最近傍マッピング。cap で使用色数を制限する。
-fn nearest_palette(c: vec3<f32>, id: f32, cap: f32) -> vec3<f32> {
+// bv は Bayer 値(-0.5..0.5)。color_mode=1 のとき 2色オーダードディザに使う。
+fn nearest_palette(c: vec3<f32>, id: f32, cap: f32, bv: f32) -> vec3<f32> {
     var n: i32 = 0;
     var pal: array<vec3<f32>, 32>;
     if (id < 1.5) {
@@ -2309,23 +2486,42 @@ fn nearest_palette(c: vec3<f32>, id: f32, cap: f32) -> vec3<f32> {
     // 使用色数を cap に制限。先頭N個だと暗色などに偏るのでパレット全体から
     // ストライドで均等に間引いて選ぶ。cap>=パレット色数なら全色を使う。
     let lim = clamp(i32(cap + 0.5), 2, n);
-    var best = pal[0];
-    var bestd = 1e9;
-    for (var i: i32 = 0; i < lim; i = i + 1) {
-        let idx = (i * n) / lim;
-        let d = distance(c, pal[idx]);
-        if (d < bestd) { bestd = d; best = pal[idx]; }
+    if (P.color_mode > 0.5) {
+        // #2: Oklab で最近傍2色を求め、距離比に応じて Bayer で振り分け（オーダードディザ）。
+        let co = rgb_to_oklab(c);
+        var b1 = pal[0]; var d1 = 1e9;
+        var b2 = pal[0]; var d2 = 1e9;
+        for (var i: i32 = 0; i < lim; i = i + 1) {
+            let idx = (i * n) / lim;
+            let d = distance(co, rgb_to_oklab(pal[idx]));
+            if (d < d1) { d2 = d1; b2 = b1; d1 = d; b1 = pal[idx]; }
+            else if (d < d2) { d2 = d; b2 = pal[idx]; }
+        }
+        if (P.dither > 0.5) {
+            let t = d1 / (d1 + d2 + 1e-6); // 0(=b1ぴったり)..0.5(=中間)
+            if ((bv + 0.5) < t) { return b2; }
+        }
+        return b1;
+    } else {
+        // 従来: RGB 最近傍。
+        var best = pal[0];
+        var bestd = 1e9;
+        for (var i: i32 = 0; i < lim; i = i + 1) {
+            let idx = (i * n) / lim;
+            let d = distance(c, pal[idx]);
+            if (d < bestd) { bestd = d; best = pal[idx]; }
+        }
+        return best;
     }
-    return best;
 }
 
-fn quantize(c: vec3<f32>) -> vec3<f32> {
+fn quantize(c: vec3<f32>, bv: f32) -> vec3<f32> {
     // 色数コントロール（levels=色数）。Posterizeモードは階調数、
     // パレットモードは「使うパレット色数」としてそのまま効く。
     if (P.palette_id < 0.5) {
         return posterize(c, P.levels);
     }
-    return nearest_palette(c, P.palette_id, P.levels);
+    return nearest_palette(c, P.palette_id, P.levels, bv);
 }
 
 // セルの代表色をエリア平均で求める。中心1点サンプルだと細部ノイズが
@@ -2343,13 +2539,9 @@ fn cell_color(cell_idx: vec2<f32>, cell: f32, dims: vec2<f32>) -> vec3<f32> {
     return acc / 4.0;
 }
 
-@fragment
-fn fs_pixel_art(in: VertexOutput) -> @location(0) vec4<f32> {
-    let dims = vec2<f32>(textureDimensions(src_tex));
-    let cell = max(P.cell_px, 1.0);
-    let frag = in.uv * dims;
-    let cell_idx = floor(frag / cell);
-
+// 1セルぶんの最終色（サンプル→彩度/コントラスト→量子化）。輪郭は含めない。
+// full-res パスと低解像度パス(#1)で共有する。
+fn shade_cell(cell_idx: vec2<f32>, cell: f32, dims: vec2<f32>) -> vec3<f32> {
     var col = cell_color(cell_idx, cell, dims);
 
     // 彩度ブースト＋コントラスト押し（限られたパレットに色を"寄せ"て写真っぽさを除去）
@@ -2357,28 +2549,93 @@ fn fs_pixel_art(in: VertexOutput) -> @location(0) vec4<f32> {
     col = mix(vec3<f32>(l0), col, P.sat);
     col = (col - vec3<f32>(0.5)) * 1.18 + vec3<f32>(0.5);
 
-    // Bayerディザ（セル単位）。パレット間隔が広いので振幅を上げないと効かない
-    if (P.dither > 0.5) {
+    let bv = bayer4(vec2<i32>(cell_idx));
+    // 従来モードのみ量子化前に加算ディザ。Oklabモード(#2)は nearest 内で2色ディザ。
+    if (P.dither > 0.5 && P.color_mode < 0.5) {
         let amt = select(0.18, 1.0 / max(P.levels, 2.0), P.palette_id < 0.5);
-        col = col + vec3<f32>(bayer4(vec2<i32>(cell_idx)) * amt);
+        col = col + vec3<f32>(bv * amt);
     }
     col = clamp(col, vec3<f32>(0.0), vec3<f32>(1.0));
+    return quantize(col, bv);
+}
 
-    var q = quantize(col);
+// 深度テクスチャの安全読み出し（範囲外はクランプ）。
+fn depth_at(px: vec2<f32>, ddims: vec2<f32>) -> f32 {
+    let ci = clamp(vec2<i32>(px), vec2<i32>(0, 0), vec2<i32>(ddims) - vec2<i32>(1, 1));
+    return textureLoad(depth_tex, ci, 0);
+}
 
-    // 輪郭線（左/上の隣セルとの輝度差）。fps優先で隣セルは中心1点だけサンプル
-    // （再平均は重いので使わない。エッジ判定は輝度差の閾値なので1点で十分）。
+// #3: 深度の不連続(シルエット)を 0..1 のエッジ強度で返す。深度は非線形なので相対差で評価。
+fn depth_edge(center_px: vec2<f32>, cell: f32) -> f32 {
+    let ddims = vec2<f32>(textureDimensions(depth_tex));
+    let dc = depth_at(center_px, ddims);
+    let dl = depth_at(center_px - vec2<f32>(cell, 0.0), ddims);
+    let dr = depth_at(center_px + vec2<f32>(cell, 0.0), ddims);
+    let du = depth_at(center_px - vec2<f32>(0.0, cell), ddims);
+    let dd = depth_at(center_px + vec2<f32>(0.0, cell), ddims);
+    let g = abs(dc - dl) + abs(dc - dr) + abs(dc - du) + abs(dc - dd);
+    let rel = g / (dc + 0.001);
+    return smoothstep(0.01, 0.05, rel);
+}
+
+// === full-res 単パス（#1 OFF）===
+@fragment
+fn fs_pixel_art(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(src_tex));
+    let cell = max(P.cell_px, 1.0);
+    let cell_idx = floor(in.position.xy / cell);
+    var q = shade_cell(cell_idx, cell, dims);
+
     if (P.outline > 0.01) {
-        let texel = cell / dims;
-        let here = (cell_idx + vec2<f32>(0.5)) * cell / dims;
-        let ln = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(texel.x, 0.0), 0.0).rgb);
-        let lu = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(0.0, texel.y), 0.0).rgb);
-        let lc = luma(col);
-        let d = max(abs(lc - ln), abs(lc - lu));
-        let edge = smoothstep(0.12, 0.30, d);
-        q = q * (1.0 - edge * P.outline * 0.8);
+        let center_px = (cell_idx + vec2<f32>(0.5)) * cell;
+        var edge = 0.0;
+        if (P.outline_mode > 0.5) {
+            edge = depth_edge(center_px, cell);
+        } else {
+            let here = center_px / dims;
+            let texel = cell / dims;
+            let ln = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(texel.x, 0.0), 0.0).rgb);
+            let lu = luma(textureSampleLevel(src_tex, samp, here - vec2<f32>(0.0, texel.y), 0.0).rgb);
+            let lc = luma(textureSampleLevel(src_tex, samp, here, 0.0).rgb);
+            edge = smoothstep(0.12, 0.30, max(abs(lc - ln), abs(lc - lu)));
+        }
+        let ostr = select(0.8, 2.0, P.outline_mode > 0.5); // 深度=黒インク濃く / 輝度=控えめ
+        q = q * (1.0 - clamp(edge * P.outline * ostr, 0.0, 1.0));
     }
+    return vec4<f32>(q, 1.0);
+}
 
+// === #1 低解像度2パス: Pass A（1画素=1セル。低解像度ビューポートへ描く）===
+@fragment
+fn fs_dot_lo(in: VertexOutput) -> @location(0) vec4<f32> {
+    let dims = vec2<f32>(textureDimensions(src_tex)); // 入力=フル解像度
+    let cell = max(P.cell_px, 1.0);
+    let cell_idx = floor(in.position.xy); // ビューポートの1画素がそのまま1セル
+    return vec4<f32>(shade_cell(cell_idx, cell, dims), 1.0);
+}
+
+// === #1 低解像度2パス: Pass B（lores を nearest 拡大＋深度/輝度輪郭）===
+@fragment
+fn fs_dot_up(in: VertexOutput) -> @location(0) vec4<f32> {
+    let cell = max(P.cell_px, 1.0);
+    let cell_idx = floor(in.position.xy / cell);
+    let ci = vec2<i32>(cell_idx);
+    var q = textureLoad(src_tex, ci, 0).rgb; // src_tex=lores（セル色がそのまま入っている）
+
+    if (P.outline > 0.01) {
+        let center_px = (cell_idx + vec2<f32>(0.5)) * cell;
+        var edge = 0.0;
+        if (P.outline_mode > 0.5) {
+            edge = depth_edge(center_px, cell);
+        } else {
+            let lc = luma(q);
+            let ln = luma(textureLoad(src_tex, ci - vec2<i32>(1, 0), 0).rgb);
+            let lu = luma(textureLoad(src_tex, ci - vec2<i32>(0, 1), 0).rgb);
+            edge = smoothstep(0.12, 0.30, max(abs(lc - ln), abs(lc - lu)));
+        }
+        let ostr = select(0.8, 2.0, P.outline_mode > 0.5); // 深度=黒インク濃く / 輝度=控えめ
+        q = q * (1.0 - clamp(edge * P.outline * ostr, 0.0, 1.0));
+    }
     return vec4<f32>(q, 1.0);
 }
 "#;
