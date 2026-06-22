@@ -53,6 +53,13 @@ var s_paintn: sampler;
 
 const PI: f32 = 3.14159265359;
 
+// 2D→1D ハッシュ（濡れ表面の微小rough揺らぎ用。world座標で安定＝カメラで泳がない）。
+fn hash21(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 = p3 + dot(p3, vec3<f32>(p3.y, p3.z, p3.x) + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
 // === PBR Functions ===
 
 // GGX/Trowbridge-Reitz 法線分布関数
@@ -315,7 +322,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 塗布色へ寄せ、さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
     let albedo0 = mix(in.color.rgb * skin_tex, paint.rgb, opaque_body);
     let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
-    let albedo = albedo1 * (1.0 - 0.32 * wet_clear);
+    // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。線形0.32→smoothstepで深い濡れを濃く。
+    let wet_dark = smoothstep(0.0, 1.0, wet_clear);
+    let albedo = albedo1 * (1.0 - 0.42 * wet_dark);
 
     // 誘電体の基本反射率 (F0)
     // ガラスの場合: IOR 1.52 → F0 ≈ 0.0425
@@ -433,15 +442,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let scatter_color = vec3(1.0, 0.4, 0.2); // 暖色系（血液透過色）
         let sss_contrib = scatter * scatter_color * albedo * radiance;
 
-        // 濡れた艶（クリアコート）: 塗布部に超低roughの鋭い反射を上乗せ＝粘液がテラテラ光る。
-        // base材質と無関係に強い glint を出すので、白×白でも「濡れた塊」だと分かる。
-        let cc_ndf = distribution_ggx(n_dot_h, 0.05);
-        let cc_g = geometry_smith(n_dot_v, n_dot_l, 0.05);
-        let cc_f = fresnel_schlick(h_dot_v, vec3(0.04));
+        // 濡れた水膜の鏡面（薄い水層）。一律テカリ→「斜め/縁で強く光る本物の濡れ」へ:
+        //  - 水のF0≈0.02、微小roughで完全鏡面のプラ感を割る
+        //  - グレージング角(視線が浅い所)ほど強く＝水膜のフレネル
+        //  - 被覆の縁でビーズ(表面張力の粒)を一段明るく
+        let micro = (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.03;
+        let cc_rough = clamp(0.045 + micro, 0.02, 0.12);
+        let cc_ndf = distribution_ggx(n_dot_h, cc_rough);
+        let cc_g = geometry_smith(n_dot_v, n_dot_l, cc_rough);
+        let cc_f = fresnel_schlick(h_dot_v, vec3(0.02));
+        let cc_graze = mix(1.0, 2.6, pow(1.0 - n_dot_v, 4.0));
+        let cc_bead = 1.0 + smoothstep(0.04, 0.22, paint_a) * (1.0 - smoothstep(0.22, 0.6, paint_a)) * 1.4;
         let clearcoat = (cc_ndf * cc_g * cc_f) / (4.0 * n_dot_v * n_dot_l + 0.0001);
 
         lo = lo + (diffuse + specular) * radiance * n_dot_l + sss_contrib
-             + clearcoat * radiance * n_dot_l * paint_a * 2.5;
+             + clearcoat * radiance * n_dot_l * paint_a * 2.0 * cc_graze * cc_bead;
     }
 
     // Emissive（発光）
