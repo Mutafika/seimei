@@ -78,6 +78,8 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     // Group 0: Camera
     camera_buffer: wgpu::Buffer,
+    /// 肌パラメータ [全身濡れ, 濡れ新A/B, SSS倍率, SSS新A/B]。毎フレーム camera uniform へ注入。
+    skin_params: [f32; 4],
     camera_bind_group: wgpu::BindGroup,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     // Group 1: Lights
@@ -373,6 +375,7 @@ impl Renderer {
             depth_texture,
             depth_view,
             camera_buffer,
+            skin_params: [0.0, 1.0, 1.0, 1.0],
             camera_bind_group,
             camera_bind_group_layout,
             light_uniform_buffer,
@@ -620,7 +623,14 @@ impl Renderer {
         // tonemap+gamma する（二重処理＝ピンクのwashoutを防ぐ）。屈折のシーンカラーtexも有効。
         let hdr_flag = if self.post_process.is_some() { 1.0 } else { 0.0 };
         uniform.resolution = [self.width as f32, self.height as f32, hdr_flag, 0.0];
+        uniform.skin_params = self.skin_params;
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// 肌パラメータをセット [全身濡れ(0..1), 濡れ新A/B(0/1), SSS倍率, SSS新A/B(0/1)]。
+    /// 次の update_camera で camera uniform に反映される。
+    pub fn set_skin_params(&mut self, p: [f32; 4]) {
+        self.skin_params = p;
     }
 
     /// クリップボックスを設定
