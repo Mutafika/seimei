@@ -461,6 +461,9 @@ pub struct CameraUniform {
     /// xy = 描画ターゲットの解像度(px)、z = 屈折有効フラグ(1=シーンカラーtexが有効)、w = 予備。
     /// `@builtin(position).xy / resolution.xy` でフラグメントのスクリーンUVを得る。
     pub resolution: [f32; 4],
+    /// 肌パラメータ（評価/制御）: x=全身濡れ floor(0..1), y=濡れ新方式A/B(1=新/0=旧),
+    /// z=SSS強度倍率(1=既定), w=SSS新方式A/B(1=新/0=旧)。レンダラ側(update_camera)で上書き。
+    pub skin_params: [f32; 4],
 }
 
 impl CameraUniform {
@@ -481,6 +484,8 @@ impl CameraUniform {
             clip_max: [0.0; 4],
             // 解像度/屈折フラグはレンダラ側(update_camera)で上書きする。
             resolution: [0.0; 4],
+            // 肌パラメータの既定（dry / 新方式ON / SSS既定 / SSS新ON）。update_camera で上書き。
+            skin_params: [0.0, 1.0, 1.0, 1.0],
         }
     }
 }

@@ -8,6 +8,8 @@ struct CameraUniform {
     // xy=描画解像度(px), z=屈折フラグ(1=シーンカラーtex有効), w=予備。
     // スクリーンスペース屈折のUV計算に使う。
     resolution: vec4<f32>,
+    // 肌パラメータ: x=全身濡れfloor(0..1), y=濡れ新方式A/B(1=新/0=旧), z=SSS倍率, w=SSS新A/B(1/0)。
+    skin_params: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -285,10 +287,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     //  - opaque = wet × 塗布色の白さ。アルベド白化＆SSS に効く＝白く塗った塗布だけ。暗く塗ると ≈0
     //    （paint_white→0 となり、肌色を変えずテラテラの濡れだけ乗る＝透明な液の定着）。
     // sqrt で中被覆を持ち上げ＝塊が埋まる。極低被覆の縁は薄く残りメニスカス（縁透け）を維持。
-    let wet = sqrt(paint_a);
+    // 評価/全身汗用の「全身濡れ floor」(skin_params.x)。塗布が無くても全身を濡らせる。
+    let gw = clamp(camera.skin_params.x, 0.0, 1.0);
+    let wet_p = sqrt(paint_a);     // 塗布由来の濡れ
+    let wet = max(wet_p, gw);      // 実効濡れ（roughness等に効く）
     let paint_luma = dot(paint.rgb, vec3<f32>(0.299, 0.587, 0.114));
     let paint_white = smoothstep(0.55, 0.85, paint_luma); // 白く焼かれた塗り=1 / 暗く焼かれた塗り=0
-    let opaque_body = wet * paint_white;
+    let opaque_body = wet_p * paint_white; // 白化は塗布のみ（全身濡れは透明として扱う）
     // 立体感: 被覆率を「厚み」とみなし、その勾配で法線を起伏させる＝粘液が盛り上がって見え、
     // 縁が丸く光る（平らな塗料でなく濡れた塊に）。近傍4点の差分で UV 勾配→TBN で世界法線へ。
     let psz = vec2<f32>(textureDimensions(t_paint));
@@ -312,7 +317,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // 透明濡れ = wet のうち白くない分（暗く塗られた塗布＝肌色を変えない濡れ）。汗テカリと同様、
     // 肌色を保ったまま「少し暗化＋艶」だけ乗せる。白い塗布(paint_white≈1)では 0＝不透明ボディが支配。
-    let wet_clear = wet * (1.0 - paint_white);
+    let wet_clear = max(wet_p * (1.0 - paint_white), gw); // 全身濡れは透明濡れとして加算
     // 透明ジェルのレンズ屈折: ジェル表面の勾配(paint_grad=被覆の傾き)で下の肌テクスチャの UV を
     // ズラして再サンプル＝水滴/ジェル越しに肌が歪んで見える。平らなジェル(勾配0)は歪まず、縁や
     // 盛り上がりの所だけ曲がる＝物理的に正しい。塗布は一切動かさず陰影サンプルだけ曲げる。
@@ -322,9 +327,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 塗布色へ寄せ、さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
     let albedo0 = mix(in.color.rgb * skin_tex, paint.rgb, opaque_body);
     let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
-    // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。線形0.32→smoothstepで深い濡れを濃く。
-    let wet_dark = smoothstep(0.0, 1.0, wet_clear);
-    let albedo = albedo1 * (1.0 - 0.42 * wet_dark);
+    // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。A/B(skin_params.y): 新=smoothstep強化 / 旧=線形0.32。
+    let wet_new = camera.skin_params.y > 0.5;
+    let dark_amt = select(0.32 * wet_clear, 0.42 * smoothstep(0.0, 1.0, wet_clear), wet_new);
+    let albedo = albedo1 * (1.0 - dark_amt);
 
     // 誘電体の基本反射率 (F0)
     // ガラスの場合: IOR 1.52 → F0 ≈ 0.0425
@@ -417,10 +423,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let n_dot_h = max(dot(n, h), 0.0);
         let h_dot_v = max(dot(h, v), 0.0);
 
-        // SSS: ラップライティング（光をターミネーター越しに拡張）
-        let wrap = 0.3 * sss;
-        let n_dot_l_wrap = (raw_n_dot_l + wrap) / (1.0 + wrap);
-        let n_dot_l = max(select(raw_n_dot_l, n_dot_l_wrap, sss > 0.0), 0.0);
+        // SSS ラップライティング（光をターミネーター越しに拡張）。S1 A/B(skin_params.w):
+        //  新 = per-channel 赤方シフト（Rを一番遠くまで回す＝影の境目が赤くにじむ肌の核）＋強度倍率
+        //  旧 = 単一wrap
+        let sss_b = camera.skin_params.z;             // SSS強度倍率
+        let sss_use_new = camera.skin_params.w > 0.5;
+        let sss_e = sss * sss_b;                      // 実効SSS
+        let wrap = 0.3 * sss_e;
+        let wrap_rgb = wrap * select(vec3(1.0), vec3(1.0, 0.5, 0.32), sss_use_new); // Rを深く=滑らかな赤方シフト
+        let nl_rgb = max((vec3(raw_n_dot_l) + wrap_rgb) / (vec3(1.0) + wrap_rgb), vec3(0.0));
+        let n_dot_l = max(select(raw_n_dot_l, (raw_n_dot_l + wrap) / (1.0 + wrap), sss_e > 0.0), 0.0);
+        // 拡散用の per-channel 重み（SSS新時のみ赤方シフト、それ以外はスカラー n_dot_l）
+        let diff_w = select(vec3<f32>(n_dot_l), nl_rgb, sss_e > 0.0 && sss_use_new);
 
         // Cook-Torrance BRDF
         let ndf = distribution_ggx(n_dot_h, roughness);
@@ -437,8 +451,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         let radiance = light_color * intensity * attenuation;
 
-        // SSS: 背面散乱（影側の暖色透過光）
-        let scatter = max(0.0, -raw_n_dot_l) * sss * 0.3;
+        // SSS: 背面散乱（影側の暖色透過光）。倍率反映＋新方式は少し強め。
+        let scatter = max(0.0, -raw_n_dot_l) * sss_e * select(0.3, 0.45, sss_use_new);
         let scatter_color = vec3(1.0, 0.4, 0.2); // 暖色系（血液透過色）
         let sss_contrib = scatter * scatter_color * albedo * radiance;
 
@@ -446,17 +460,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         //  - 水のF0≈0.02、微小roughで完全鏡面のプラ感を割る
         //  - グレージング角(視線が浅い所)ほど強く＝水膜のフレネル
         //  - 被覆の縁でビーズ(表面張力の粒)を一段明るく
-        let micro = (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.03;
-        let cc_rough = clamp(0.045 + micro, 0.02, 0.12);
+        // A/B(skin_params.y): 新=水膜フレネル＋グレージング＋縁ビーズ＋微小rough / 旧=均一クリアコート。
+        // wet_amt=塗布 or 全身濡れ。全身濡れでも水膜艶が乗る。
+        let wet_amt = max(paint_a, gw);
+        let micro = select(0.0, (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.03, wet_new);
+        let cc_rough = select(0.05, clamp(0.045 + micro, 0.02, 0.12), wet_new);
         let cc_ndf = distribution_ggx(n_dot_h, cc_rough);
         let cc_g = geometry_smith(n_dot_v, n_dot_l, cc_rough);
-        let cc_f = fresnel_schlick(h_dot_v, vec3(0.02));
-        let cc_graze = mix(1.0, 2.6, pow(1.0 - n_dot_v, 4.0));
-        let cc_bead = 1.0 + smoothstep(0.04, 0.22, paint_a) * (1.0 - smoothstep(0.22, 0.6, paint_a)) * 1.4;
+        let cc_f = fresnel_schlick(h_dot_v, select(vec3(0.04), vec3(0.02), wet_new));
+        let cc_graze = select(1.0, mix(1.0, 3.0, pow(1.0 - n_dot_v, 3.5)), wet_new); // 縁の水膜リム（チラ抑制で控えめ）
+        let cc_bead = select(1.0, 1.0 + smoothstep(0.04, 0.22, wet_amt) * (1.0 - smoothstep(0.22, 0.6, wet_amt)) * 1.4, wet_new);
+        let cc_mult = select(2.5, 2.0, wet_new);
         let clearcoat = (cc_ndf * cc_g * cc_f) / (4.0 * n_dot_v * n_dot_l + 0.0001);
 
-        lo = lo + (diffuse + specular) * radiance * n_dot_l + sss_contrib
-             + clearcoat * radiance * n_dot_l * paint_a * 2.0 * cc_graze * cc_bead;
+        // 拡散は per-channel（SSS赤方シフト）、鏡面はスカラー n_dot_l。
+        lo = lo + diffuse * radiance * diff_w + specular * radiance * n_dot_l + sss_contrib
+             + clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead;
     }
 
     // Emissive（発光）
