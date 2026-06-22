@@ -1357,10 +1357,20 @@ impl Renderer {
         }
     }
 
-    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）
-    pub fn set_pixel_art_params(&self, params: crate::post_process::PixelArtParams) {
-        if let Some(pp) = &self.post_process {
+    /// ドット絵パラメータをライブ更新（パイプライン再構築なし）。CPU側 cell 同期のため &mut。
+    pub fn set_pixel_art_params(&mut self, params: crate::post_process::PixelArtParams) {
+        if let Some(pp) = &mut self.post_process {
             pp.set_pixel_art_params(&self.queue, params);
+        }
+    }
+
+    /// #1 低解像度2パスの ON/OFF。ポストプロセス経路が無ければ false。
+    pub fn set_pixel_art_lowres(&mut self, on: bool) -> bool {
+        if let Some(pp) = &mut self.post_process {
+            pp.set_pixel_art_lowres(on);
+            true
+        } else {
+            false
         }
     }
 
