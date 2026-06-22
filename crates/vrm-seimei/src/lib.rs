@@ -874,14 +874,80 @@ fn normalize_weights(w: [f32; 4]) -> [f32; 4] {
 
 /// Build a morphed copy of `base` by adding each active target's per-vertex
 /// position deltas (scaled by weight). `active` is `(morph_index, weight)`.
+///
+/// glTF morph targets here carry **position only** (Blender shape keys exported
+/// without NORMAL deltas). Adding position deltas alone leaves each vertex's normal at
+/// its rest-shape value, so a morphed bump (nipple, enlarged breast, butt…) is shaded
+/// as if flat → looks waxy / translucent / pinched. We therefore recompute normals for
+/// the moved vertices from the morphed geometry, and blend toward that geometric normal
+/// by displacement magnitude so the morph boundary doesn't seam against the authored
+/// (smoothed) normals of the untouched body.
 fn apply_morphs(base: &SkinMesh, deltas: &[Vec<[f32; 3]>], active: &[(usize, f32)]) -> SkinMesh {
+    let n = base.vertices.len();
     let mut vertices = base.vertices.clone();
+    let mut disp = vec![0.0f32; n]; // 累積変位量(native mm)
     for &(ti, w) in active {
         let Some(td) = deltas.get(ti) else { continue };
-        for (v, d) in vertices.iter_mut().zip(td.iter()) {
+        for (i, (v, d)) in vertices.iter_mut().zip(td.iter()).enumerate() {
             v.position[0] += d[0] * w;
             v.position[1] += d[1] * w;
             v.position[2] += d[2] * w;
+            disp[i] += (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() * w.abs();
+        }
+    }
+    // 動いた頂点の法線を新ジオメトリの面法線で張り直す（位置だけ動かした陰影の嘘を正す）。
+    const NBLEND_MM: f32 = 3.0; // この変位量で完全に幾何法線へ。手前は元法線とブレンド。
+    let moved: Vec<bool> = disp.iter().map(|&d| d > 1.0e-4).collect();
+    if moved.iter().any(|&m| m) {
+        let mut acc = vec![[0.0f32; 3]; n];
+        for t in base.indices.chunks_exact(3) {
+            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+            if !(moved[a] || moved[b] || moved[c]) {
+                continue;
+            }
+            let pa = vertices[a].position;
+            let pb = vertices[b].position;
+            let pc = vertices[c].position;
+            let u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
+            let v = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
+            let fnv = [
+                u[1] * v[2] - u[2] * v[1],
+                u[2] * v[0] - u[0] * v[2],
+                u[0] * v[1] - u[1] * v[0],
+            ];
+            for &k in &[a, b, c] {
+                if moved[k] {
+                    acc[k][0] += fnv[0];
+                    acc[k][1] += fnv[1];
+                    acc[k][2] += fnv[2];
+                }
+            }
+        }
+        for i in 0..n {
+            if !moved[i] {
+                continue;
+            }
+            let g = acc[i];
+            let gl = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+            if gl <= 1.0e-9 {
+                continue;
+            }
+            let orig = vertices[i].normal;
+            let mut gn = [g[0] / gl, g[1] / gl, g[2] / gl];
+            if gn[0] * orig[0] + gn[1] * orig[1] + gn[2] * orig[2] < 0.0 {
+                gn = [-gn[0], -gn[1], -gn[2]]; // 元法線と逆＝巻き順反転を補正
+            }
+            let t = (disp[i] / NBLEND_MM).clamp(0.0, 1.0);
+            let mut bl = [
+                orig[0] + (gn[0] - orig[0]) * t,
+                orig[1] + (gn[1] - orig[1]) * t,
+                orig[2] + (gn[2] - orig[2]) * t,
+            ];
+            let l = (bl[0] * bl[0] + bl[1] * bl[1] + bl[2] * bl[2]).sqrt();
+            if l > 1.0e-9 {
+                bl = [bl[0] / l, bl[1] / l, bl[2] / l];
+            }
+            vertices[i].normal = bl;
         }
     }
     SkinMesh { vertices, indices: base.indices.clone() }
