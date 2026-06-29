@@ -23,7 +23,7 @@ const ARM_DOWN: f32 = 0.72;
 const ARM_SWING: f32 = 0.45; // walk arm-swing amplitude (rad)
 /// Idle auto-blink: one quick close/open every `BLINK_PERIOD` s, lasting `BLINK_DUR`.
 const BLINK_PERIOD: f32 = 3.4;
-const BLINK_DUR: f32 = 0.14;
+const BLINK_DUR: f32 = 0.24; // 1回の開閉時間。0.14は速すぎ(twitch)＝0.24で柔らかいまばたきに
 /// Lip-sync: how wide a vowel opens, and how fast the mouth eases toward its target
 /// per frame (a low lerp avoids snapping between visemes → a continuous flap).
 const MOUTH_OPEN: f32 = 0.9;
