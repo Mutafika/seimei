@@ -1719,12 +1719,24 @@ impl Renderer {
     }
 
     /// シーン描画の MSAA サンプル数。ポストプロセス有効時は HDR テクスチャが単一サンプルなので 1。
-    fn scene_sample_count(&self) -> u32 {
+    ///
+    /// これは深度テクスチャ・MSAA カラーテクスチャ・全シーンパイプラインを作る基準値
+    /// （`set_quality` 参照）。外部パス（例: bamiri の FinishPass）をシーン深度と共有して
+    /// 重ねる場合、そのパイプラインのサンプル数をこの値に合わせる必要がある。
+    pub fn scene_sample_count(&self) -> u32 {
         if self.quality_settings.needs_post_process() {
             1
         } else {
             self.quality_settings.msaa.count()
         }
+    }
+
+    /// MSAA 有効（かつポストプロセス無効）時のシーン用マルチサンプルカラービュー。
+    /// シーンはここへ描き surface へ resolve される（`StoreOp::Store` で保持済み）。
+    /// 外部パスを resolve 前に重ねたい場合、このビューへ `LoadOp::Load` で描き
+    /// resolve_target に surface を指定する。MSAA 無効/ポストプロセス時は `None`。
+    pub fn msaa_view(&self) -> Option<&wgpu::TextureView> {
+        self.msaa_view.as_ref()
     }
 
     fn rebuild_pipelines(&mut self) -> Result<(), RendererError> {
