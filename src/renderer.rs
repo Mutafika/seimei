@@ -749,13 +749,19 @@ impl Renderer {
             ],
         });
 
-        let main_pipeline_with_shadow = pipeline::create_main_pipeline_with_shadow(
+        // シーンパスの実フォーマット/実サンプル数に合わせて構築する。
+        // 固定の surface_format / 1サンプルで作ると、MSAA やポストプロセス(HDR)が
+        // 先に有効な状態でシャドウを有効化した瞬間に
+        // 「Render pipeline targets are incompatible with render pass」で落ちる
+        // （rebuild_pipelines は品質変更時しか走らないため、こちら側でも一致が必要）。
+        let main_pipeline_with_shadow = pipeline::create_main_pipeline_with_shadow_msaa(
             &self.device,
-            self.surface_format,
+            self.scene_render_format(),
             &self.camera_bind_group_layout,
             &self.light_bind_group_layout,
             &self.texture_manager.bind_group_layout,
             &shadow_bind_group_layout,
+            self.scene_sample_count(),
         )?;
 
         self.shadow_depth_texture = Some(shadow_texture);
@@ -1156,6 +1162,11 @@ impl Renderer {
     ) -> Result<Vec<u8>, RendererError> {
         self.update_camera(camera);
 
+        // シーンパスの実サンプル数（MSAA 有効なら 4 等・ポストプロセス時は 1）。
+        // オフスクリーンの深度・MSAA カラーをこれに合わせないと、パイプラインや
+        // レンダーパスとサンプル数が食い違って validation エラーで落ちる。
+        let samples = self.scene_sample_count();
+
         let color_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Offscreen Color"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
@@ -1172,13 +1183,35 @@ impl Renderer {
             label: Some("Offscreen Depth"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1,
+            // MSAA 有効時、render_to_view は色ターゲットに self.msaa_view（実サンプル数）を
+            // 使う。深度を 1 固定にすると「Attachments have differing sample counts」で
+            // 落ちるため、シーンパスの実サンプル数に合わせる（MSAA 無効時は従来通り 1）。
+            sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // MSAA 有効時、render_to_view は色を self.msaa_view へ描き color_view へ resolve する。
+        // だが self.msaa_view はウィンドウ内部サイズで作られているため、オフスクリーン解像度
+        // （例: 動画書き出し 1920x1080）が内部サイズと違うと resolve の src/dst サイズ不一致で
+        // 落ちる。そこでオフスクリーン解像度・実サンプル数の一時 MSAA カラーへ差し替え、
+        // 描画後（submit 後）に元へ戻す。samples==1（MSAA 無効/ポストプロセス）時は不要。
+        let saved_msaa_texture = self.msaa_texture.take();
+        let saved_msaa_view = self.msaa_view.take();
+        if samples > 1 {
+            let (mt, mv) = Self::create_msaa_texture_impl(
+                &self.device,
+                width,
+                height,
+                self.surface_format,
+                samples,
+            );
+            self.msaa_texture = Some(mt);
+            self.msaa_view = Some(mv);
+        }
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Offscreen Encoder"),
@@ -1219,6 +1252,11 @@ impl Renderer {
         );
 
         self.queue.submit(std::iter::once(encoder.finish()));
+
+        // 一時差し替えた MSAA カラーを元へ戻す（submit 済みなので描画に使ったテクスチャは
+        // wgpu 側がコマンド完了まで保持する）。
+        self.msaa_texture = saved_msaa_texture;
+        self.msaa_view = saved_msaa_view;
 
         let slice = output_buffer.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
