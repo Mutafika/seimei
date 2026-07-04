@@ -10,6 +10,12 @@ struct CameraUniform {
     resolution: vec4<f32>,
     // 肌パラメータ: x=全身濡れfloor(0..1), y=濡れ新方式A/B(1=新/0=旧), z=SSS倍率, w=SSS新A/B(1/0)。
     skin_params: vec4<f32>,
+    // レンダFX: x=髪異方性強度(0=OFF), y=瞳角膜艶倍率(1=通常), z=グレード強度(composite用), w=予備。
+    fx_params: vec4<f32>,
+    // レンダFX2: x=リムライト強度(0=OFF), y=DoF量(composite用), z/w=予備。
+    fx_params2: vec4<f32>,
+    // 溶解の焼き点: xyz=world座標の溶解中心, w=熱(0..1)。この点の近傍だけ溶け縁を焦がし光らせる。
+    melt: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -62,6 +68,35 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+// 3D→1D ハッシュ（溶解ノイズのセル値用）。
+fn hash31(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// 3D value noise（三線形補間で連続）。生ハッシュを座標に直接使うと1画素ごとに乱数が変わり
+// 塩胡椒ノイズ(砂/ラメ)になるため、格子点でハッシュ→補間して「なめらかな」場を作る。溶解の穴を
+// コヒーレントに繋げるのに必須。
+fn vnoise3(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let c000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+    let c100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, u.x);
+    let x10 = mix(c010, c110, u.x);
+    let x01 = mix(c001, c101, u.x);
+    let x11 = mix(c011, c111, u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+
 // === PBR Functions ===
 
 // GGX/Trowbridge-Reitz 法線分布関数
@@ -98,6 +133,18 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
 }
 
+// === シェーディングモデルID（seimei vertex.rs の MODEL_* と一致） ===
+// 旧来は material.w(発光と髪=3/瞳=4/水>5タグの兼用) と material.z の符号(肌/透過) を値で推定して
+// いたが、標準材質(革/金属)が誤って特殊分岐に巻き込まれる事故源だった。明示IDで分岐する。
+const M_STANDARD: i32 = 0;
+const M_SKIN: i32 = 1;
+const M_HAIR: i32 = 2;
+const M_EYE: i32 = 3;
+const M_WATER: i32 = 4;
+const M_FLUID: i32 = 5;
+const M_GLASS: i32 = 6;
+const M_JELLY: i32 = 7;
+
 // === Vertex/Instance Input ===
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -113,8 +160,8 @@ struct InstanceInput {
     @location(5) model_matrix_2: vec4<f32>,
     @location(6) model_matrix_3: vec4<f32>,
     @location(7) color: vec4<f32>,
-    @location(8) material: vec4<f32>,  // [metallic, roughness, sss_or_transmission, emissive]
-    // material[2]: 正=SSS強度、負=transmission（-abs(transmission)）
+    @location(8) material: vec4<f32>,  // [metallic, roughness, sss(肌/ゼリー)又はtransmission(ガラス), emissive]
+    @location(11) model_id: f32,       // シェーディングモデル（M_* 定数）
 };
 
 struct VertexOutput {
@@ -126,6 +173,7 @@ struct VertexOutput {
     @location(4) material: vec4<f32>,
     @location(5) world_tangent: vec3<f32>,
     @location(6) world_bitangent: vec3<f32>,
+    @location(7) @interpolate(flat) model_id: i32,
 };
 
 @vertex
@@ -160,6 +208,7 @@ fn vs_main(
     out.uv = vertex.uv;
     out.color = instance.color * vertex.vertex_color;
     out.material = instance.material;
+    out.model_id = i32(instance.model_id + 0.5);
     return out;
 }
 
@@ -239,16 +288,17 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて濁らない
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
-    if (in.material.w >= 7.5) {
-        alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0); // 透過度スライダー直結＋ハイライトだけ僅かに
+    if (in.model_id == M_FLUID) {
+        alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0); // 濃い液=透過度スライダー直結＋ハイライトだけ僅かに
     }
     return vec4<f32>(col, alpha);
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // 水マテリアル（material[3] > 5）は専用シェーディングへ（テクスチャ判定前に分岐）。
-    if (in.material.w > 5.0) {
+    let model = in.model_id;
+    // 水/濃い液は専用シェーディングへ（テクスチャ判定前に分岐）。
+    if (model == M_WATER || model == M_FLUID) {
         return water_shade(in);
     }
     // クリップボックス判定
@@ -266,6 +316,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // アルファテスト
     if (tex_color.a < 0.01) {
         discard;
+    }
+
+    // === 溶解(dissolve/melt): 表面を局所的に溶かして穴を空ける汎用機能 ===
+    // 溶解フラグ material.z>0.5 を立てた標準材(=服)のみ対象。in.color.a を頂点ごとの「溶け量」として
+    // 読む(不透明clothは instance.a=1 なので in.color.a==頂点値・a==1→dissolve=0で無反応)。
+    // world座標の有機ノイズで縁がレース状に溶ける。out.color.a は不透明パスでは出力に効かない。
+    // ★ゲート必須: 髪/肌/ガラス/霧等の「元々半透明(alpha<1)」な材を巻き込んで砂状に消さないため、
+    //   model==M_STANDARD かつ material.z>0.5(服が溶解中の時だけ ticsim が立てる)に限定する。
+    let dissolve = select(
+        0.0,
+        clamp(1.0 - in.color.a, 0.0, 1.0),
+        model == M_STANDARD && in.material.z > 0.5);
+    // 溶解の「熱」＝現在の焼き点(camera.melt.xyz)の近傍のみ camera.melt.w で光る。
+    // ＝当てている場所だけ縁が焦げ光り、離れた古い穴は光らない（局所化）。半径は狭く絞る＝
+    // 近接した別の穴(例: 胸と腹は≈200mm)を巻き込まない。焼き点直近だけ(≈35mmで満・75mmで消)。
+    let melt_heat = camera.melt.w * (1.0 - smoothstep(35.0, 75.0, distance(in.world_position, camera.melt.xyz)));
+    var melt_edge = 0.0;
+    if (dissolve > 0.002) {
+        let wp = in.world_position;
+        // なめらか value noise 2オクターブ(mm単位)。粗(≈11mm)で穴の塊、細(≈4mm)で縁のレース。
+        // 連続なので穴が繋がり、白ノイズの砂ザラつきにならない。
+        let nz = vnoise3(wp * 0.09) * 0.62 + vnoise3(wp * 0.24) * 0.38;
+        // 溶け量がノイズを越えた画素を捨てる＝穴が有機的に広がる。a=0(完全溶解)は nz<1 が常真で確実消滅。
+        if (nz < dissolve) {
+            discard;
+        }
+        // 消滅境界の細い帯＝溶け縁。発光/焦がしはこの帯 × 熱でのみ出す(熱ゼロ＝ただの綺麗な穴)。
+        melt_edge = (1.0 - smoothstep(0.0, 0.09, nz - dissolve)) * melt_heat;
     }
 
     // 体表塗布マップ（付着した液）。被覆率 paint.a で素肌色↔塗布色を混ぜ、濡れて滑らかに（roughness↓）。
@@ -288,7 +366,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     //    （paint_white→0 となり、肌色を変えずテラテラの濡れだけ乗る＝透明な液の定着）。
     // sqrt で中被覆を持ち上げ＝塊が埋まる。極低被覆の縁は薄く残りメニスカス（縁透け）を維持。
     // 評価/全身汗用の「全身濡れ floor」(skin_params.x)。塗布が無くても全身を濡らせる。
-    let gw = clamp(camera.skin_params.x, 0.0, 1.0);
+    // 全身濡れ floor は「肌(SSS>0)」のみに効かせる。これをしないと global uniform が
+    // 全メッシュ共通のため、レンガ壁等の環境メッシュ(SSS=0)まで roughness↓＋clearcoat が
+    // 乗って世界中が specular firefly でビカビカになる。塗布由来の濡れ(wet_p)は全メッシュ可。
+    let gw_gate = select(0.0, 1.0, model == M_SKIN); // 全身濡れfloorは肌モデルのみ
+    let gw = clamp(camera.skin_params.x, 0.0, 1.0) * gw_gate;
     let wet_p = sqrt(paint_a);     // 塗布由来の濡れ
     let wet = max(wet_p, gw);      // 実効濡れ（roughness等に効く）
     let paint_luma = dot(paint.rgb, vec3<f32>(0.299, 0.587, 0.114));
@@ -306,14 +388,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // マテリアルパラメータ
     let metallic = clamp(in.material.x, 0.0, 1.0);
+    // シェーディングモデルは model_id で明示分岐（値域推定の sentinel を撤去＝標準材が誤って
+    // 髪/瞳/肌の特殊分岐に巻き込まれる事故を構造的に排除）。
+    let is_hair = model == M_HAIR;
+    let is_eye = model == M_EYE;
+    let is_sss = model == M_SKIN || model == M_JELLY; // SSSを持つモデル
+    let is_transmission = model == M_GLASS;
     // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。白い/暗い塗布問わず wet で艶を出す。
-    let roughness = mix(clamp(in.material.y, 0.04, 1.0), 0.08, wet);
+    // 瞳は角膜=常にツルツル＝低 rough で鋭い反射（濡れに依らず固定）。
+    let roughness = select(mix(clamp(in.material.y, 0.04, 1.0), 0.14, wet), 0.035, is_eye);
     let mat_z = in.material.z;
-    // material[2]: 正=SSS、負=transmission
-    let is_transmission = mat_z < 0.0;
-    let sss = select(clamp(mat_z, 0.0, 1.0), 0.0, is_transmission);
-    let transmission = select(0.0, clamp(-mat_z, 0.0, 1.0), is_transmission);
-    let emissive_strength = max(in.material.w, 0.0); // 発光強度
+    // material[2]: 肌/ゼリー=SSS強度 / ガラス=transmission量（共に正値）
+    let sss = select(0.0, clamp(mat_z, 0.0, 1.0), is_sss);
+    let transmission = select(0.0, clamp(mat_z, 0.0, 1.0), is_transmission);
+    let emissive_strength = max(in.material.w, 0.0); // 発光は純粋に発光のみ（タグ兼用を撤去）
 
     // 透明濡れ = wet のうち白くない分（暗く塗られた塗布＝肌色を変えない濡れ）。汗テカリと同様、
     // 肌色を保ったまま「少し暗化＋艶」だけ乗せる。白い塗布(paint_white≈1)では 0＝不透明ボディが支配。
@@ -329,7 +417,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
     // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。A/B(skin_params.y): 新=smoothstep強化 / 旧=線形0.32。
     let wet_new = camera.skin_params.y > 0.5;
-    let dark_amt = select(0.32 * wet_clear, 0.42 * smoothstep(0.0, 1.0, wet_clear), wet_new);
+    // 濡れの暗化は控えめに。暗いダンジョンはアンビエントが弱く、albedo暗化が拡散/アンビ/SSS
+    // 全てに効くため強いと肌が黒潰れする。「しっとり艶」は clearcoat 側で出す。
+    let dark_amt = select(0.18 * wet_clear, 0.10 * smoothstep(0.0, 1.0, wet_clear), wet_new);
     let albedo = albedo1 * (1.0 - dark_amt);
 
     // 誘電体の基本反射率 (F0)
@@ -463,19 +553,39 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // A/B(skin_params.y): 新=水膜フレネル＋グレージング＋縁ビーズ＋微小rough / 旧=均一クリアコート。
         // wet_amt=塗布 or 全身濡れ。全身濡れでも水膜艶が乗る。
         let wet_amt = max(paint_a, gw);
-        let micro = select(0.0, (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.03, wet_new);
-        let cc_rough = select(0.05, clamp(0.045 + micro, 0.02, 0.12), wet_new);
+        // micro: 水膜のごく僅かな粗さ揺らぎ。大きいと per-pixel に rough が振れて firefly（ギラつき）に
+        // なるので極小に。cc_rough 下限も上げて極小鏡面の aliasing(チラ)を抑える。
+        let micro = select(0.0, (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.006, wet_new);
+        let cc_rough = select(0.05, clamp(0.07 + micro, 0.05, 0.12), wet_new);
         let cc_ndf = distribution_ggx(n_dot_h, cc_rough);
         let cc_g = geometry_smith(n_dot_v, n_dot_l, cc_rough);
         let cc_f = fresnel_schlick(h_dot_v, select(vec3(0.04), vec3(0.02), wet_new));
-        let cc_graze = select(1.0, mix(1.0, 3.0, pow(1.0 - n_dot_v, 3.5)), wet_new); // 縁の水膜リム（チラ抑制で控えめ）
+        let cc_graze = select(1.0, mix(1.0, 1.8, pow(1.0 - n_dot_v, 3.5)), wet_new); // 縁の水膜リム（チラ抑制で控えめ）
         let cc_bead = select(1.0, 1.0 + smoothstep(0.04, 0.22, wet_amt) * (1.0 - smoothstep(0.22, 0.6, wet_amt)) * 1.4, wet_new);
         let cc_mult = select(2.5, 2.0, wet_new);
         let clearcoat = (cc_ndf * cc_g * cc_f) / (4.0 * n_dot_v * n_dot_l + 0.0001);
 
-        // 拡散は per-channel（SSS赤方シフト）、鏡面はスカラー n_dot_l。
-        lo = lo + diffuse * radiance * diff_w + specular * radiance * n_dot_l + sss_contrib
-             + clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead;
+        // 髪: アニメ的な「天使の輪」帯。tangent を法線方向へずらして帯位置を作り(主=上/副=下)、
+        // 高指数で帯を細くする＝一様な面光りでなく帯に。色は髪色寄り(tint0.7)＋髪色でクランプ＝
+        // 強めても白飛びせず“ブライトな髪色の艶”に飽和する（白光り回避）。
+        let t_hair = normalize(in.world_tangent);
+        let t1 = normalize(t_hair + n * 0.20);
+        let t2 = normalize(t_hair - n * 0.30);
+        let s1 = sqrt(max(0.0, 1.0 - dot(t1, h) * dot(t1, h)));
+        let s2 = sqrt(max(0.0, 1.0 - dot(t2, h) * dot(t2, h)));
+        let hair_spec = pow(s1, 140.0) + pow(s2, 50.0) * 0.25;
+        let hair_tint = mix(vec3<f32>(1.0), albedo, 0.7); // 髪色寄りの艶（白飛び回避）
+        // 鏡面項: 既定=GGX / 髪=天使の輪(tint・髪色クランプ) / 瞳=GGX増強(濡れた角膜の鋭い反射)。
+        // 強度は実機操作盤(fx_params): x=髪, y=瞳。0で各々OFF/通常。
+        let spec_ggx = specular * radiance * n_dot_l * select(1.0, camera.fx_params.y, is_eye);
+        let spec_hair = min(hair_tint * hair_spec * radiance * n_dot_l * camera.fx_params.x, albedo * 1.5 + vec3<f32>(0.1));
+        let spec_term = select(spec_ggx, spec_hair, is_hair);
+
+        // 拡散は per-channel（SSS赤方シフト）、鏡面は上の spec_term（髪/瞳で切替）。
+        // 濡れclearcoat(白い水膜艶)も肌/肉のみ。標準材(革/金具/布)には乗せない。
+        let cc_gate = select(0.0, 1.0, is_sss);
+        lo = lo + diffuse * radiance * diff_w + spec_term + sss_contrib
+             + clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead * cc_gate;
     }
 
     // Emissive（発光）
@@ -483,7 +593,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // 塗布部に淡い白の底上げ＝影側でも透けて暗くならず「白く濁った不透明な液」に見える(擬似SSS)。
     let opaque_floor = opaque_body * vec3<f32>(0.20, 0.19, 0.18);
-    let color = ambient + lo + emissive + opaque_floor;
+
+    // リムライト（縁光）: 暗い背景からシルエットを起こす暖色の縁。fx_params2.x=強度(0=OFF)。
+    // 真っ白化対策＝(1) 既に明るい面には乗せない（暗い縁だけ埋める rim_dark ゲート。松明で
+    // 明るい石の縁まで足して白飛び→ACES色転び＝緑被り、を断つ）、(2) 細い縁(高指数)、(3) 色は
+    // やや沈めた琥珀＋アルベド混ぜで白飛び回避。瞳は自前の角膜艶があるので除外。
+    let lit_lum = dot(ambient + lo + emissive + opaque_floor, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let rim_dark = 1.0 - smoothstep(0.12, 0.6, lit_lum); // 明所=0で乗らない／暗い縁だけ埋める
+    let rim_w = pow(1.0 - n_dot_v, 4.0) * camera.fx_params2.x * rim_dark;
+    let rim_col = vec3<f32>(0.95, 0.82, 0.62) * mix(vec3<f32>(1.0), albedo, 0.35);
+    // リムは肌/肉(is_sss)のシルエット用のみ。革帯/金具/布/壁等の標準材に乗せると、暗い面が
+    // グレージング角で暖色白に飛ぶ（口枷帯が拘束ポーズで白く見える事故の元）。model_idで遮断。
+    let rim = select(0.0, rim_w, is_sss) * rim_col;
+
+    // 溶け縁の焦げ光(琥珀)＝溶かしてる最中(heat>0)だけ。境界の帯を軽く焦がし、内側を淡く発光。
+    let melt_glow = melt_edge * vec3<f32>(1.7, 0.55, 0.12);
+    let char_dark = 1.0 - melt_edge * 0.45;
+    let color = (ambient + lo + emissive + opaque_floor + rim) * char_dark + melt_glow;
 
     // ACES トーンマッピング
     let mapped = aces_tonemap(color);
@@ -492,7 +618,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let gamma_corrected = pow(mapped, vec3(1.0 / 2.2));
 
     // ガラス: Fresnelベースの透過アルファ
-    var alpha = in.color.a * tex_color.a;
+    // 溶解中は in.color.a を溶け量に転用しているので、生き残った画素は不透明として出す
+    // (穴は discard で表現済み。alpha を下げると blend パスで薄まってしまう)。
+    var alpha = select(in.color.a, 1.0, dissolve > 0.002) * tex_color.a;
     if (is_transmission) {
         let fresnel = fresnel_schlick(n_dot_v, f0);
         let avg_fresnel = (fresnel.x + fresnel.y + fresnel.z) / 3.0;

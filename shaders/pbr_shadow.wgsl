@@ -41,6 +41,31 @@ var shadow_sampler: sampler_comparison;
 var<uniform> light_view_proj: mat4x4<f32>;
 
 const PI: f32 = 3.14159265359;
+
+// 溶解ノイズ（本体 pbr.wgsl と同一実装＝影の穴を本体と一致させる）。連続 value noise で砂ザラつき回避。
+fn hash31(p: vec3<f32>) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn vnoise3(p: vec3<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let c000 = hash31(i + vec3<f32>(0.0, 0.0, 0.0));
+    let c100 = hash31(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = hash31(i + vec3<f32>(0.0, 1.0, 0.0));
+    let c110 = hash31(i + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = hash31(i + vec3<f32>(0.0, 0.0, 1.0));
+    let c101 = hash31(i + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = hash31(i + vec3<f32>(0.0, 1.0, 1.0));
+    let c111 = hash31(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, u.x);
+    let x10 = mix(c010, c110, u.x);
+    let x01 = mix(c001, c101, u.x);
+    let x11 = mix(c011, c111, u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
 const SHADOW_MAP_SIZE: f32 = 2048.0;
 const SHADOW_BIAS: f32 = 0.05;
 
@@ -95,6 +120,16 @@ fn calculate_shadow(world_pos: vec3<f32>) -> f32 {
     return shadow / 9.0;
 }
 
+// === シェーディングモデルID（seimei vertex.rs の MODEL_* / pbr.wgsl の M_* と一致） ===
+const M_STANDARD: i32 = 0;
+const M_SKIN: i32 = 1;
+const M_HAIR: i32 = 2;
+const M_EYE: i32 = 3;
+const M_WATER: i32 = 4;
+const M_FLUID: i32 = 5;
+const M_GLASS: i32 = 6;
+const M_JELLY: i32 = 7;
+
 // === Vertex/Instance Input ===
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -110,7 +145,8 @@ struct InstanceInput {
     @location(5) model_matrix_2: vec4<f32>,
     @location(6) model_matrix_3: vec4<f32>,
     @location(7) color: vec4<f32>,
-    @location(8) material: vec4<f32>,  // [metallic, roughness, sss_or_transmission, emissive]
+    @location(8) material: vec4<f32>,  // [metallic, roughness, sss(肌/ゼリー)又はtransmission(ガラス), emissive]
+    @location(11) model_id: f32,       // シェーディングモデル（M_* 定数）
 };
 
 struct VertexOutput {
@@ -122,6 +158,7 @@ struct VertexOutput {
     @location(4) material: vec4<f32>,
     @location(5) world_tangent: vec3<f32>,
     @location(6) world_bitangent: vec3<f32>,
+    @location(7) @interpolate(flat) model_id: i32,
 };
 
 // IOR -> F0
@@ -156,6 +193,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.uv = vertex.uv;
     out.color = instance.color * vertex.vertex_color;
     out.material = instance.material;
+    out.model_id = i32(instance.model_id + 0.5);
     return out;
 }
 
@@ -207,16 +245,17 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40); // 水は薄く＝背景が透けて濁らない
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
-    if (in.material.w >= 7.5) {
-        alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0); // 透過度スライダー直結＋ハイライトだけ僅かに
+    if (in.model_id == M_FLUID) {
+        alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0); // 濃い液=透過度スライダー直結＋ハイライトだけ僅かに
     }
     return vec4<f32>(col, alpha);
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // 水マテリアル（material[3] > 5）は専用シェーディングへ（テクスチャ判定前に分岐）。
-    if (in.material.w > 5.0) {
+    let model = in.model_id;
+    // 水/濃い液は専用シェーディングへ（テクスチャ判定前に分岐）。
+    if (model == M_WATER || model == M_FLUID) {
         return water_shade(in);
     }
     // clip box
@@ -235,12 +274,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         discard;
     }
 
+    // 溶解: 本体 pbr.wgsl と同一ゲート＆ロジックで discard（影のシルエットを溶けた穴に一致させる。
+    // glow は影に不要）。model==M_STANDARD かつ material.z>0.5 の服のみ＝半透明材を巻き込まない。
+    let dissolve = select(
+        0.0,
+        clamp(1.0 - in.color.a, 0.0, 1.0),
+        model == M_STANDARD && in.material.z > 0.5);
+    if (dissolve > 0.002) {
+        let wp = in.world_position;
+        let nz = vnoise3(wp * 0.09) * 0.62 + vnoise3(wp * 0.24) * 0.38;
+        if (nz < dissolve) {
+            discard;
+        }
+    }
+
     let metallic = clamp(in.material.x, 0.0, 1.0);
     let roughness = clamp(in.material.y, 0.04, 1.0);
+    let is_sss = model == M_SKIN || model == M_JELLY; // SSSを持つモデル
+    let is_transmission = model == M_GLASS;
     let mat_z = in.material.z;
-    let is_transmission = mat_z < 0.0;
-    let sss = select(clamp(mat_z, 0.0, 1.0), 0.0, is_transmission);
-    let transmission = select(0.0, clamp(-mat_z, 0.0, 1.0), is_transmission);
+    // material[2]: 肌/ゼリー=SSS強度 / ガラス=transmission量（共に正値）
+    let sss = select(0.0, clamp(mat_z, 0.0, 1.0), is_sss);
+    let transmission = select(0.0, clamp(mat_z, 0.0, 1.0), is_transmission);
     let emissive_strength = max(in.material.w, 0.0);
     let albedo = in.color.rgb * tex_color.rgb;
 

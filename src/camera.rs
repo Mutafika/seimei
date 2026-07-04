@@ -464,6 +464,15 @@ pub struct CameraUniform {
     /// 肌パラメータ（評価/制御）: x=全身濡れ floor(0..1), y=濡れ新方式A/B(1=新/0=旧),
     /// z=SSS強度倍率(1=既定), w=SSS新方式A/B(1=新/0=旧)。レンダラ側(update_camera)で上書き。
     pub skin_params: [f32; 4],
+    /// レンダリングFX（実機操作盤で調整）: x=髪 異方性強度(0=OFF), y=瞳 角膜艶倍率(1=通常),
+    /// z=カラーグレード強度(0=OFF/1=全) w=予備。pbr(髪/瞳)と composite(グレード)が参照。
+    pub fx_params: [f32; 4],
+    /// レンダリングFX 第2系: x=リムライト強度(0=OFF), y=被写界深度量(0=OFF/1=最大),
+    /// z/w=予備。pbr(リム)と composite(DoF)が参照。
+    pub fx_params2: [f32; 4],
+    /// 溶解の「焼き点」: xyz=world座標の現在の溶解中心, w=熱(0..1)。pbr が溶け縁の焦げ発光を
+    /// この点の近傍かつ w>0 の時だけ出す（古い穴が光らないよう局所化）。update_camera で上書き。
+    pub melt: [f32; 4],
 }
 
 impl CameraUniform {
@@ -486,6 +495,12 @@ impl CameraUniform {
             resolution: [0.0; 4],
             // 肌パラメータの既定（dry / 新方式ON / SSS既定 / SSS新ON）。update_camera で上書き。
             skin_params: [0.0, 1.0, 1.0, 1.0],
+            // FX既定（髪0.6 / 瞳4.0 / グレード1.0）。update_camera で上書き。
+            fx_params: [0.6, 4.0, 1.0, 0.0],
+            // FX2既定（リム0.4 / DoF OFF）。update_camera で上書き。
+            fx_params2: [0.4, 0.0, 0.0, 0.0],
+            // 溶解の焼き点（既定=熱0で無効）。update_camera で上書き。
+            melt: [0.0, 0.0, 0.0, 0.0],
         }
     }
 }
