@@ -71,8 +71,14 @@ pub struct Renderer {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
+    // width/height は「内部レンダーターゲットの実サイズ」。render_scale<1.0 のとき base より小さい。
     width: u32,
     height: u32,
+    // 実サーフェス（全解像度）。render_scale を掛けて width/height を出す基準。
+    base_width: u32,
+    base_height: u32,
+    // 3D レンダ解像度スケール（0.5..=1.0）。<1.0 で内部を低解像度に描き FXAA で全解像度へ拡大。
+    render_scale: f32,
     // Depth
     depth_texture: wgpu::Texture,
     depth_view: wgpu::TextureView,
@@ -80,6 +86,12 @@ pub struct Renderer {
     camera_buffer: wgpu::Buffer,
     /// 肌パラメータ [全身濡れ, 濡れ新A/B, SSS倍率, SSS新A/B]。毎フレーム camera uniform へ注入。
     skin_params: [f32; 4],
+    /// レンダリングFX [髪異方性, 瞳角膜艶, グレード強度, 予備]。毎フレーム camera uniform へ注入。
+    fx_params: [f32; 4],
+    /// レンダリングFX2 [リムライト, DoF量, 予備, 予備]。毎フレーム camera uniform へ注入。
+    fx_params2: [f32; 4],
+    /// 溶解の焼き点 [world x, y, z, 熱(0..1)]。毎フレーム camera uniform へ注入。
+    melt: [f32; 4],
     camera_bind_group: wgpu::BindGroup,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     // Group 1: Lights
@@ -372,10 +384,16 @@ impl Renderer {
             surface_format,
             width,
             height,
+            base_width: width,
+            base_height: height,
+            render_scale: 1.0,
             depth_texture,
             depth_view,
             camera_buffer,
             skin_params: [0.0, 1.0, 1.0, 1.0],
+            fx_params: [0.6, 4.0, 1.0, 0.0],
+            fx_params2: [0.4, 0.0, 0.0, 0.0],
+            melt: [0.0, 0.0, 0.0, 0.0],
             camera_bind_group,
             camera_bind_group_layout,
             light_uniform_buffer,
@@ -486,7 +504,8 @@ impl Renderer {
         let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(&format!("Vertex Buffer {}", id)),
             contents: bytemuck::cast_slice(&gpu_vertices),
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            // STORAGE: GPUオンリー経路で compute シェーダが頂点を直接書き込めるように(readback廃止)。
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
         });
 
         let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -624,13 +643,34 @@ impl Renderer {
         let hdr_flag = if self.post_process.is_some() { 1.0 } else { 0.0 };
         uniform.resolution = [self.width as f32, self.height as f32, hdr_flag, 0.0];
         uniform.skin_params = self.skin_params;
+        uniform.fx_params = self.fx_params;
+        uniform.fx_params2 = self.fx_params2;
+        uniform.melt = self.melt;
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// 溶解の焼き点をセット [world 座標 point, 熱(0..1)]。次の update_camera で反映。
+    /// pbr がこの点の近傍かつ heat>0 の時だけ溶け縁を焦がして光らせる（古い穴は光らない）。
+    pub fn set_melt(&mut self, point: [f32; 3], heat: f32) {
+        self.melt = [point[0], point[1], point[2], heat];
     }
 
     /// 肌パラメータをセット [全身濡れ(0..1), 濡れ新A/B(0/1), SSS倍率, SSS新A/B(0/1)]。
     /// 次の update_camera で camera uniform に反映される。
     pub fn set_skin_params(&mut self, p: [f32; 4]) {
         self.skin_params = p;
+    }
+
+    /// レンダリングFXをセット [髪異方性強度, 瞳角膜艶倍率, カラーグレード強度, 予備]。
+    /// 次の update_camera で camera uniform に反映される（pbr=髪/瞳, composite=グレード）。
+    pub fn set_fx_params(&mut self, p: [f32; 4]) {
+        self.fx_params = p;
+    }
+
+    /// レンダリングFX2をセット [リムライト強度, DoF量, 予備, 予備]。
+    /// 次の update_camera で camera uniform に反映される（pbr=リム, composite=DoF）。
+    pub fn set_fx_params2(&mut self, p: [f32; 4]) {
+        self.fx_params2 = p;
     }
 
     /// クリップボックスを設定
@@ -1041,6 +1081,14 @@ impl Renderer {
             (scene_target, None)
         };
 
+        // render_scale<1.0 かつ has_pp のときは内部 scaled 深度(self.depth_view)へ描く（色=scaled HDR と
+        // サイズ一致＋SSAOのGBuffer深度と一致）。それ以外は従来どおり外部 depth_view（全解像度）。
+        let scene_depth: &wgpu::TextureView = if has_pp && self.render_scale < 1.0 {
+            &self.depth_view
+        } else {
+            depth_view
+        };
+
         // メインパス
         let use_shadow_pipeline = self.shadow_enabled
             && self.main_pipeline_with_shadow.is_some()
@@ -1069,7 +1117,7 @@ impl Renderer {
                         ops: wgpu::Operations { load: color_load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: scene_depth,
                         depth_ops: Some(wgpu::Operations { load: depth_load, store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }),
@@ -1112,7 +1160,7 @@ impl Renderer {
                     label: Some("Depth Prepass (see-through)"),
                     color_attachments: &[],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: scene_depth,
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }),
@@ -1132,7 +1180,7 @@ impl Renderer {
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: depth_view,
+                        view: scene_depth,
                         depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
                         stencil_ops: None,
                     }),
@@ -1386,14 +1434,45 @@ impl Renderer {
 
     // ── リサイズ ──
 
-    /// サイズ変更時に深度/MSAA/ポストプロセステクスチャを再作成
+    /// サイズ変更時に深度/MSAA/ポストプロセステクスチャを再作成。`width/height` は実サーフェス
+    /// （全解像度）。render_scale を掛けた内部サイズで実テクスチャを作る。
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
         }
-        self.width = width;
-        self.height = height;
+        self.base_width = width;
+        self.base_height = height;
+        self.apply_render_scale();
+        self.rebuild_targets();
+    }
 
+    /// 3D レンダ解像度スケールを設定（0.5..=1.0）。<1.0 で内部を低解像度に描き、最終 FXAA が
+    /// 全解像度サーフェスへ拡大（UI は後段で全解像度のまま乗るので鮮明）。1.0 は従来と完全同一。
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let s = scale.clamp(0.5, 1.0);
+        if (s - self.render_scale).abs() < 1e-4 {
+            return;
+        }
+        self.render_scale = s;
+        self.apply_render_scale();
+        self.rebuild_targets();
+    }
+
+    /// 現在の 3D レンダ解像度スケール。
+    pub fn render_scale(&self) -> f32 {
+        self.render_scale
+    }
+
+    /// 内部レンダーターゲットの実サイズ = base * render_scale（最小16px）を self.width/height に入れる。
+    fn apply_render_scale(&mut self) {
+        let s = self.render_scale.clamp(0.5, 1.0);
+        self.width = ((self.base_width as f32 * s).round() as u32).max(16);
+        self.height = ((self.base_height as f32 * s).round() as u32).max(16);
+    }
+
+    /// 内部レンダーターゲット（深度/MSAA/PP/scene_copy）を現在の self.width/height で作り直す。
+    fn rebuild_targets(&mut self) {
+        let (width, height) = (self.width, self.height);
         let msaa_count = self.quality_settings.msaa.count();
         let (dt, dv) = Self::create_depth_texture_impl(&self.device, width, height, msaa_count);
         self.depth_texture = dt;
@@ -1648,10 +1727,10 @@ impl Renderer {
     }
 
     /// 半透明メッシュ `[opaque_count..)` を描画。
-    /// `use_refraction==true` のとき、material[3] > 5.0 のインスタンスは屈折パイプライン
+    /// `use_refraction==true` のとき、model_id が水/濃い液のインスタンスは屈折パイプライン
     /// (group2=scene_copy)で、それ以外は従来 transparent_pipeline で描く。
     /// `use_refraction==false` のときは全て従来 transparent_pipeline（屈折なし）。
-    /// 透過(see-through)メッシュ(material[2]<0)の深度だけを先書きする。半透明色パスの前に呼び、
+    /// 透過(see-through)メッシュ(model_id==Glass)の深度だけを先書きする。半透明色パスの前に呼び、
     /// 後ろの髪等を深度で遮蔽して半透明ソートのオーラを消す。色は描かない。
     fn draw_depth_prepass<'a>(
         &'a self,
@@ -1666,8 +1745,8 @@ impl Renderer {
         render_pass.set_pipeline(&self.depth_prepass_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         for (i, (mesh_id, inst)) in instances[opaque_count..].iter().enumerate() {
-            if inst.material[2] >= 0.0 {
-                continue; // 透過(負)メッシュのみ深度先書き
+            if inst.model_id != crate::MODEL_GLASS {
+                continue; // ガラス(誘電体透過)メッシュのみ深度先書き
             }
             let idx = opaque_count + i;
             if let Some(mesh) = self.meshes.get(mesh_id) {
@@ -1698,7 +1777,8 @@ impl Renderer {
         for (i, (mesh_id, _)) in instances[opaque_count..].iter().enumerate() {
             let idx = opaque_count + i;
             if let Some(mesh) = self.meshes.get(mesh_id) {
-                let is_refr = use_refraction && instances[idx].1.material[3] > 5.0;
+                let m = instances[idx].1.model_id;
+                let is_refr = use_refraction && (m == crate::MODEL_WATER || m == crate::MODEL_FLUID);
                 let want_mode = if is_refr { 2u8 } else { 1u8 };
                 if want_mode != cur_mode {
                     if is_refr {
