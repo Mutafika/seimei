@@ -131,6 +131,11 @@ pub struct VrmAvatar {
     nodes_name: Vec<String>,
     node_order: Vec<usize>, // topological (parent-first) order of node indices
 
+    // 一様モデルスケール（身長/全体サイズ）。root ノードの scale に焼くと compute_world で
+    // 全子へ伝播するので、world_for_pose / スキン / world() すべてが一様に拡縮する。
+    model_scale: f32,
+    base_root_s: Vec<(usize, Vec3)>, // (root node index, model_scale 適用前の元 scale)
+
     // Inverse-bind matrices live per-primitive (see VrmPrimitive); they're
     // computed from OUR node chain (not the file's IBMs), guaranteeing
     // `jm = world_posed · inv_bind = I` at bind regardless of file IBM quirks.
@@ -335,6 +340,12 @@ impl VrmAvatar {
             }
         }
 
+        // root（親なし）ノードの元 scale を控える＝set_model_scale の再計算用。
+        let base_root_s: Vec<(usize, Vec3)> = (0..nn)
+            .filter(|&i| nodes_parent[i].is_none())
+            .map(|i| (i, nodes_s[i]))
+            .collect();
+
         Ok(VrmAvatar {
             primitives,
             nodes_t,
@@ -343,6 +354,8 @@ impl VrmAvatar {
             nodes_parent,
             nodes_name,
             node_order,
+            model_scale: 1.0,
+            base_root_s,
             humanoid,
             is_vrm0,
             spring,
@@ -397,6 +410,45 @@ impl VrmAvatar {
     /// Whether the model defines `preset`.
     pub fn has_expression(&self, preset: ExpressionPreset) -> bool {
         self.expressions.presets.contains_key(&preset)
+    }
+
+    /// Per-primitive vertex position deltas (native space) that `preset`'s morph binds
+    /// apply, summed and weighted by each bind's weight. Outer index matches
+    /// `primitives()`/skin order; the inner Vec is empty for primitives this expression
+    /// does not move (and for every primitive if the model lacks the preset).
+    ///
+    /// Lets callers locate the vertices an expression displaces — e.g. find the lips via
+    /// the mouth-open morph — independent of mesh proportions. Generic geometry query.
+    pub fn expression_vertex_deltas(&self, preset: ExpressionPreset) -> Vec<Vec<[f32; 3]>> {
+        let expr = self.expressions.get_preset(preset);
+        self.primitives
+            .iter()
+            .map(|prim| {
+                let mut acc: Vec<[f32; 3]> = Vec::new();
+                let Some(expr) = expr else { return acc };
+                for bind in &expr.morph_target_binds {
+                    let mesh = match bind.addressing {
+                        MorphAddressing::MeshIndex => Some(bind.target),
+                        MorphAddressing::NodeIndex => self.node_mesh.get(bind.target).copied().flatten(),
+                    };
+                    if mesh != Some(prim.mesh_index) {
+                        continue;
+                    }
+                    let Some(deltas) = prim.morph_deltas.get(bind.index) else { continue };
+                    if acc.is_empty() {
+                        acc = vec![[0.0; 3]; deltas.len()];
+                    }
+                    for (i, d) in deltas.iter().enumerate() {
+                        if i < acc.len() {
+                            acc[i][0] += d[0] * bind.weight;
+                            acc[i][1] += d[1] * bind.weight;
+                            acc[i][2] += d[2] * bind.weight;
+                        }
+                    }
+                }
+                acc
+            })
+            .collect()
     }
 
     /// Set a preset's weight in `0..=1`. `0` clears it. Presets overlay additively
@@ -623,6 +675,30 @@ impl VrmAvatar {
         self.spring.as_mut().map(|s| s.set_group_stiffness(name, stiffness)).unwrap_or(false)
     }
 
+    /// Bypass one named spring chain: `skin_dynamic` leaves its nodes FK/animation-posed
+    /// so the host can pose them itself (external physics via the overlay seam, paired
+    /// with [`Self::register_bone_alias`]). `false` restores spring simulation. Returns
+    /// true if a chain matched. No-op (false) if the model has no spring config.
+    pub fn set_group_bypass(&mut self, name: &str, on: bool) -> bool {
+        self.spring.as_mut().map(|s| s.set_group_bypass(name, on)).unwrap_or(false)
+    }
+
+    /// Register `name` as an extra pose-able bone name resolving to glTF node `node`.
+    /// Poses and overlays only resolve VRM humanoid names by default; an alias opens the
+    /// same seam for any node (e.g. a secondary/spring bone the host wants to FK-drive).
+    /// Refuses (false) an already-taken name (humanoid bone or prior alias) or an
+    /// out-of-range node — idempotent re-registration of the same alias is harmless.
+    pub fn register_bone_alias(&mut self, name: &str, node: usize) -> bool {
+        if node >= self.nodes_t.len() {
+            return false;
+        }
+        if self.humanoid.contains_key(name) {
+            return false;
+        }
+        self.humanoid.insert(name.to_string(), node);
+        true
+    }
+
     /// (node index, node name, is-a-skin-joint in any primitive) for a humanoid
     /// bone — debug.
     pub fn debug_bone_info(&self, bone: &str) -> Option<(usize, String, bool)> {
@@ -697,6 +773,21 @@ impl VrmAvatar {
     /// bind (empty pose) `world = world_bind` so every `jm = I`.
     ///
     /// Public half of the **physics-insertion seam** (see [`Self::skin_with_world`]).
+    /// 一様モデルスケール（身長/全体サイズ）。1.0=元寸。root ノードの scale に焼くので
+    /// world_for_pose / スキン / world() がすべて一様に拡縮する（モデル原点=足元基準で伸縮）。
+    /// 接地はホスト側が毎フレーム最下点を床へ合わせるので足は床に残る。
+    /// 注: spring（揺れもの）の bind 長は構築時 scale 基準のため、極端値では揺れが僅かにズレる。
+    pub fn set_model_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(0.1, 5.0);
+        self.model_scale = scale;
+        for &(i, base) in &self.base_root_s {
+            self.nodes_s[i] = base * scale;
+        }
+    }
+    pub fn model_scale(&self) -> f32 {
+        self.model_scale
+    }
+
     pub fn world_for_pose(&self, pose: &[(&str, [f32; 3])]) -> Vec<Mat4> {
         let nn = self.nodes_t.len();
         let mut anim: Vec<Quat> = vec![Quat::IDENTITY; nn];
@@ -948,6 +1039,45 @@ fn apply_morphs(base: &SkinMesh, deltas: &[Vec<[f32; 3]>], active: &[(usize, f32
                 bl = [bl[0] / l, bl[1] / l, bl[2] / l];
             }
             vertices[i].normal = bl;
+        }
+        // 法線スムージング: 低ポリ部位(乳首等)の幾何法線は面ファセットが粗く、また
+        // moved/非moved 境界に法線の段差が残る。濡れ/光沢の鋭いスペキュラだとこれが
+        // 「しわ(湯葉)」に見える。動いた頂点の法線を一輪近傍(非movedの元法線も含む)で
+        // 数回平均して均す＝面取りを丸め境界段差も溶かす。位置は変えない(陰影だけ整える)。
+        const NORMAL_SMOOTH_ITERS: usize = 3;
+        if NORMAL_SMOOTH_ITERS > 0 {
+            // 動いた頂点の一輪近傍(重複可＝重み)を index から収集。
+            let mut nbr: Vec<Vec<u32>> = vec![Vec::new(); n];
+            for t in base.indices.chunks_exact(3) {
+                let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+                for &(x, y) in &[(a, b), (b, c), (c, a)] {
+                    if moved[x] {
+                        nbr[x].push(y as u32);
+                    }
+                    if moved[y] {
+                        nbr[y].push(x as u32);
+                    }
+                }
+            }
+            for _ in 0..NORMAL_SMOOTH_ITERS {
+                let cur: Vec<[f32; 3]> = vertices.iter().map(|v| v.normal).collect();
+                for i in 0..n {
+                    if !moved[i] || nbr[i].is_empty() {
+                        continue;
+                    }
+                    let mut s = cur[i];
+                    for &j in &nbr[i] {
+                        let nj = cur[j as usize];
+                        s[0] += nj[0];
+                        s[1] += nj[1];
+                        s[2] += nj[2];
+                    }
+                    let l = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+                    if l > 1.0e-9 {
+                        vertices[i].normal = [s[0] / l, s[1] / l, s[2] / l];
+                    }
+                }
+            }
         }
     }
     SkinMesh { vertices, indices: base.indices.clone() }

@@ -121,6 +121,10 @@ pub struct SpringSystem {
     /// resists a driving force elastically (small, proportional deflection + a snappy
     /// return) instead of a soft chain slumping to its length limit. `< 0` restores.
     group_stiffs: Vec<f32>,
+    /// Per-group bypass (parallel to `group_names`). `true` = `step` leaves that chain's
+    /// nodes untouched (world stays FK/animation-posed), so a host can pose them itself
+    /// (e.g. drive a labelled secondary chain from external physics via the overlay seam).
+    group_bypass: Vec<bool>,
     /// Accumulated sim time, for gust phase.
     time: f32,
 }
@@ -141,6 +145,7 @@ impl SpringSystem {
         let group_forces = vec![Vec3::ZERO; group_names.len()];
         let group_drags = vec![-1.0; group_names.len()];
         let group_stiffs = vec![-1.0; group_names.len()];
+        let group_bypass = vec![false; group_names.len()];
         SpringSystem {
             joints,
             colliders,
@@ -152,6 +157,7 @@ impl SpringSystem {
             group_drags,
             group_stiffs,
             group_forces,
+            group_bypass,
             time: 0.0,
         }
     }
@@ -482,6 +488,22 @@ impl SpringSystem {
         hit
     }
 
+    /// Bypass every chain whose name contains `name` (case-insensitive): `step` leaves
+    /// those nodes untouched (world stays FK/animation-posed) so a host can pose them
+    /// itself — e.g. drive a labelled secondary chain from external physics through the
+    /// overlay seam. `false` restores spring simulation. Returns true if any chain matched.
+    pub fn set_group_bypass(&mut self, name: &str, on: bool) -> bool {
+        let key = name.to_ascii_lowercase();
+        let mut hit = false;
+        for (gn, gb) in self.group_names.iter().zip(self.group_bypass.iter_mut()) {
+            if gn.to_ascii_lowercase().contains(&key) {
+                *gb = on;
+                hit = true;
+            }
+        }
+        hit
+    }
+
     /// Advance one step and overwrite `world[node]` for every spring joint. `world`
     /// must be the animation-posed skeleton (native space); the head/skirt anchors
     /// (non-spring parents) are read from it, so the springs follow the body.
@@ -520,7 +542,16 @@ impl SpringSystem {
             })
             .collect();
 
+        let group_bypass = self.group_bypass.clone();
         for (idx, j) in self.joints.iter_mut().enumerate() {
+            // Bypassed chain: leave world[j.node] as the FK/animation pose (host-driven).
+            // Keep the verlet tail tracking the FK pose so un-bypassing doesn't snap.
+            if group_bypass.get(j.group as usize).copied().unwrap_or(false) {
+                let (_, nrot, npos) = world[j.node].to_scale_rotation_translation();
+                j.prev_tail = j.cur_tail;
+                j.cur_tail = npos + nrot * j.bone_axis * j.length;
+                continue;
+            }
             let parent_world = world[j.parent];
             let (_, parent_rot, _) = parent_world.to_scale_rotation_translation();
             let world_pos = parent_world.transform_point3(j.local_t);
