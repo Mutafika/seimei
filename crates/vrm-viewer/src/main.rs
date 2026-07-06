@@ -16,7 +16,7 @@ use std::time::Instant;
 use glam::Mat4;
 use sabitori::element::*;
 use sabitori::*;
-use seimei::{Camera, InstanceData, Light, Point3, Renderer};
+use seimei::{Camera, InstanceData, Light, Point3, Renderer, MODEL_STANDARD};
 use vrm_seimei::{AvatarController, ExpressionPreset, VrmAvatar};
 
 /// Fixed animation step (~60fps; SceneApp drives a continuous redraw loop).
@@ -350,6 +350,7 @@ impl SceneApp for ViewerApp {
                 model: Mat4::IDENTITY.to_cols_array_2d(),
                 color: if tex_id.is_some() { [1.0, 1.0, 1.0, bc[3]] } else { bc },
                 material: [prim.metallic, prim.roughness.max(0.5), 0.0, 0.0],
+                model_id: MODEL_STANDARD,
             };
             if prim.alpha_blend {
                 blend.push((mesh_id, inst));

@@ -51,6 +51,18 @@ impl GpuVertex {
     }
 }
 
+/// シェーディングモデルID。材質チャネルの値から特殊シェーディングを推定していた旧 sentinel 方式
+/// （material.w を発光と髪/瞳/水タグに兼用・material.z の符号で肌/透過を判定）を廃し、この明示IDで
+/// 分岐する。pbr.wgsl / pbr_shadow.wgsl の M_* 定数と必ず一致させること。
+pub const MODEL_STANDARD: f32 = 0.0; // 革/金属/ゴム/布/石/木/プラ/環境（metallic+roughness+albedo+emissive のみ）
+pub const MODEL_SKIN: f32 = 1.0; // 肌（SSS＋全身濡れfloor＋clearcoat）
+pub const MODEL_HAIR: f32 = 2.0; // 髪（異方性ハイライト）
+pub const MODEL_EYE: f32 = 3.0; // 瞳（角膜＝低roughの鋭い反射）
+pub const MODEL_WATER: f32 = 4.0; // 水（material.x=粘性。視線依存の薄い透過）
+pub const MODEL_FLUID: f32 = 5.0; // 濃い液(精液/スライム/霧/ガラス壁)。透過度=color.a直結
+pub const MODEL_GLASS: f32 = 6.0; // 誘電体ガラス（material.z=transmission量・正値）
+pub const MODEL_JELLY: f32 = 7.0; // ゼリー/肉触手（SSS半透明・全身濡れfloorは無し）
+
 /// インスタンスデータ（要素ごとの変換・色・マテリアル）
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -59,8 +71,10 @@ pub struct InstanceData {
     pub model: [[f32; 4]; 4],
     /// 色（RGBA）
     pub color: [f32; 4],
-    /// マテリアル [metallic, roughness, sss_or_transmission, emissive]
+    /// マテリアル [metallic(水/粘液は粘性), roughness, sss(肌/ゼリー)又はtransmission(ガラス), emissive]
     pub material: [f32; 4],
+    /// シェーディングモデルID（MODEL_* 定数。各シェーダの switch と一致させる）
+    pub model_id: f32,
 }
 
 impl InstanceData {
@@ -99,6 +113,12 @@ impl InstanceData {
                     shader_location: 8,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    // model + color + material の直後（64 + 16 + 16 = 96B）
+                    offset: (std::mem::size_of::<[[f32; 4]; 4]>() + std::mem::size_of::<[f32; 8]>()) as wgpu::BufferAddress,
+                    shader_location: 11,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         }
     }
@@ -113,6 +133,7 @@ impl InstanceData {
             ],
             color,
             material: [0.0, 0.5, 0.0, 0.0],
+            model_id: MODEL_STANDARD,
         }
     }
 
@@ -126,6 +147,7 @@ impl InstanceData {
             ],
             color,
             material: [metallic, roughness, 0.0, 0.0],
+            model_id: MODEL_STANDARD,
         }
     }
 
@@ -148,6 +170,7 @@ impl InstanceData {
             ],
             color,
             material: [0.0, 0.5, 0.0, 0.0],
+            model_id: MODEL_STANDARD,
         }
     }
 
