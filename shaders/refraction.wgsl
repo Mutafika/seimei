@@ -59,6 +59,9 @@ struct VertexInput {
     @location(10) vertex_color: vec4<f32>,
 };
 
+// シェーディングモデルID（seimei vertex.rs の MODEL_* / pbr.wgsl の M_* と一致）
+const M_FLUID: i32 = 5;
+
 struct InstanceInput {
     @location(3) model_matrix_0: vec4<f32>,
     @location(4) model_matrix_1: vec4<f32>,
@@ -66,6 +69,7 @@ struct InstanceInput {
     @location(6) model_matrix_3: vec4<f32>,
     @location(7) color: vec4<f32>,
     @location(8) material: vec4<f32>,
+    @location(11) model_id: f32,
 };
 
 struct VertexOutput {
@@ -77,6 +81,7 @@ struct VertexOutput {
     @location(4) material: vec4<f32>,
     @location(5) world_tangent: vec3<f32>,
     @location(6) world_bitangent: vec3<f32>,
+    @location(7) @interpolate(flat) model_id: i32,
 };
 
 @vertex
@@ -108,6 +113,7 @@ fn vs_main(
     out.uv = vertex.uv;
     out.color = instance.color * vertex.vertex_color;
     out.material = instance.material;
+    out.model_id = i32(instance.model_id + 0.5);
     return out;
 }
 
@@ -172,11 +178,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         col = pow(col, vec3<f32>(1.0 / 2.2));
     }
 
-    // 透過度。flag>=7.5(濃い不透明な液)はスライダー直結、それ以外は視線依存。
+    // 透過度。濃い不透明な液(Fluid)はスライダー直結、それ以外(Water)は視線依存。
     let water_a = clamp(0.04 + fres * 0.45 + spec * 0.15, 0.0, 0.40);
     let thick_a = clamp(in.color.a * (0.85 + 0.15 * fres) + spec * 0.2, 0.0, 1.0);
     var alpha = mix(water_a, thick_a, visc);
-    if (in.material.w >= 7.5) {
+    if (in.model_id == M_FLUID) {
         alpha = clamp(in.color.a + spec * 0.15, 0.0, 1.0);
     }
     return vec4<f32>(col, alpha);

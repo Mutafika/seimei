@@ -30,6 +30,21 @@ const COLLIDER_INFLATE: f32 = 1.0;
 const STIFFNESS_SCALE: f32 = 0.45;
 const DRAG_SCALE: f32 = 0.8;
 
+/// Hair-only segment collision. A hair chain has just 3–5 joints, so each bone is
+/// long (10–15 cm). Endpoint-only collision (pushing only the joint *tail* out of a
+/// collider) lets a long bone whip its tail to a point in *front* of the body —
+/// outside every collider sphere — while the bone segment itself skewers straight
+/// through the torso. That is the "hair passes through the body" artifact. For hair
+/// chains we instead push the tail out along the outward normal at the *deepest* point
+/// of the whole bone (anchor→tail), by that point's penetration depth. This is a
+/// damped push toward tangency (never past it), so it de-tunnels without flinging the
+/// strand off the head. A near-anchor hit is only partially lifted — the parent joint
+/// (also a hair joint) gets the same treatment and resolves it. `ITERS` because each
+/// length re-constrain nudges the bone slightly back in; `RELAX` under-relaxes so
+/// overlapping colliders converge smoothly instead of jittering.
+const HAIR_COLLIDE_ITERS: usize = 4;
+const HAIR_COLLIDE_RELAX: f32 = 0.9;
+
 /// Wind turbulence. The steady wind is modulated by a non-repeating gust envelope
 /// (layered incommensurate sines — no RNG, so the sim stays deterministic) that
 /// ranges from near-calm (`WIND_LULL`) up to full gust, while the heading slowly
@@ -125,6 +140,14 @@ pub struct SpringSystem {
     /// nodes untouched (world stays FK/animation-posed), so a host can pose them itself
     /// (e.g. drive a labelled secondary chain from external physics via the overlay seam).
     group_bypass: Vec<bool>,
+    /// Extra downward (native -Y) pull on hair strands, *weighted by how far each strand's
+    /// rest direction already points down* — so strands authored to hang get dragged into a
+    /// natural drape, while ones authored to point up/out (an ahoge, a flicked tip) keep
+    /// their gravity-defying shape via their own stiffness. Unlike `gravity_boost` (which is
+    /// uniform over every joint and would slump those accent strands too), this lets a host
+    /// make hair "hang under gravity" without flattening the bits that are meant to spring
+    /// up. 0 disables. Only affects chains whose name contains "hair".
+    hair_drape: f32,
     /// Accumulated sim time, for gust phase.
     time: f32,
 }
@@ -158,6 +181,7 @@ impl SpringSystem {
             group_stiffs,
             group_forces,
             group_bypass,
+            hair_drape: 0.0,
             time: 0.0,
         }
     }
@@ -437,6 +461,18 @@ impl SpringSystem {
         self.gravity_boost
     }
 
+    /// Downward drape pull on hair, weighted per strand by how far its rest direction
+    /// already points down (see the `hair_drape` field). Lets a host make hair hang
+    /// naturally while leaving ahoge / flicked tips (rest pointing up/out) springing up.
+    /// 0 disables. Only affects chains whose name contains "hair".
+    pub fn set_hair_drape(&mut self, power: f32) {
+        self.hair_drape = power.max(0.0);
+    }
+
+    pub fn hair_drape(&self) -> f32 {
+        self.hair_drape
+    }
+
     /// Apply a steady external force (native space) to every joint whose chain name
     /// contains `name` (case-insensitive), on top of gravity/wind. Lets a host drive
     /// one labelled chain — e.g. orbit a force to slosh a specific secondary bone —
@@ -514,6 +550,7 @@ impl SpringSystem {
         // Wind for this frame (copied out so the &mut self.joints loop can read them).
         let (wind_dir, wind_strength) = (self.wind_dir, self.wind_strength);
         let gravity_boost = self.gravity_boost;
+        let hair_drape = self.hair_drape;
         let group_forces = self.group_forces.clone();
         let group_drags = self.group_drags.clone();
         let group_stiffs = self.group_stiffs.clone();
@@ -543,6 +580,10 @@ impl SpringSystem {
             .collect();
 
         let group_bypass = self.group_bypass.clone();
+        // Hair chains get segment-aware collision (below); short/tuned chains
+        // (bust/butt/skirt/ears) keep the cheaper endpoint-only push unchanged.
+        let hair_group: Vec<bool> =
+            self.group_names.iter().map(|n| n.to_ascii_lowercase().contains("hair")).collect();
         for (idx, j) in self.joints.iter_mut().enumerate() {
             // Bypassed chain: leave world[j.node] as the FK/animation pose (host-driven).
             // Keep the verlet tail tracking the FK pose so un-bypassing doesn't snap.
@@ -573,8 +614,18 @@ impl SpringSystem {
             let stiff = rest_dir * (stiffness * dt);
             // per-joint gravity ＋ ホスト指定の追加重力（native -Y, steady）＋ グループ外力。
             let group_force = group_forces.get(j.group as usize).copied().unwrap_or(Vec3::ZERO);
+            // hair drape: extra downward pull, but only on hair strands and scaled by how far
+            // the strand's rest already points down (1 = straight down, 0.5 = horizontal,
+            // 0 = straight up). Keeps ahoge / flicked tips (rest pointing up/out) springing
+            // up instead of slumping under a uniform pull.
+            let drape = if hair_drape > 0.0 && hair_group.get(j.group as usize).copied().unwrap_or(false) {
+                let w = (0.5 - 0.5 * rest_dir.y).clamp(0.0, 1.0);
+                hair_drape * dt * w
+            } else {
+                0.0
+            };
             let ext = j.gravity_dir * (j.gravity_power * dt)
-                + Vec3::NEG_Y * (gravity_boost * dt)
+                + Vec3::NEG_Y * (gravity_boost * dt + drape)
                 + group_force * dt;
             // wind: gusty envelope (calm↔gust) + wandering heading; each strand is
             // time-offset so they don't all surge together.
@@ -588,21 +639,58 @@ impl SpringSystem {
             let mut next = j.cur_tail + inertia + stiff + ext + wind;
             next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
 
-            // collisions: push the tail out of each collider, then re-constrain length.
-            // A capsule reduces to the sphere at its nearest point to the tail.
-            for (a, b, cr) in &worlds {
-                let center = match b {
-                    None => *a,
-                    Some(b) => closest_on_segment(*a, *b, next),
-                };
-                let r = cr * COLLIDER_INFLATE + j.radius;
-                let d = next - center;
-                let dl = d.length();
-                if dl > 1e-9 && dl < r {
-                    next = center + d / dl * r;
+            // collisions. A capsule reduces to the sphere at its nearest point to the
+            // tail. Two modes:
+            if hair_group.get(j.group as usize).copied().unwrap_or(false) {
+                // Hair: same tail push as short chains, plus an anti-skewer pass that
+                // fires ONLY when both bone ends are already outside a collider yet the
+                // bone chord still dips inside — i.e. the long bone is spearing the body
+                // (tail resting in front, segment cutting through). Gating on both-ends-
+                // outside is what keeps hair that legitimately hugs the head collider
+                // (root inside it) from being shoved off the scalp.
+                for _ in 0..HAIR_COLLIDE_ITERS {
+                    for (a, b, cr) in &worlds {
+                        let center = match b {
+                            None => *a,
+                            Some(b) => closest_on_segment(*a, *b, next),
+                        };
+                        let r = cr * COLLIDER_INFLATE + j.radius;
+                        // (1) endpoint push: keep the tail itself outside.
+                        let dt = next - center;
+                        let dtl = dt.length();
+                        if dtl > 1e-9 && dtl < r {
+                            next = center + dt / dtl * r;
+                        }
+                        // (2) anti-skewer: only when both ends clear the collider.
+                        if (world_pos - center).length() > r && (next - center).length() > r {
+                            let p = closest_on_segment(world_pos, next, center);
+                            let d = p - center;
+                            let dl = d.length();
+                            if dl > 1e-9 && dl < r {
+                                // damped push of the tail along the deepest point's normal;
+                                // RELAX<1 converges to tangency without flinging the strand.
+                                next += d / dl * ((r - dl) * HAIR_COLLIDE_RELAX);
+                            }
+                        }
+                    }
+                    next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
                 }
+            } else {
+                // Short/tuned chains: push only the tail out, then re-constrain length.
+                for (a, b, cr) in &worlds {
+                    let center = match b {
+                        None => *a,
+                        Some(b) => closest_on_segment(*a, *b, next),
+                    };
+                    let r = cr * COLLIDER_INFLATE + j.radius;
+                    let d = next - center;
+                    let dl = d.length();
+                    if dl > 1e-9 && dl < r {
+                        next = center + d / dl * r;
+                    }
+                }
+                next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
             }
-            next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
 
             j.prev_tail = j.cur_tail;
             j.cur_tail = next;
@@ -680,6 +768,113 @@ mod tests {
         // STIFFNESS_SCALE / DRAG_SCALE applied from the per-joint params
         assert!((sys.joints[0].stiffness - STIFFNESS_SCALE).abs() < 1e-6);
         assert!((sys.joints[0].drag - (0.4 * DRAG_SCALE)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hair_bone_segment_does_not_skewer_collider() {
+        // Regression for "hair passes through the body": a hair bone whose *tail* rests
+        // just outside a collider but whose *segment* would pass straight through it.
+        // rig() hangs the strand at x≈0 from y1.4 (anchor) down. Collider centre
+        // (0.03, 1.35, 0) r0.05: the vertical bone (x=0) is 0.03 from the centre (inside
+        // r), yet the tail at (0,1.3,0) is 0.058 away (outside r) — endpoint-only
+        // collision would miss it. Segment-aware hair collision must clear the whole bone.
+        let (t, r, s, parent, world_bind) = rig();
+        let ext = json!({ "VRMC_springBone": {
+            "specVersion": "1.0",
+            // offset is in node-0 (head, world y=1.5) space → world centre (0.03,1.35,0)
+            "colliders": [{ "node": 0, "shape": { "sphere": { "offset": [0.03, -0.15, 0.0], "radius": 0.05 } } }],
+            "colliderGroups": [{ "name": "body", "colliders": [0] }],
+            "springs": [{ "name": "Hair", "colliderGroups": [0], "joints": [
+                { "node": 1, "hitRadius": 0.0, "stiffness": 1.0, "gravityPower": 0.5, "gravityDir": [0.0,-1.0,0.0], "dragForce": 0.4 },
+                { "node": 2, "hitRadius": 0.0, "stiffness": 1.0, "gravityPower": 0.5, "gravityDir": [0.0,-1.0,0.0], "dragForce": 0.4 }
+            ]}]
+        }});
+        let mut sys = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        let mut world = world_bind.clone();
+        for _ in 0..120 {
+            sys.step(&mut world, 1.0 / 60.0);
+        }
+        let center = Vec3::new(0.03, 1.35, 0.0);
+        let rad = 0.05_f32;
+        for jt in &sys.joints {
+            assert!(jt.cur_tail.is_finite(), "hair sim went non-finite");
+            let anchor = world[jt.node].to_scale_rotation_translation().2;
+            let p = closest_on_segment(anchor, jt.cur_tail, center);
+            let dist = (p - center).length();
+            assert!(
+                dist >= rad - 2e-3,
+                "hair bone at node {} still skewers collider: min dist {dist} < r {rad}",
+                jt.node
+            );
+        }
+    }
+
+    #[test]
+    fn hair_drape_hangs_down_strands_but_spares_ahoge() {
+        // Two hair chains off the head: one hangs down-and-forward, one is an AHOGE that
+        // points straight up. set_hair_drape must drag the hanging strand into a deeper
+        // hang yet leave the ahoge standing (its rest points up → drape weight ≈ 0).
+        let t = vec![
+            Vec3::new(0.0, 1.5, 0.0),    // 0 head
+            Vec3::new(0.0, -0.07, 0.07), // 1 down root (down+forward)
+            Vec3::new(0.0, -0.07, 0.07), // 2 down tip
+            Vec3::new(0.0, 0.10, 0.0),   // 3 ahoge root (up)
+            Vec3::new(0.0, 0.10, 0.0),   // 4 ahoge tip
+        ];
+        let r = vec![Quat::IDENTITY; 5];
+        let s = vec![Vec3::ONE; 5];
+        let parent = vec![None, Some(0), Some(1), Some(0), Some(3)];
+        let mut world_bind = vec![Mat4::IDENTITY; 5];
+        for i in 0..5 {
+            let local = Mat4::from_scale_rotation_translation(s[i], r[i], t[i]);
+            world_bind[i] = match parent[i] {
+                Some(p) => world_bind[p] * local,
+                None => local,
+            };
+        }
+        let ext = json!({ "VRMC_springBone": {
+            "specVersion": "1.0", "colliders": [], "colliderGroups": [],
+            "springs": [
+                { "name": "Hair", "joints": [
+                    { "node": 1, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.4 },
+                    { "node": 2, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.4 }
+                ]},
+                { "name": "HairAhoge", "joints": [
+                    { "node": 3, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.4 },
+                    { "node": 4, "stiffness": 1.0, "gravityPower": 0.0, "dragForce": 0.4 }
+                ]}
+            ]
+        }});
+        let run = |drape: f32| {
+            let mut sys = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+            sys.set_hair_drape(drape);
+            let mut w = world_bind.clone();
+            for _ in 0..120 {
+                sys.step(&mut w, 1.0 / 60.0);
+            }
+            sys
+        };
+        let calm = run(0.0);
+        let draped = run(6.0);
+        // joints: [0]=down root, [1]=down tip, [2]=ahoge root, [3]=ahoge tip
+        assert!(
+            draped.joints[1].cur_tail.y < calm.joints[1].cur_tail.y - 1e-3,
+            "drape should lower the hanging strand ({} !< {})",
+            draped.joints[1].cur_tail.y,
+            calm.joints[1].cur_tail.y
+        );
+        let ahoge_root_y = world_bind[3].to_scale_rotation_translation().2.y;
+        assert!(
+            draped.joints[3].cur_tail.y > ahoge_root_y,
+            "ahoge tip should still stand above its root ({} !> {ahoge_root_y})",
+            draped.joints[3].cur_tail.y
+        );
+        assert!(
+            (draped.joints[3].cur_tail.y - calm.joints[3].cur_tail.y).abs() < 5e-3,
+            "drape must barely touch the ahoge ({} vs {})",
+            draped.joints[3].cur_tail.y,
+            calm.joints[3].cur_tail.y
+        );
     }
 
     #[test]

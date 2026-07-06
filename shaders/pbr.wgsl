@@ -370,7 +370,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 全メッシュ共通のため、レンガ壁等の環境メッシュ(SSS=0)まで roughness↓＋clearcoat が
     // 乗って世界中が specular firefly でビカビカになる。塗布由来の濡れ(wet_p)は全メッシュ可。
     let gw_gate = select(0.0, 1.0, model == M_SKIN); // 全身濡れfloorは肌モデルのみ
-    let gw = clamp(camera.skin_params.x, 0.0, 1.0) * gw_gate;
+    let gw0 = clamp(camera.skin_params.x, 0.0, 1.0) * gw_gate;
+    // A/B(skin_params.y): 新=水膜フレネル＋筋ムラ＋環境反射 / 旧=均一クリアコート。
+    let wet_new = camera.skin_params.y > 0.5;
+    // 汗筋ムラ: 全身濡れを均一な水膜にしない。縦長ノイズ(Y低周波×XZ中周波)で「流れた筋/
+    // たまり」の濃淡を付ける＝均一テカリのプラ人形感を割る本丸。塗布(wet_p)は被覆勾配で
+    // 既に構造があるので触らない。world空間なので大移動では泳ぐが溶解ノイズと同じ割り切り。
+    let streak_n = vnoise3(vec3<f32>(in.world_position.x * 0.035, in.world_position.y * 0.005, in.world_position.z * 0.035));
+    // 濡れデバッグ(fx_params2.z): 1=筋ムラOFF / 2=環境反射OFF / 3=旧rough / 4=旧水膜倍率。
+    // アーティファクト(境界線等)の犯人切り分け用。0で全効果ON。
+    let wet_dbg = camera.fx_params2.z;
+    let dbg_no_streak = wet_dbg > 0.5 && wet_dbg < 1.5;
+    let dbg_no_env = wet_dbg > 1.5 && wet_dbg < 2.5;
+    let dbg_old_rough = wet_dbg > 2.5 && wet_dbg < 3.5;
+    let dbg_old_cc = wet_dbg > 3.5 && wet_dbg < 4.5;
+    let streak = select(select(1.0, mix(0.55, 1.3, streak_n), wet_new), 1.0, dbg_no_streak);
+    let gw = clamp(gw0 * streak, 0.0, 1.0);
     let wet_p = sqrt(paint_a);     // 塗布由来の濡れ
     let wet = max(wet_p, gw);      // 実効濡れ（roughness等に効く）
     let paint_luma = dot(paint.rgb, vec3<f32>(0.299, 0.587, 0.114));
@@ -396,7 +411,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_transmission = model == M_GLASS;
     // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。白い/暗い塗布問わず wet で艶を出す。
     // 瞳は角膜=常にツルツル＝低 rough で鋭い反射（濡れに依らず固定）。
-    let roughness = select(mix(clamp(in.material.y, 0.04, 1.0), 0.14, wet), 0.035, is_eye);
+    let rough_wet = select(select(0.14, 0.09, wet_new), 0.14, dbg_old_rough); // 新方式は水膜らしく更に鋭く
+    let roughness = select(mix(clamp(in.material.y, 0.04, 1.0), rough_wet, wet), 0.035, is_eye);
     let mat_z = in.material.z;
     // material[2]: 肌/ゼリー=SSS強度 / ガラス=transmission量（共に正値）
     let sss = select(0.0, clamp(mat_z, 0.0, 1.0), is_sss);
@@ -415,11 +431,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 塗布色へ寄せ、さらに白へ少し持ち上げる＝透明ガラスでなく白く濁った不透明な液の地色に。
     let albedo0 = mix(in.color.rgb * skin_tex, paint.rgb, opaque_body);
     let albedo1 = mix(albedo0, vec3<f32>(0.96, 0.95, 0.93), opaque_body * 0.22);
-    // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。A/B(skin_params.y): 新=smoothstep強化 / 旧=線形0.32。
-    let wet_new = camera.skin_params.y > 0.5;
+    // 濡れると暗くなる（水が光を吸う）＝濡れ感の核。A/B は上で定義済みの wet_new。
     // 濡れの暗化は控えめに。暗いダンジョンはアンビエントが弱く、albedo暗化が拡散/アンビ/SSS
     // 全てに効くため強いと肌が黒潰れする。「しっとり艶」は clearcoat 側で出す。
-    let dark_amt = select(0.18 * wet_clear, 0.10 * smoothstep(0.0, 1.0, wet_clear), wet_new);
+    // 筋ムラ(streak)が wet_clear に乗るので、暗化も筋状に濃淡が付く＝流れた汗の跡。
+    let dark_amt = select(0.18 * wet_clear, 0.14 * smoothstep(0.0, 1.0, wet_clear), wet_new);
     let albedo = albedo1 * (1.0 - dark_amt);
 
     // 誘電体の基本反射率 (F0)
@@ -448,6 +464,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
+    // スペキュラAA（法線分散→roughness床上げ・Kaplanyan NDFフィルタの簡易版）。
+    // 焼き込みメッシュの局所サブディブ境界/クリース/シルエットは法線が画素間で急変し、
+    // 低roughの鏡面（濡れ水膜）がそこを「境界線」や白ブロブとして露出させる。画素間の
+    // 法線分散ぶんだけ局所的に粗くして、滑らかな面のシャープさは保ったまま急変部だけ鈍らせる。
+    let n_var = dot(dpdx(n), dpdx(n)) + dot(dpdy(n), dpdy(n));
+    let spec_aa = min(0.20, 2.0 * n_var);
+    let rough_s = min(1.0, sqrt(roughness * roughness + spec_aa));
 
     let light_count = i32(light_data.ambient_and_count.a);
     let is_dark_room = false;
@@ -460,7 +483,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (is_dark_room) {
         ambient_base = ambient_base * 0.02;
     }
-    let ambient = ambient_base * (kd_ambient * albedo + f_ambient * 0.1);
+    // 濡れ環境反射(擬似IBL): 水膜は解析ライトの向きに依らず環境光を鏡面で拾う。視線の浅い
+    // 体側/輪郭ほど強い水膜フレネル＝ライト正面以外も「しっとり」見える濡れ感の主役。
+    // 全世界ビカビカ(firefly)防止で肌系のみ・強度は wet(筋ムラ込み)に比例。
+    let wet_env_f = 0.02 + 0.98 * pow(1.0 - n_dot_v, 3.0);
+    let wet_env = ambient_base * wet_env_f * wet * 1.5 * select(0.0, 1.0, wet_new && is_sss && !dbg_no_env);
+    let ambient = ambient_base * (kd_ambient * albedo + f_ambient * 0.1) + wet_env;
 
     var lo = vec3(0.0);
 
@@ -526,9 +554,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 拡散用の per-channel 重み（SSS新時のみ赤方シフト、それ以外はスカラー n_dot_l）
         let diff_w = select(vec3<f32>(n_dot_l), nl_rgb, sss_e > 0.0 && sss_use_new);
 
-        // Cook-Torrance BRDF
-        let ndf = distribution_ggx(n_dot_h, roughness);
-        let g = geometry_smith(n_dot_v, n_dot_l, roughness);
+        // Cook-Torrance BRDF（rough_s=スペキュラAA込みroughness）
+        let ndf = distribution_ggx(n_dot_h, rough_s);
+        let g = geometry_smith(n_dot_v, n_dot_l, rough_s);
         let f = fresnel_schlick(h_dot_v, f0);
 
         let numerator = ndf * g * f;
@@ -556,13 +584,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // micro: 水膜のごく僅かな粗さ揺らぎ。大きいと per-pixel に rough が振れて firefly（ギラつき）に
         // なるので極小に。cc_rough 下限も上げて極小鏡面の aliasing(チラ)を抑える。
         let micro = select(0.0, (hash21(in.world_position.xy * 0.6 + in.world_position.zz * 0.6) - 0.5) * 0.006, wet_new);
-        let cc_rough = select(0.05, clamp(0.07 + micro, 0.05, 0.12), wet_new);
+        let cc_rough0 = select(0.05, clamp(0.07 + micro, 0.05, 0.12), wet_new);
+        let cc_rough = min(0.6, sqrt(cc_rough0 * cc_rough0 + spec_aa)); // スペキュラAA込み
         let cc_ndf = distribution_ggx(n_dot_h, cc_rough);
         let cc_g = geometry_smith(n_dot_v, n_dot_l, cc_rough);
         let cc_f = fresnel_schlick(h_dot_v, select(vec3(0.04), vec3(0.02), wet_new));
-        let cc_graze = select(1.0, mix(1.0, 1.8, pow(1.0 - n_dot_v, 3.5)), wet_new); // 縁の水膜リム（チラ抑制で控えめ）
+        let cc_graze = select(1.0, mix(1.0, 2.4, pow(1.0 - n_dot_v, 3.0)), wet_new); // 縁の水膜リム
         let cc_bead = select(1.0, 1.0 + smoothstep(0.04, 0.22, wet_amt) * (1.0 - smoothstep(0.22, 0.6, wet_amt)) * 1.4, wet_new);
-        let cc_mult = select(2.5, 2.0, wet_new);
+        // 新方式の水膜倍率: F0=0.02(物理値)のままだと解析ライト強度では鈍く「しょぼい」の
+        // 主因だったため増強。筋ムラ(streak入り gw→wet_amt)で濃淡が付くので一様には飛ばない。
+        let cc_mult = select(select(2.5, 3.4, wet_new), 2.0, dbg_old_cc);
         let clearcoat = (cc_ndf * cc_g * cc_f) / (4.0 * n_dot_v * n_dot_l + 0.0001);
 
         // 髪: アニメ的な「天使の輪」帯。tangent を法線方向へずらして帯位置を作り(主=上/副=下)、
@@ -583,9 +614,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // 拡散は per-channel（SSS赤方シフト）、鏡面は上の spec_term（髪/瞳で切替）。
         // 濡れclearcoat(白い水膜艶)も肌/肉のみ。標準材(革/金具/布)には乗せない。
+        // シルエット(n_dot_v→0)で Cook-Torrance 分母が発散し 100 倍級の firefly になり、
+        // bloom 低解像バッファに乗って四角い白ブロブと化す→寄与ごと上限クランプで遮断。
         let cc_gate = select(0.0, 1.0, is_sss);
-        lo = lo + diffuse * radiance * diff_w + spec_term + sss_contrib
-             + clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead * cc_gate;
+        let cc_term = min(clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead * cc_gate,
+                          vec3<f32>(2.5));
+        lo = lo + diffuse * radiance * diff_w + spec_term + sss_contrib + cc_term;
     }
 
     // Emissive（発光）

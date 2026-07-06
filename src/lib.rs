@@ -25,6 +25,10 @@ pub mod gltf;
 // re-exports
 pub use math::{Point3, BoundingBox, Transform};
 pub use vertex::{GpuVertex, InstanceData, LineVertex};
+pub use vertex::{
+    MODEL_STANDARD, MODEL_SKIN, MODEL_HAIR, MODEL_EYE, MODEL_WATER, MODEL_FLUID, MODEL_GLASS,
+    MODEL_JELLY,
+};
 pub use light::{Light, LightKind, GpuLight, LightHeader, LightStorageData, LightUniform, MAX_LIGHTS};
 pub use mesh::{Vertex, RenderMesh};
 pub use ray::{Ray, RayHit};

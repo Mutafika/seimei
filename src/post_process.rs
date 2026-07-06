@@ -1440,6 +1440,17 @@ impl PostProcessPipeline {
                         },
                         count: None,
                     },
+                    // 深度テクスチャ（DoF用。textureLoad なのでサンプラ不要）
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -1451,7 +1462,8 @@ impl PostProcessPipeline {
         let composite_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Composite Pipeline Layout"),
-                bind_group_layouts: &[&composite_bind_group_layout],
+                // group0=合成テクスチャ群, group1=camera(グレード強度 fx_params.z 用)。
+                bind_group_layouts: &[&composite_bind_group_layout, camera_bind_group_layout],
                 push_constant_ranges: &[],
             });
 
@@ -1715,6 +1727,23 @@ impl PostProcessPipeline {
             .map(|e| &e.bevel_view)
             .unwrap_or(&dummy_view);
 
+        // DoF用 深度ビュー（gbuffer のシーン深度を使う。無ければ 1x1 ダミー。
+        // DoFは fx_params2.y=0 で既定OFFのため、ダミー時もシェーダ側で即 return される）。
+        let dof_dummy_depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("PP DoF Dummy Depth"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dof_dummy_view = dof_dummy_depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = self.gbuffer.as_ref()
+            .map(|g| &g.depth_view)
+            .unwrap_or(&dof_dummy_view);
+
         let composite_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Composite Bind Group"),
             layout: &self.composite_bind_group_layout,
@@ -1739,6 +1768,10 @@ impl PostProcessPipeline {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(bevel_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
             ],
         });
 
@@ -1760,6 +1793,7 @@ impl PostProcessPipeline {
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &composite_bg, &[]);
+            pass.set_bind_group(1, camera_bind_group, &[]); // グレード強度 fx_params.z
             pass.draw(0..3, 0..1);
         }
 
@@ -2175,6 +2209,22 @@ const COMPOSITE_SHADER: &str = r#"
 @group(0) @binding(2) var ssao_tex: texture_2d<f32>;
 @group(0) @binding(3) var samp: sampler;
 @group(0) @binding(4) var bevel_tex: texture_2d<f32>;
+// 被写界深度(DoF)用のシーン深度（生の非線形深度[0,1]）。textureLoad で読むためサンプラ不要。
+@group(0) @binding(5) var depth_tex: texture_depth_2d;
+
+// camera uniform（group 1）: グレード強度 fx_params.z / DoF量 fx_params2.y を実機操作盤から読む。
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+    position: vec4<f32>,
+    clip_min: vec4<f32>,
+    clip_max: vec4<f32>,
+    resolution: vec4<f32>,
+    skin_params: vec4<f32>,
+    fx_params: vec4<f32>,
+    fx_params2: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> camera: CameraUniform;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -2201,9 +2251,75 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3(0.0), vec3(1.0));
 }
 
+// 2D→1D ハッシュ（出力ディザ用）。
+fn hash21c(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 = p3 + dot(p3, vec3<f32>(p3.y, p3.z, p3.x) + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+// フィルミック・カラーグレード（tonemap後の 0..1 LDR に適用）。
+// パステル/アニメ調を壊さない控えめ設定: ①影をわずかに持ち上げハイライトを締める柔S字、
+// ②split-tone（影=寒色/ハイライト=暖色）で肌を血色よく、③軽い彩度上げで髪/瞳を発色。
+fn color_grade(c: vec3<f32>) -> vec3<f32> {
+    var x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+    let lum0 = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    // ① フィルミックS字（中心0.5軸のコントラスト＝のっぺり防止）。※まず効果を見せるため強め。
+    x = mix(x, x * x * (3.0 - 2.0 * x), 0.30);
+    // ② split-tone: 影を寒色・ハイライトを暖色へ振る（肌が映える）。
+    let warm = vec3<f32>(1.05, 1.008, 0.95);
+    let cool = vec3<f32>(0.97, 1.0, 1.045);
+    x *= mix(cool, warm, smoothstep(0.1, 0.9, lum0));
+    // ③ 彩度上げ（髪/瞳/血色を発色）。
+    let lum = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    x = mix(vec3<f32>(lum), x, 1.18);
+    return clamp(x, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// 被写界深度（DoF）: 画面中央付近の最近接深度(=手前の被写体=アバター)へオートフォーカスし、
+// それより奥ほどボカす。nearest-center フォーカスゆえ調整値に依らず被写体は常にシャープで、
+// 変わるのは「奥のボケ量」だけ＝暴発しにくい。fx_params2.y=量(0=OFF)。深度は非線形のままで、
+// K(深度→CoC係数)と量つまみを実機で合わせる。黄金角スパイラル16タップの gather ブラー。
+fn dof_color(uv: vec2<f32>, sharp: vec3<f32>) -> vec3<f32> {
+    let amount = camera.fx_params2.y;
+    if (amount < 0.01) { return sharp; }
+    let dims = vec2<i32>(textureDimensions(depth_tex));
+    let res = vec2<f32>(dims);
+    let lo = vec2<i32>(0, 0);
+    let hi = dims - vec2<i32>(1, 1);
+    // フォーカス深度 = 画面中央 5x5(間引き)の最近接。被写体を必ずシャープに保つ。
+    let c = dims / 2;
+    var focus = 1.0;
+    for (var oy = -2; oy <= 2; oy = oy + 1) {
+        for (var ox = -2; ox <= 2; ox = ox + 1) {
+            let p = clamp(c + vec2<i32>(ox * 6, oy * 6), lo, hi);
+            focus = min(focus, textureLoad(depth_tex, p, 0));
+        }
+    }
+    let K = 30.0;
+    let here = textureLoad(depth_tex, clamp(vec2<i32>(uv * res), lo, hi), 0);
+    let coc = clamp((here - focus) * K, 0.0, 1.0);
+    if (coc < 0.02) { return sharp; }
+    let radius = (coc * amount * 10.0) / res; // UV 半径（最大~10px）
+    let GA = 2.39996323;
+    var acc = sharp * coc;
+    var wsum = coc;
+    for (var i = 0; i < 16; i = i + 1) {
+        let fi = f32(i) + 0.5;
+        let rr = sqrt(fi / 16.0);
+        let off = vec2<f32>(cos(fi * GA), sin(fi * GA)) * radius * rr;
+        let suv = uv + off;
+        let td = textureLoad(depth_tex, clamp(vec2<i32>(suv * res), lo, hi), 0);
+        let w = clamp((td - focus) * K, 0.0, 1.0); // 手前(シャープ)タップは寄与小→背景へ滲ませない
+        acc = acc + textureSampleLevel(scene_tex, samp, suv, 0.0).rgb * w;
+        wsum = wsum + w;
+    }
+    return acc / max(wsum, 0.0001);
+}
+
 @fragment
 fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
-    var color = textureSample(scene_tex, samp, in.uv).rgb;
+    var color = dof_color(in.uv, textureSample(scene_tex, samp, in.uv).rgb);
 
     // Bloom加算
     let bloom = textureSample(bloom_tex, samp, in.uv).rgb;
@@ -2217,11 +2333,16 @@ fn fs_composite(in: VertexOutput) -> @location(0) vec4<f32> {
     let bevel = textureSample(bevel_tex, samp, in.uv).r;
     color *= bevel;
 
-    // トーンマッピング + ガンマ補正
+    // トーンマッピング → カラーグレード(強度=操作盤 fx_params.z) → ガンマ補正
     let mapped = aces_tonemap(color);
-    let gamma_corrected = pow(mapped, vec3(1.0 / 2.2));
+    let graded = mix(mapped, color_grade(mapped), clamp(camera.fx_params.z, 0.0, 1.0));
+    let gamma_corrected = pow(graded, vec3(1.0 / 2.2));
 
-    return vec4<f32>(gamma_corrected, 1.0);
+    // 出力ディザ(±0.5LSB): 8bitスワップチェーンへの量子化で淡い緩勾配(肌の陰影/濡れ暗化)が
+    // 等高線状のバンディングになるのを、画素ハッシュノイズで階調誤差に拡散して潰す。
+    let dither = (hash21c(in.uv * camera.resolution.xy) - 0.5) / 255.0;
+
+    return vec4<f32>(gamma_corrected + vec3<f32>(dither), 1.0);
 }
 "#;
 

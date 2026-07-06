@@ -201,6 +201,15 @@ impl AvatarController {
         self.paused = !self.paused;
     }
 
+    /// 診断用スクラブ: **再生直後(clip 先頭 time=0)** のクリップを時刻 `t`(s)まで一気に進めて
+    /// 凍結する。以後 pause＝`update` が進めないので、次に `play_*`/`play_custom` を呼ぶまで
+    /// そのフレームのポーズを保持。多角度で1フレームを検分する用途。`t` はクリップ長未満で呼ぶこと
+    /// （Once クリップは終端で再生停止＝bind ポーズに落ちるため）。
+    pub fn scrub_to(&mut self, t: f32) {
+        self.player.update(t.max(0.0));
+        self.paused = true;
+    }
+
     pub fn is_spinning(&self) -> bool {
         self.spinning
     }

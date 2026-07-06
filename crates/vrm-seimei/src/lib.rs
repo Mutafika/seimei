@@ -651,6 +651,17 @@ impl VrmAvatar {
         }
     }
 
+    /// Extra downward pull on hair strands, weighted per strand by how far its rest
+    /// already points down — so hanging strands drape while ahoge / flicked tips (rest
+    /// pointing up/out) keep springing up. Unlike `set_gravity_boost` (uniform over all
+    /// 揺れもの), this lets a host make hair hang without slumping those accent strands or
+    /// touching bust/skirt. 0 disables. No-op if the model has no spring config.
+    pub fn set_hair_drape(&mut self, power: f32) {
+        if let Some(s) = self.spring.as_mut() {
+            s.set_hair_drape(power);
+        }
+    }
+
     /// Apply a steady external force (native space) to one named spring chain only —
     /// every joint whose `springs[].name` contains `name` (case-insensitive). Lets a
     /// host drive a single labelled secondary bone (e.g. orbit a force to slosh it)
