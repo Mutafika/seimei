@@ -115,6 +115,10 @@ pub struct Renderer {
     /// プレビュー更新のたびに静的線を全再アップロードせずに済む（毎フレーム全再構築の根絶）。
     preview_line_vertex_buffer: wgpu::Buffer,
     preview_line_vertex_count: u32,
+    /// 静的線のチャンク別バッファ（chunk_id → (buffer, count)）。カテゴリ/サブチャンク
+    /// 単位で部分更新できるため、1 要素の編集で変化したチャンクだけ再アップロードできる。
+    /// 単一 `line_vertex_buffer` と併存し、描画時は両方を描く。
+    line_chunks: std::collections::HashMap<u32, (wgpu::Buffer, u32)>,
     point_vertex_buffer: wgpu::Buffer,
     point_vertex_count: u32,
     // Meshes
@@ -421,6 +425,7 @@ impl Renderer {
             line_vertex_count: 0,
             preview_line_vertex_buffer,
             preview_line_vertex_count: 0,
+            line_chunks: std::collections::HashMap::new(),
             point_vertex_buffer,
             point_vertex_count: 0,
             meshes: HashMap::new(),
@@ -963,6 +968,45 @@ impl Renderer {
             &self.device, &self.queue, &mut self.preview_line_vertex_buffer,
             "Preview Line Vertex Buffer", vertices,
         );
+    }
+
+    /// 静的線チャンク `chunk_id` の頂点を更新する。空スライスはそのチャンクを削除する。
+    /// バッファはチャンクごとに保持し、必要に応じて確保・拡張する。
+    pub fn update_line_chunk(&mut self, chunk_id: u32, vertices: &[LineVertex]) {
+        if vertices.is_empty() {
+            self.line_chunks.remove(&chunk_id);
+            return;
+        }
+        let required_size = std::mem::size_of_val(vertices) as u64;
+        let entry = self.line_chunks.entry(chunk_id).or_insert_with(|| {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Line Chunk Buffer"),
+                size: required_size.max(std::mem::size_of::<LineVertex>() as u64 * 256),
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            (buffer, 0)
+        });
+        if required_size > entry.0.size() {
+            entry.0 = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Line Chunk Buffer"),
+                size: required_size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.queue.write_buffer(&entry.0, 0, bytemuck::cast_slice(vertices));
+        entry.1 = vertices.len() as u32;
+    }
+
+    /// 静的線チャンクを削除する。
+    pub fn remove_line_chunk(&mut self, chunk_id: u32) {
+        self.line_chunks.remove(&chunk_id);
+    }
+
+    /// 全静的線チャンクを削除する。
+    pub fn clear_line_chunks(&mut self) {
+        self.line_chunks.clear();
     }
 
     /// ポイントの頂点データを更新
@@ -1705,14 +1749,23 @@ impl Renderer {
                 shadow_pass.set_pipeline(shadow_pipeline);
                 shadow_pass.set_bind_group(0, shadow_light_vp_bg, &[]);
 
-                for (idx, (mesh_id, _)) in instances.iter().enumerate() {
+                // 深度のみのパス。連続同一 mesh_id をインスタンシングで 1 draw に統合する
+                // （深度出力は不変・約2倍だった影の draw call をランレングス分削減）。
+                let mut i = 0usize;
+                while i < instances.len() {
+                    let mesh_id = &instances[i].0;
+                    let mut j = i + 1;
+                    while j < instances.len() && &instances[j].0 == mesh_id {
+                        j += 1;
+                    }
                     if let Some(mesh) = self.meshes.get(mesh_id) {
-                        let offset = idx as u64 * instance_size;
+                        let offset = i as u64 * instance_size;
                         shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
                         shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                        shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
                     }
+                    i = j;
                 }
             }
 
@@ -1757,6 +1810,18 @@ impl Renderer {
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
             render_pass.draw(0..self.line_vertex_count, 0..1);
         }
+        // 静的線チャンク（部分更新用）を同一パイプラインで描く。線は深度ソート不要なので
+        // HashMap の順序で問題ない。チャンク数は数十で draw call は無害。
+        if !self.line_chunks.is_empty() {
+            render_pass.set_pipeline(&self.line_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            for (buffer, count) in self.line_chunks.values() {
+                if *count > 0 {
+                    render_pass.set_vertex_buffer(0, buffer.slice(..));
+                    render_pass.draw(0..*count, 0..1);
+                }
+            }
+        }
         // プレビュー線（作図中のラバーバンド等）を静的線の直後に同一パイプラインで描く。
         if self.preview_line_vertex_count > 0 {
             render_pass.set_pipeline(&self.line_pipeline);
@@ -1778,20 +1843,55 @@ impl Renderer {
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
 
-        for (idx, (mesh_id, _)) in instances[..opaque_count].iter().enumerate() {
+        // 連続する同一 mesh_id をハードウェアインスタンシングで 1 draw に統合する。
+        // 同一 mesh なら texture/paint も同一なので bind group はラン先頭で 1 回設定。
+        // 色・材質・finish 等の per-instance 属性は instance_buffer の連番スロットから
+        // instance_index で引かれるため、`base..base+run` の範囲描画で各インスタンスが
+        // 正しい属性を得る（bamiri 側が不透明区間を mesh_id で安定グルーピング済みなら
+        // n→1、未グルーピングでもラン長 1 で従来と同一挙動＝後方互換）。
+        let opaque = &instances[..opaque_count];
+        let mut i = 0usize;
+        while i < opaque.len() {
+            let mesh_id = &opaque[i].0;
+            let mut j = i + 1;
+            while j < opaque.len() && &opaque[j].0 == mesh_id {
+                j += 1;
+            }
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                 render_pass.set_bind_group(2, tex_bind_group, &[]);
                 // group 3 = 体表塗布(色+被覆 / 塗布時法線 を束ねた1グループ)。無ければ透明。
                 let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                 render_pass.set_bind_group(3, paint_bg, &[]);
-                let offset = idx as u64 * instance_size;
+                let offset = i as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                render_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
             }
+            i = j;
         }
+    }
+
+    /// 不透明区間の draw call 数（＝連続同一 mesh_id ランの数・存在するメッシュのみ）。
+    /// bamiri 側が mesh_id で安定グルーピングすると共有 def が n→1 に統合されることを
+    /// ヘッドレスで検証するための stats。描画ロジックと同じラン走査を通す。
+    pub fn opaque_draw_call_count(&self, instances: &[(String, InstanceData)], opaque_count: usize) -> usize {
+        let opaque = &instances[..opaque_count.min(instances.len())];
+        let mut count = 0usize;
+        let mut i = 0usize;
+        while i < opaque.len() {
+            let mesh_id = &opaque[i].0;
+            let mut j = i + 1;
+            while j < opaque.len() && &opaque[j].0 == mesh_id {
+                j += 1;
+            }
+            if self.meshes.contains_key(mesh_id) {
+                count += 1;
+            }
+            i = j;
+        }
+        count
     }
 
     /// 半透明メッシュ `[opaque_count..)` を描画。
@@ -1933,16 +2033,26 @@ impl Renderer {
         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
         render_pass.set_bind_group(3, shadow_bg, &[]);
 
-        for (idx, (mesh_id, _)) in instances[..opaque_count].iter().enumerate() {
+        // 連続同一 mesh_id をインスタンシングで統合（シャドウ付き不透明パス）。
+        // group3=shadow はループ外で 1 回、group2=texture はランごとに 1 回設定。
+        let opaque = &instances[..opaque_count];
+        let mut i = 0usize;
+        while i < opaque.len() {
+            let mesh_id = &opaque[i].0;
+            let mut j = i + 1;
+            while j < opaque.len() && &opaque[j].0 == mesh_id {
+                j += 1;
+            }
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                 render_pass.set_bind_group(2, tex_bind_group, &[]);
-                let offset = idx as u64 * instance_size;
+                let offset = i as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                render_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
             }
+            i = j;
         }
     }
 
