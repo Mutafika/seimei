@@ -111,6 +111,10 @@ pub struct Renderer {
     instance_buffer: wgpu::Buffer,
     line_vertex_buffer: wgpu::Buffer,
     line_vertex_count: u32,
+    /// プレビュー線（作図中のラバーバンド等）専用バッファ。静的線とは別に持つことで、
+    /// プレビュー更新のたびに静的線を全再アップロードせずに済む（毎フレーム全再構築の根絶）。
+    preview_line_vertex_buffer: wgpu::Buffer,
+    preview_line_vertex_count: u32,
     point_vertex_buffer: wgpu::Buffer,
     point_vertex_count: u32,
     // Meshes
@@ -317,6 +321,13 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let preview_line_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Preview Line Vertex Buffer"),
+            size: std::mem::size_of::<LineVertex>() as u64 * 1024,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let point_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Point Vertex Buffer"),
             size: std::mem::size_of::<LineVertex>() as u64 * 10000,
@@ -408,6 +419,8 @@ impl Renderer {
             instance_buffer,
             line_vertex_buffer,
             line_vertex_count: 0,
+            preview_line_vertex_buffer,
+            preview_line_vertex_count: 0,
             point_vertex_buffer,
             point_vertex_count: 0,
             meshes: HashMap::new(),
@@ -939,6 +952,16 @@ impl Renderer {
         Self::update_vertex_buffer(
             &self.device, &self.queue, &mut self.line_vertex_buffer,
             "Line Vertex Buffer", vertices,
+        );
+    }
+
+    /// プレビュー線（作図中のラバーバンド等）の頂点データを更新。静的線とは独立に
+    /// 更新できるため、プレビュー中も静的線バッファを再アップロードしない。
+    pub fn update_preview_lines(&mut self, vertices: &[LineVertex]) {
+        self.preview_line_vertex_count = vertices.len() as u32;
+        Self::update_vertex_buffer(
+            &self.device, &self.queue, &mut self.preview_line_vertex_buffer,
+            "Preview Line Vertex Buffer", vertices,
         );
     }
 
@@ -1733,6 +1756,13 @@ impl Renderer {
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
             render_pass.draw(0..self.line_vertex_count, 0..1);
+        }
+        // プレビュー線（作図中のラバーバンド等）を静的線の直後に同一パイプラインで描く。
+        if self.preview_line_vertex_count > 0 {
+            render_pass.set_pipeline(&self.line_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.preview_line_vertex_buffer.slice(..));
+            render_pass.draw(0..self.preview_line_vertex_count, 0..1);
         }
     }
 
