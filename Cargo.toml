@@ -1,6 +1,6 @@
 [package]
 name = "seimei"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 description = "UI-agnostic 3D rendering library — wgpu + glam"
 license = "MIT"
