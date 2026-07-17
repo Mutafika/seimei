@@ -58,6 +58,8 @@ pub struct AvatarController {
     spinning: bool,
     body_yaw: f32,    // accumulated turntable yaw (hips Y)
     gait_period: f32, // current locomotion period (s); 0 = not walking → no arm swing
+    anim_speed: f32,  // clip playback rate multiplier (1.0 = real time). Locomotion can sync the
+                      // walk clip cadence to ground speed so feet plant (no foot-slide). 1.0 default.
     auto_blink: bool,
     blink_phase: f32,
     speech: Visemes,
@@ -93,6 +95,7 @@ impl AvatarController {
             avatar,
             player,
             paused: false,
+            anim_speed: 1.0,
             spinning: false,
             body_yaw: 0.0,
             gait_period: 0.0,
@@ -194,6 +197,12 @@ impl AvatarController {
         self.paused = false;
     }
 
+    /// Set the clip playback rate (1.0 = real time). Locomotion sets this to sync the walk clip's
+    /// foot cadence to ground speed so the stance foot stays planted (no foot-slide/skating).
+    pub fn set_anim_speed(&mut self, s: f32) {
+        self.anim_speed = s.clamp(0.05, 6.0);
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused
     }
@@ -293,7 +302,9 @@ impl AvatarController {
     /// active-ragdoll targets, etc. Unknown bones are pushed as new entries.
     pub fn update_with_overlay(&mut self, dt: f32, overlay: &[(&str, [f32; 3])]) -> Vec<RenderMesh> {
         if !self.paused {
-            self.player.update(dt);
+            // Clip advances at `anim_speed`× real time so locomotion can match the walk cadence to
+            // ground speed (feet plant instead of sliding). Springs/emotion below still use real dt.
+            self.player.update(dt * self.anim_speed);
         }
         // Spin turns the BODY (hips-Y yaw), which moves the hair/skirt spring
         // anchors so the secondary motion has something to react to.

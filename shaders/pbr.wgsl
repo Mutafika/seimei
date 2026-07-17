@@ -144,6 +144,7 @@ const M_WATER: i32 = 4;
 const M_FLUID: i32 = 5;
 const M_GLASS: i32 = 6;
 const M_JELLY: i32 = 7;
+const M_GEL: i32 = 8;
 
 // === Vertex/Instance Input ===
 struct VertexInput {
@@ -294,12 +295,85 @@ fn water_shade(in: VertexOutput) -> vec4<f32> {
     return vec4<f32>(col, alpha);
 }
 
+// === ゲル(gel): 柔らかい半透明カラーゲル（スライム/ゼリー体）。氷(FLUID=鏡面屈折)でも
+// 塗り像(JELLY=SSS前面白飛び)でもない中間＝「色を保った濡れた半透明ゲル」。反射(スペキュラ)は
+// 最小限、縁は白い空でなく地色を持ち上げた色付きフレネル(ゲルの厚み感)、背景屈折は無し。
+// material.x=縁(rim)の強さ / color.a=不透明度。中心は透け・縁(シルエット)ほど密＝体積に見せる。
+fn gel_shade(in: VertexOutput) -> vec4<f32> {
+    let n = normalize(in.world_normal);
+    let v = normalize(camera.position.xyz - in.world_position);
+    let wp = in.world_position;
+    let tint = in.color.rgb;
+
+    // 元テクスチャの明暗を拾って「水色単色」に塗る＝目/口/眉など描き込みが陰影として
+    // 移植される（彩度は捨てて gel の色に統一）。透明テクセル(まつげ/眉の余白)は捨てる。
+    let tex = textureSample(t_diffuse, s_diffuse, in.uv);
+    if (tex.a < 0.02) { discard; }
+    let tex_lum = dot(tex.rgb, vec3<f32>(0.299, 0.587, 0.114));
+    // 暗い描き込み(目/眉/口/睫毛)だけ強く暗く落とし、明るい肌側はflatに潰す＝顔立ちはくっきり出しつつ
+    // 体テクスチャの微細な明暗を縞として拾わない(コントラスト強+全域だと平坦部に縞が出た為)。
+    let detail = 0.20 + 0.80 * smoothstep(0.15, 0.72, tex_lum);
+
+    // 形を出す陰影: 多灯シーンは平均すると平坦(ウユニ塩湖状)で顔の起伏も消える。so 素のN·L平均に
+    // 加えて「視点+上方の固定キー光」と「上下グラデ(hemisphere)」で体・顔の凹凸を出す。影は暗く
+    // 落として立体感を確保（明部はブルーム閾下に抑える）。ラップはしない＝陰影を消さない。
+    var scene = 0.0;
+    var spec = 0.0;
+    var totw = 0.0;
+    let lc = i32(light_data.ambient_and_count.a);
+    for (var i = 0; i < lc; i = i + 1) {
+        let lt = light_data.lights[i];
+        var ld: vec3<f32>;
+        if (lt.direction_or_position_and_type.w < 0.5) {
+            ld = normalize(lt.direction_or_position_and_type.xyz);
+        } else {
+            ld = normalize(lt.direction_or_position_and_type.xyz - wp);
+        }
+        let inten = max(lt.color_and_intensity.a, 0.0);
+        scene = scene + clamp(dot(n, ld), 0.0, 1.0) * inten; // 素のN·L（陰影を残す）
+        let h = normalize(ld + v);
+        spec = spec + pow(max(dot(n, h), 0.0), 28.0) * inten;
+        totw = totw + inten;
+    }
+    let scene_n = scene / max(totw, 0.001); // 平均直射 [0,1]
+    let key = clamp(dot(n, normalize(v + vec3<f32>(0.0, 0.0, 0.55))), 0.0, 1.0); // 視点+上のキー光
+    let hemi = 0.5 + 0.5 * clamp(n.z, -1.0, 1.0); // 上向き=明/下向き=暗（起伏を出す）
+    let form = 0.30 * scene_n + 0.45 * key + 0.25 * hemi; // 形の主役はキー+hemi
+    let shade = 0.14 + 0.60 * form;       // [~0.14,0.74] 影を暗く落として立体感（顔の凹凸も出る）
+    spec = clamp(spec / max(totw, 0.001), 0.0, 1.0) * 0.06; // ごく淡い濡れ（テカらせない）
+
+    // 色付きフレネル縁: 縁ほど地色をわずかに持ち上げて（白い空でなく明るい同系色）＝ゲルの厚み感。
+    let ndv = max(dot(n, v), 1e-3);
+    let fres = pow(1.0 - ndv, 3.0);
+    let rim = clamp(fres * clamp(in.material.x, 0.0, 3.0), 0.0, 0.55);
+
+    var col = tint * shade * detail; // ★テクスチャの明暗を乗算＝顔立ち等が水色モノクロで出る
+    let edge = min(tint * 1.25, vec3<f32>(0.78)); // 縁は同系色を軽く持ち上げるだけ（白飛びさせない）
+    col = mix(col, edge, rim);
+    col = col + spec * mix(tint, vec3<f32>(1.0), 0.25); // ハイライトも色寄りで白飛び回避
+    col = clamp(col, vec3<f32>(0.0), vec3<f32>(0.88)); // 明部を抑える
+    // ★トーンマップ/ガンマは掛けない＝この透明パスは pp(HDR合成)側でトーンマップされる前提。
+    // 自前で aces+gamma すると二重処理で白飛びする(実測: 生tint出力は正常/自前TMは白化)。
+
+    // 透過度: ほぼ不透明ベース＋中心をわずかに透かす。★半透明を強くすると閉じた体の前面+背面が
+    // 通常αブレンドで重なり、明部ブルームと相まって白へ飽和する(実測)。so 不透明寄りで濁りを断つ。
+    let alpha = clamp((0.55 + in.color.a * 0.35 + fres * 0.10) * tex.a, 0.0, 1.0);
+    return vec4<f32>(col, alpha);
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @location(0) vec4<f32> {
     let model = in.model_id;
     // 水/濃い液は専用シェーディングへ（テクスチャ判定前に分岐）。
     if (model == M_WATER || model == M_FLUID) {
         return water_shade(in);
+    }
+    // ゲル: 柔らかい半透明カラーゲル（屈折なし・低スペキュラ）。テクスチャ判定前に分岐。
+    // ★背面ポリゴンは捨てる＝閉じた体の前面+背面が半透明で重なって「しましま」に見えるのを断つ
+    // （背景には透けるが自分の裏側は透けない＝透明感は残しつつ縞を消す。顔の抜けも解消）。
+    if (model == M_GEL) {
+        if (!front_facing) { discard; }
+        return gel_shade(in);
     }
     // クリップボックス判定
     if (camera.clip_min.w > 0.5) {
