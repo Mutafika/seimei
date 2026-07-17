@@ -1,0 +1,16 @@
+/target
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+
+# Claude Code runtime (scheduled-tasks lock 等のランタイム生成物)
+.claude/scheduled_tasks.lock
+
+# Downloaded / sample VRM assets — large binaries, not redistributed.
+# Examples take the model path as an arg, so the repo doesn't need them.
+*.vrm

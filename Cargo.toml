@@ -1,0 +1,35 @@
+[package]
+name = "seimei"
+version = "0.3.16"
+edition = "2024"
+description = "UI-agnostic 3D rendering library — wgpu + glam"
+license = "MIT"
+authors = ["MKD"]
+
+# seimei is the workspace root; sibling sub-crates (the VRM bridge etc.) live
+# under crates/. The root package is itself a member.
+[workspace]
+members = ["crates/*"]
+
+[features]
+default = ["gltf"]
+gltf = ["dep:gltf", "dep:image"]
+splat = []
+post-process = []
+egui = ["dep:egui", "dep:egui-wgpu"]
+
+[dependencies]
+wgpu = { version = "24", features = ["webgl"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+thiserror = "2.0"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+half = "2.4"
+
+# optional
+gltf = { version = "1.4", features = ["extras", "names", "extensions"], optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
+egui = { version = "0.31", optional = true }
+egui-wgpu = { version = "0.31", optional = true }

@@ -1,0 +1,17 @@
+[package]
+name = "vrm-seimei"
+version = "0.3.16"
+edition = "2024"
+description = "Bridge between vrm-anatomy (CPU skinning / VRM SDK) and seimei (wgpu renderer)"
+license = "MIT"
+
+[dependencies]
+seimei = { path = "../.." } # workspace-internal: resolves inside the seimei repo even when fetched as a git dep
+vrm-anatomy = { git = "https://github.com/Mutafika/vrm-anatomy.git", tag = "v0.1.0" }
+serde_json = "1.0"
+glam = "0.29"
+rayon = "1" # parallel CPU skinning across primitives (each primitive is independent)
+
+# The live winit/wgpu/egui viewer moved to its own crate (`vrm-viewer`); this crate
+# stays GUI-free so it can be embedded without pulling in a windowing stack. The
+# `parity` example is offline (no GUI deps).
