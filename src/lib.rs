@@ -48,5 +48,6 @@ pub use post_process::{PostProcessPipeline, GBuffer, SsaoPass, BloomPass, EdgeBe
 pub use dof::{DofPass, DofParams};
 pub use ssr::SsrPass;
 pub mod procedural;
+pub mod shader_lib;
 #[cfg(feature = "gltf")]
 pub use gltf::{load_gltf, load_gltf_from_bytes, GltfScene, GltfPrimitive, GltfMaterial, GltfError};
