@@ -145,6 +145,22 @@ const M_FLUID: i32 = 5;
 const M_GLASS: i32 = 6;
 const M_JELLY: i32 = 7;
 const M_GEL: i32 = 8;
+const M_IRIDESCENT: i32 = 9;
+
+// 薄膜干渉。膜の表と裏で反射した光が干渉して、強め合う波長だけが残る。
+//
+// ⚠ 虹のグラデーションを貼らないこと。位相から解けば、視線の角度が変わるだけで
+//   色が勝手に動く＝物理が絵を描く。貼った虹は角度に応じて動かないので、
+//   一目で「効果」だと分かる（シャボン玉を回しても色が変わらないのと同じ嘘）。
+//
+// `d` = 膜厚（正規化）。`cos_t` = 法線と視線の内積。
+// 斜めから見るほど膜の中の光路が延びる＝位相が回る。それが色の変化の全部。
+fn thin_film(d: f32, cos_t: f32) -> vec3<f32> {
+    let phase = d * 6.2831853 / max(cos_t, 0.22);
+    // R/G/B は波長が違う＝位相の回り方が違う。ここが干渉色の正体。
+    return 0.5 + 0.5 * cos(vec3<f32>(phase, phase * 0.86, phase * 0.71)
+                           + vec3<f32>(0.0, 2.09, 4.19));
+}
 
 // === Vertex/Instance Input ===
 struct VertexInput {
@@ -483,11 +499,19 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     let is_eye = model == M_EYE;
     let is_sss = model == M_SKIN || model == M_JELLY; // SSSを持つモデル
     let is_transmission = model == M_GLASS;
+    // 薄膜干渉（シャボン玉/油膜/貝殻/曜変の暈）。
+    // ⚠ material.z / albedo.a の意味がこのモデルだけ変わる（seimei の作法）。
+    //   z=膜厚のスケール、テクスチャの a=膜厚マップ＝「どこに膜が乗っているか」。
+    let is_iridescent = model == M_IRIDESCENT;
     // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。白い/暗い塗布問わず wet で艶を出す。
     // 瞳は角膜=常にツルツル＝低 rough で鋭い反射（濡れに依らず固定）。
     let rough_wet = select(select(0.14, 0.09, wet_new), 0.14, dbg_old_rough); // 新方式は水膜らしく更に鋭く
     let roughness = select(mix(clamp(in.material.y, 0.04, 1.0), rough_wet, wet), 0.035, is_eye);
     let mat_z = in.material.z;
+    // 膜厚。テクスチャの a が「どこに・どれだけ膜が乗っているか」、mat_z がその倍率。
+    // ⚠ 干渉モデル以外では a は被覆/透過なので、ここは is_iridescent で閉じること。
+    let film_amt = select(0.0, clamp(tex_color.a, 0.0, 1.0), is_iridescent);
+    let film_d = tex_color.a * select(0.0, mat_z, is_iridescent);
     // material[2]: 肌/ゼリー=SSS強度 / ガラス=transmission量（共に正値）
     let sss = select(0.0, clamp(mat_z, 0.0, 1.0), is_sss);
     let transmission = select(0.0, clamp(mat_z, 0.0, 1.0), is_transmission);
@@ -684,7 +708,11 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         // 強度は実機操作盤(fx_params): x=髪, y=瞳。0で各々OFF/通常。
         let spec_ggx = specular * radiance * n_dot_l * select(1.0, camera.fx_params.y, is_eye);
         let spec_hair = min(hair_tint * hair_spec * radiance * n_dot_l * camera.fx_params.x, albedo * 1.5 + vec3<f32>(0.1));
-        let spec_term = select(spec_ggx, spec_hair, is_hair);
+        // 薄膜干渉: 鏡面を干渉色で染める。⚠ 拡散には乗せないこと。
+        //   干渉は膜の表裏で反射した光が起こすので、中へ入って散った光（＝拡散）には出ない。
+        //   拡散まで虹にすると、プラスチックの玩具になる。
+        let spec_iri = spec_ggx * mix(vec3<f32>(1.0), thin_film(film_d, n_dot_v), film_amt);
+        let spec_term = select(select(spec_ggx, spec_hair, is_hair), spec_iri, is_iridescent);
 
         // 拡散は per-channel（SSS赤方シフト）、鏡面は上の spec_term（髪/瞳で切替）。
         // 濡れclearcoat(白い水膜艶)も肌/肉のみ。標準材(革/金具/布)には乗せない。

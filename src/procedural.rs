@@ -1,10 +1,91 @@
 //! プロシージャルメッシュ生成
 //!
-//! icosphere, cube, torus, plane, cylinder をコードで生成する。
+//! icosphere, cube, torus, plane, cylinder, lathe をコードで生成する。
 
 use crate::math::{Point3, Vec3D};
 use crate::mesh::{RenderMesh, Vertex};
 use std::f32::consts::PI;
+
+/// 回転体 — 断面の外形線を Y 軸まわりに回す。
+///
+/// `profile` は `(半径, 高さ)` の並び。轆轤と同じで、器はこれで出る（碗・壺・皿・杯）。
+/// `segments` は周方向の分割数。
+///
+/// ⚠ `profile` は「器の**断面**」であって「輪郭」ではない。
+///   碗なら、高台の底から外側を上って、口縁を回り込んで、内側を下って、
+///   見込み（内底）の中心まで——**一本の線で表と裏の両方を通る**こと。
+///   外側だけ回すと、裏の無い紙のような器になって、口縁に厚みが出ない。
+///
+/// 法線は profile の接線から出す（`(dy, -dr)` を回したもの）ので、
+/// ⚠ profile の向きがそのまま表裏を決める。逆順に渡すと法線が全部裏返る。
+///
+/// UV は `u = 周方向`、`v = 断面に沿った弧長`（0..1 に正規化）。
+/// 弧長で取るので、profile の点を詰めた所だけ UV が縮む、ということが起きない。
+pub fn lathe(profile: &[(f32, f32)], segments: u32) -> RenderMesh {
+    let mut mesh = RenderMesh::new();
+    if profile.len() < 2 || segments < 3 {
+        return mesh;
+    }
+    let n = profile.len();
+
+    // 断面に沿った弧長。UV の v になる。
+    let mut arc = vec![0.0f32; n];
+    for i in 1..n {
+        let (dr, dy) = (profile[i].0 - profile[i - 1].0, profile[i].1 - profile[i - 1].1);
+        arc[i] = arc[i - 1] + (dr * dr + dy * dy).sqrt();
+    }
+    let total = arc[n - 1].max(1e-6);
+
+    // 区間の法線（r,y 平面）。⚠ (dy, -dr)＝円筒の壁（接線が真上）で外向きになる向き。
+    let seg_normal = |i: usize| -> (f32, f32) {
+        let (dr, dy) = (profile[i + 1].0 - profile[i].0, profile[i + 1].1 - profile[i].1);
+        let len = (dr * dr + dy * dy).sqrt().max(1e-6);
+        (dy / len, -dr / len)
+    };
+    // 点の法線は隣り合う区間の平均＝面と面が滑らかに繋がる。
+    let mut nrm = Vec::with_capacity(n);
+    for i in 0..n {
+        let (a, b) = if i == 0 {
+            seg_normal(0)
+        } else if i == n - 1 {
+            seg_normal(n - 2)
+        } else {
+            let (p, q) = (seg_normal(i - 1), seg_normal(i));
+            (p.0 + q.0, p.1 + q.1)
+        };
+        let len = (a * a + b * b).sqrt().max(1e-6);
+        nrm.push((a / len, b / len));
+    }
+
+    for s in 0..=segments {
+        let u = s as f32 / segments as f32;
+        let theta = u * 2.0 * PI;
+        let (ct, st) = (theta.cos(), theta.sin());
+        for i in 0..n {
+            let (r, y) = profile[i];
+            let (nr, ny) = nrm[i];
+            mesh.add_vertex(Vertex::with_uv(
+                Point3::new_f32(ct * r, y, st * r),
+                Vec3D::new_f32(ct * nr, ny, st * nr),
+                [u, arc[i] / total],
+            ));
+        }
+    }
+
+    let nn = n as u32;
+    for s in 0..segments {
+        for i in 0..nn - 1 {
+            let a = s * nn + i;
+            let b = a + 1;
+            let c = a + nn;
+            let d = c + 1;
+            mesh.add_triangle(a, c, b);
+            mesh.add_triangle(b, c, d);
+        }
+    }
+
+    mesh
+}
 
 /// UVスフィア — 緯度経度で分割した球体
 pub fn sphere(radius: f32, segments: u32, rings: u32) -> RenderMesh {
@@ -589,4 +670,68 @@ pub fn water_plane(size: f32, y_level: f32, resolution: u32) -> RenderMesh {
     }
 
     mesh
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 円筒の断面を回したら円筒になる。法線が外を向いていること。
+    ///
+    /// ⚠ `lathe` の要は `(dy, -dr)` の向き。ここが逆だと器の内外が全部裏返り、
+    ///   しかもレンダラは「暗いな」としか言わないので、絵を見ても原因が分からない。
+    #[test]
+    fn lathe_wall_normals_point_outward() {
+        // 半径 1 の壁を真上へ。
+        let mesh = lathe(&[(1.0, -1.0), (1.0, 1.0)], 16);
+        assert!(!mesh.vertices.is_empty());
+        for v in &mesh.vertices {
+            let n = v.normal;
+            // 軸向きの成分は無く、法線は位置と同じ向き（＝外）。
+            assert!(n.y.abs() < 1e-4, "壁の法線が上下を向いている: {:?}", n.y);
+            let dot = n.x * v.position.x + n.z * v.position.z;
+            assert!(dot > 0.9, "法線が内を向いている: dot={dot}");
+        }
+    }
+
+    /// 断面を逆順に渡すと法線が反転する（＝向きが表裏を決める、の裏取り）。
+    #[test]
+    fn lathe_reversed_profile_flips_normals() {
+        let a = lathe(&[(1.0, -1.0), (1.0, 1.0)], 8);
+        let b = lathe(&[(1.0, 1.0), (1.0, -1.0)], 8);
+        let da = a.vertices[0].normal.x * a.vertices[0].position.x;
+        let db = b.vertices[0].normal.x * b.vertices[0].position.x;
+        assert!(da * db < 0.0, "逆順にしても法線が裏返っていない");
+    }
+
+    /// UV の v は断面の弧長。点を詰めても縮まないこと。
+    #[test]
+    fn lathe_v_follows_arc_length() {
+        // 下半分に点を詰める。弧長で取っていれば v は等間隔のまま。
+        let mesh = lathe(&[(1.0, 0.0), (1.0, 0.25), (1.0, 0.5), (1.0, 1.0)], 3);
+        let v: Vec<f32> = mesh.vertices[0..4].iter().map(|x| x.uv[1]).collect();
+        assert!((v[0] - 0.0).abs() < 1e-5);
+        assert!((v[1] - 0.25).abs() < 1e-5, "v が点の番号になっている: {:?}", v);
+        assert!((v[2] - 0.5).abs() < 1e-5, "v が点の番号になっている: {:?}", v);
+        assert!((v[3] - 1.0).abs() < 1e-5);
+    }
+
+    /// 潰れた入力で落ちない。
+    #[test]
+    fn lathe_degenerate_input_is_empty() {
+        assert!(lathe(&[], 16).vertices.is_empty());
+        assert!(lathe(&[(1.0, 0.0)], 16).vertices.is_empty());
+        assert!(lathe(&[(1.0, 0.0), (1.0, 1.0)], 2).vertices.is_empty());
+    }
+
+    /// 面の数が断面と分割から出る数と合う（穴が開いていない）。
+    #[test]
+    fn lathe_index_count() {
+        let (n, seg) = (5usize, 12u32);
+        let profile: Vec<(f32, f32)> = (0..n).map(|i| (1.0, i as f32 * 0.25)).collect();
+        let mesh = lathe(&profile, seg);
+        // 1区画あたり2枚、区画は (n-1) × seg。
+        assert_eq!(mesh.indices.len(), (n - 1) * seg as usize * 2 * 3);
+        assert_eq!(mesh.vertices.len(), (seg as usize + 1) * n);
+    }
 }
