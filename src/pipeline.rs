@@ -16,9 +16,6 @@ pub enum PipelineError {
 /// メインPBRシェーダーソース
 pub const SHADER_SOURCE: &str = include_str!("../shaders/pbr.wgsl");
 
-/// シャドウ付きPBRシェーダーソース
-pub const SHADER_WITH_SHADOW_SOURCE: &str = include_str!("../shaders/pbr_shadow.wgsl");
-
 /// スクリーンスペース屈折シェーダソース
 pub const SHADER_REFRACTION_SOURCE: &str = include_str!("../shaders/refraction.wgsl");
 
@@ -36,7 +33,7 @@ pub fn create_main_pipeline(
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     paint_bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, true, "Main Pipeline", 1)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout,true, "Main Pipeline", 1)
 }
 
 /// 半透明用パイプライン（深度書き込みOFF）
@@ -48,7 +45,7 @@ pub fn create_transparent_pipeline(
     texture_bind_group_layout: &wgpu::BindGroupLayout,
     paint_bind_group_layout: &wgpu::BindGroupLayout,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, false, "Transparent Pipeline", 1)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout,false, "Transparent Pipeline", 1)
 }
 
 /// 深度プリパス用パイプライン（深度のみ書き込み・色出力なし）。
@@ -115,7 +112,7 @@ pub fn create_main_pipeline_msaa(
     paint_bind_group_layout: &wgpu::BindGroupLayout,
     msaa_samples: u32,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, true, "Main Pipeline MSAA", msaa_samples)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout,true, "Main Pipeline MSAA", msaa_samples)
 }
 
 /// MSAA対応半透明パイプライン
@@ -128,7 +125,7 @@ pub fn create_transparent_pipeline_msaa(
     paint_bind_group_layout: &wgpu::BindGroupLayout,
     msaa_samples: u32,
 ) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout, false, "Transparent Pipeline MSAA", msaa_samples)
+    create_main_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, paint_bind_group_layout,false, "Transparent Pipeline MSAA", msaa_samples)
 }
 
 /// 線分用パイプライン
@@ -169,30 +166,10 @@ pub fn create_point_pipeline_msaa(
     create_line_or_point_pipeline(device, format, camera_bind_group_layout, wgpu::PrimitiveTopology::PointList, true, "Point Pipeline MSAA", msaa_samples)
 }
 
-/// シャドウマップ対応メインパイプライン（Group 3追加）
-pub fn create_main_pipeline_with_shadow(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    camera_bind_group_layout: &wgpu::BindGroupLayout,
-    light_bind_group_layout: &wgpu::BindGroupLayout,
-    texture_bind_group_layout: &wgpu::BindGroupLayout,
-    shadow_bind_group_layout: &wgpu::BindGroupLayout,
-) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_shadow_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, shadow_bind_group_layout, "Main Pipeline with Shadow", 1)
-}
-
-/// MSAA対応シャドウ付きメインパイプライン
-pub fn create_main_pipeline_with_shadow_msaa(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    camera_bind_group_layout: &wgpu::BindGroupLayout,
-    light_bind_group_layout: &wgpu::BindGroupLayout,
-    texture_bind_group_layout: &wgpu::BindGroupLayout,
-    shadow_bind_group_layout: &wgpu::BindGroupLayout,
-    msaa_samples: u32,
-) -> Result<wgpu::RenderPipeline, PipelineError> {
-    create_shadow_pipeline_impl(device, format, camera_bind_group_layout, light_bind_group_layout, texture_bind_group_layout, shadow_bind_group_layout, "Main Pipeline with Shadow MSAA", msaa_samples)
-}
+// シャドウ専用の別パイプライン（旧 create_main_pipeline_with_shadow*）は撤去した。
+// 影を点けると pbr.wgsl の劣化複製(pbr_shadow.wgsl＝塗布/濡れ/SSS/clearcoat/リム無し)へ
+// 切り替わる構造で、影と材質表現がトレードオフになっていたため。影は group 4 として
+// メイン/半透明パイプラインへ常設した（create_main_pipeline_impl）。
 
 /// Gaussian Splatting パイプライン
 pub fn create_splat_pipeline(
@@ -395,12 +372,14 @@ fn create_main_pipeline_impl(
     });
 
     // group 3 = 体表塗布マップ（テクスチャと同じ layout を流用＝texture+sampler）。
-    // シャドウ無効時のメイン/半透明パイプラインに常設し、pbr.wgsl の @group(3) と対応させる。
+    // 影は group を増やさず **group 1(light) に同居**させている（max_bind_groups=4 の制限）。
+    // ＝影ONで別シェーダへ切り替える旧方式をやめた（旧方式は pbr.wgsl の劣化複製を使っており、
+    // 影を点けると塗布/濡れ/SSS/clearcoat がごっそり落ちていた）。
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[
             camera_bind_group_layout,
-            light_bind_group_layout,
+            light_bind_group_layout, // group 1 = ライト uniform ＋ 影(深度tex/比較sampler/ライトVP)
             texture_bind_group_layout,
             paint_bind_group_layout, // group 3 = 体表塗布(色+被覆 / 塗布時法線 の2tex束)
         ],
@@ -452,80 +431,6 @@ fn create_main_pipeline_impl(
                     clamp: 0.0,
                 }
             },
-        }),
-        multisample: wgpu::MultisampleState {
-            count: msaa_samples,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-        multiview: None,
-        cache: None,
-    });
-
-    Ok(pipeline)
-}
-
-fn create_shadow_pipeline_impl(
-    device: &wgpu::Device,
-    format: wgpu::TextureFormat,
-    camera_bind_group_layout: &wgpu::BindGroupLayout,
-    light_bind_group_layout: &wgpu::BindGroupLayout,
-    texture_bind_group_layout: &wgpu::BindGroupLayout,
-    shadow_bind_group_layout: &wgpu::BindGroupLayout,
-    label: &str,
-    msaa_samples: u32,
-) -> Result<wgpu::RenderPipeline, PipelineError> {
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(SHADER_WITH_SHADOW_SOURCE.into()),
-    });
-
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(label),
-        bind_group_layouts: &[
-            camera_bind_group_layout,
-            light_bind_group_layout,
-            texture_bind_group_layout,
-            shadow_bind_group_layout,
-        ],
-        push_constant_ranges: &[],
-    });
-
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::layout(), InstanceData::layout()],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            unclipped_depth: false,
-            conservative: false,
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            // LessEqual: 同深度で後勝ち。VRMの重なりメッシュを描画順で制御するため。
-            depth_compare: wgpu::CompareFunction::LessEqual,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState {
             count: msaa_samples,

@@ -16,6 +16,10 @@ struct CameraUniform {
     fx_params2: vec4<f32>,
     // 溶解の焼き点: xyz=world座標の溶解中心, w=熱(0..1)。この点の近傍だけ溶け縁を焦がし光らせる。
     melt: vec4<f32>,
+    // 距離フォグ: x=密度(1/距離単位・0でOFF), y=効き始める距離, z=太陽方向の前方散乱強度, w=最大濃度。
+    fog_params: vec4<f32>,
+    // フォグ色（リニア）。屋外は空の地平線色に合わせると遠景が空へ溶ける。
+    fog_color: vec4<f32>,
 };
 
 @group(0) @binding(0)
@@ -37,11 +41,93 @@ struct LightUniform {
 @group(1) @binding(0)
 var<uniform> light_data: LightUniform;
 
-// === Group 2: Texture ===
+// 方向光 light[0] のシャドウマップ。**ライトの一部**として group 1 に同居させる
+// （max_bind_groups=4 で group を増やせない／影ONで別シェーダへ切り替える旧方式は塗布・濡れ・
+// SSS を失うのでやめた）。light_view_proj が単位行列の間は uv が範囲外に落ちて影なしになる。
+@group(1) @binding(1)
+var t_shadow: texture_depth_2d;
+@group(1) @binding(2)
+var s_shadow: sampler_comparison;
+// カスケードシャドウ。1枚では「足元の輪郭の鋭さ」と「建物1棟ぶんの射程」を両立できないので、
+// 近距離ほど小さい箱を密に、遠距離は大きい箱を粗く覆う。2x2 アトラスに4枚を詰めてある。
+struct ShadowUniform {
+    view_proj: array<mat4x4<f32>, 4>, // 各カスケードの world→ライトクリップ
+    splits: vec4<f32>,                // splits[i] = カスケード i の遠端（カメラからの距離）
+    biases: vec4<f32>,                // 各カスケードの深度バイアス
+    params: vec4<f32>,                // x=有効カスケード数(0=影なし), y=アトラス1テクセル
+};
+@group(1) @binding(3)
+var<uniform> shadow: ShadowUniform;
+
+/// 影係数 0..1（0=完全な影 / 1=陽当たり）。3x3 PCF で縁を柔らかくする。
+/// ライト空間の外・カスケード0枚（未設定）の画素は 1.0＝影なし。
+fn calc_shadow(world_pos: vec3<f32>, view_dist: f32) -> f32 {
+    let count = i32(shadow.params.x);
+    if (count <= 0) { return 1.0; }
+    // 距離でカスケードを選ぶ。どれにも入らない遠方は最後（一番広い）カスケードへ。
+    var ci = count - 1;
+    for (var i = 0; i < count; i = i + 1) {
+        if (view_dist < shadow.splits[i]) { ci = i; break; }
+    }
+    let lp = shadow.view_proj[ci] * vec4<f32>(world_pos, 1.0);
+    if (lp.w <= 0.0) { return 1.0; }
+    let ndc = lp.xyz / lp.w;
+    var uv = ndc.xy * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5, 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {
+        return 1.0;
+    }
+    // ⚠ PCF がタイルの外へ滲むと隣のカスケードの深度を読んで縁に影の帯が出る。
+    //   1タイル＝アトラスの半分なので、タイル内へ 2 テクセル分だけ内側に丸める。
+    let texel = shadow.params.y;
+    let inset = texel * 4.0; // タイル座標系（0..1）での2テクセル ＝ アトラスの4テクセル
+    uv = clamp(uv, vec2<f32>(inset), vec2<f32>(1.0 - inset));
+    let tile = vec2<f32>(f32(ci % 2), f32(ci / 2)) * 0.5;
+    let auv = tile + uv * 0.5;
+    let d = ndc.z - shadow.biases[ci];
+    var s = 0.0;
+    for (var y = -1; y <= 1; y = y + 1) {
+        for (var x = -1; x <= 1; x = x + 1) {
+            let o = vec2<f32>(f32(x), f32(y)) * texel;
+            s = s + textureSampleCompare(t_shadow, s_shadow, auv + o, d);
+        }
+    }
+    return s / 9.0;
+}
+
+// === Group 2: Texture（メッシュのマテリアル4枚束）===
 @group(2) @binding(0)
 var t_diffuse: texture_2d<f32>;
 @group(2) @binding(1)
 var s_diffuse: sampler;
+// 法線マップ（接空間・OpenGL 向き）。持たないメッシュには平ら(128,128,255)が入り摂動ゼロ。
+@group(2) @binding(2)
+var t_normal: texture_2d<f32>;
+// ARM: r=AO / g=Roughness / b=Metallic。持たないメッシュには白が入り、乗算で実質無効。
+@group(2) @binding(3)
+var t_arm: texture_2d<f32>;
+// エミッシブ（発光色そのもの・リニア）。持たないメッシュには黒が入り、加算で実質無効。
+// 「アルベド×係数」では蛍光灯や非常口サインのように"面の一部だけが光る"絵は作れないので、
+// スカラー係数(material.w)とは別にマップで持つ。glTF の emissiveFactor は取り込み時に焼き込む。
+@group(2) @binding(4)
+var t_emissive: texture_2d<f32>;
+
+/// 頂点タンジェント無しで法線マップを適用する（画面微分から接空間を組む定番手法）。
+/// メッシュ側に接線データを持たせずに済むので、既存の全メッシュに後付けできる。
+/// `nmap` は接空間法線（-1..1 にデコード済み）。平ら(0,0,1)なら `n` をそのまま返す。
+fn perturb_normal(n: vec3<f32>, wp: vec3<f32>, uv: vec2<f32>, nmap: vec3<f32>) -> vec3<f32> {
+    let dp1 = dpdx(wp);
+    let dp2 = dpdy(wp);
+    let duv1 = dpdx(uv);
+    let duv2 = dpdy(uv);
+    let dp2perp = cross(dp2, n);
+    let dp1perp = cross(n, dp1);
+    let t = dp2perp * duv1.x + dp1perp * duv2.x;
+    let b = dp2perp * duv1.y + dp1perp * duv2.y;
+    let m = max(dot(t, t), dot(b, b));
+    if (m <= 0.0) { return n; }
+    let inv = inverseSqrt(m);
+    return normalize(t * (inv * nmap.x) + b * (inv * nmap.y) + n * nmap.z);
+}
 
 // === Group 3: Paint map (体表塗布: 液の付着を UV 空間に塗り込み、面に合成) ===
 // rgb=塗布色, a=被覆率(0=素肌/1=塗り潰し)。塗布なしメッシュは透明(__paint_none__)が入る。
@@ -492,7 +578,10 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     let paint_grad = vec2<f32>(h_r - h_l, h_u - h_d);
 
     // マテリアルパラメータ
-    let metallic = clamp(in.material.x, 0.0, 1.0);
+    // ARM マップ (r=AO, g=Roughness, b=Metallic)。持たないメッシュは白＝乗算で恒等なので、
+    // 3チャネルとも material の係数へ素直に乗せてよい（素材のムラを係数に掛ける合成）。
+    let arm = textureSample(t_arm, s_diffuse, in.uv).rgb;
+    let metallic = clamp(in.material.x * arm.b, 0.0, 1.0);
     // シェーディングモデルは model_id で明示分岐（値域推定の sentinel を撤去＝標準材が誤って
     // 髪/瞳/肌の特殊分岐に巻き込まれる事故を構造的に排除）。
     let is_hair = model == M_HAIR;
@@ -506,7 +595,9 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     // 塗られた所は濡れて滑らか＝鋭いハイライト（液体の艶）。白い/暗い塗布問わず wet で艶を出す。
     // 瞳は角膜=常にツルツル＝低 rough で鋭い反射（濡れに依らず固定）。
     let rough_wet = select(select(0.14, 0.09, wet_new), 0.14, dbg_old_rough); // 新方式は水膜らしく更に鋭く
-    let roughness = select(mix(clamp(in.material.y, 0.04, 1.0), rough_wet, wet), 0.035, is_eye);
+    // rough も同じく「材質の rough に素材のムラを乗せる」乗算合成（素材が均一なら従来どおり）。
+    let rough_base = clamp(in.material.y * arm.g, 0.04, 1.0);
+    let roughness = select(mix(rough_base, rough_wet, wet), 0.035, is_eye);
     let mat_z = in.material.z;
     // 膜厚。テクスチャの a が「どこに・どれだけ膜が乗っているか」、mat_z がその倍率。
     // ⚠ 干渉モデル以外では a は被覆/透過なので、ここは is_iridescent で閉じること。
@@ -544,21 +635,37 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
 
     // 塗布の厚み勾配で法線を起伏（盛り上がり）。被覆率(=厚み)の勾配で縁が丸く盛り上がる＝
     // 濡れた塊の艶。bump は控えめにして「粒ごとの黒い縁取り/網目」を出さず、滑らかな盛りに。
-    let n_geo = normalize(in.world_normal);
+    // 両面シート照明: 布タグ(M_STANDARD かつ material.z>0.5)は裏面向き画素の法線を視線側へ反転。
+    // 開いたシート(服のフラップ等)の内面が「外向き法線のまま=未照明の灰色」に沈むのを断つ。
+    // 巻き順反転の複製で両面化したメッシュは front_facing が常に真のため n·v で裏面を判定する。
+    let n_raw = normalize(in.world_normal);
+    let v_dir = normalize(camera.position.xyz - in.world_position);
+    let n_geo = select(
+        n_raw,
+        -n_raw,
+        model == M_STANDARD && in.material.z > 0.5 && dot(n_raw, v_dir) < 0.0);
     // 無塗布(paint_a==0)では塗布由来の法線起伏を一切計算しない。乗算ゲート(... * paint_a)は、
     // paint_a==0 でも接線項(タンジェント未生成メッシュ等で normalize(0)=NaN になり得る)を
     // 巻き込むと 0×NaN=NaN となり陰影法線 n を破壊し、塗布の無い汎用メッシュ(壁等)が脱色・
     // 消失する回帰を生む(#2)。分岐ゲートにして未塗布は n_geo を素通しさせ、塗布導入前の描画と
     // bit 一致させる。塗布合成(roughness/albedo/clearcoat/opaque_floor)は paint_a==0 で有限値
     // に収束する(mix(x,_,0)=x, _*0=0)ため変更不要＝NaN源は法線起伏のみ。
+    // マテリアル法線マップ（接空間）。持たないメッシュは平ら＝ここは恒等（従来と一致）。
+    // 塗布の法線起伏より先に当てる＝素材の凹凸の上に液の盛りが乗る順序。
     var n = n_geo;
+    let nm_raw = textureSample(t_normal, s_diffuse, in.uv).rgb;
+    let nm = vec3<f32>(nm_raw.xy * 2.0 - 1.0, nm_raw.z * 2.0 - 1.0);
+    if (abs(nm.x) > 0.004 || abs(nm.y) > 0.004) {
+        n = perturb_normal(n_geo, in.world_position, in.uv, normalize(nm));
+    }
+    let n_geo2 = n;
     if (paint_a > 0.0) {
         let tb_t = normalize(in.world_tangent);
         let tb_b = normalize(in.world_bitangent);
         // 起伏: 白い塗布(濃い不透明な液)は厚い塊なので強く盛り上げる。透明濡れは薄い膜＝ほぼ平ら
         // （汗テカリと同じく面で均一にヌメッと光らせる）ので paint_white で起伏量を絞る。
         let paint_bump = 6.0 * mix(0.18, 1.0, paint_white);
-        n = normalize(n_geo - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
+        n = normalize(n_geo2 - paint_bump * paint_a * (paint_grad.x * tb_t + paint_grad.y * tb_b));
     }
     let v = normalize(camera.position.xyz - in.world_position);
     let n_dot_v = max(dot(n, v), 0.001);
@@ -586,7 +693,8 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     // 全世界ビカビカ(firefly)防止で肌系のみ・強度は wet(筋ムラ込み)に比例。
     let wet_env_f = 0.02 + 0.98 * pow(1.0 - n_dot_v, 3.0);
     let wet_env = ambient_base * wet_env_f * wet * 1.5 * select(0.0, 1.0, wet_new && is_sss && !dbg_no_env);
-    let ambient = ambient_base * (kd_ambient * albedo + f_ambient * 0.1) + wet_env;
+    // 環境光には素材の AO（ARM.r）を掛ける＝溝や葉の根元が環境光で浮かなくなる（無マップは1.0）。
+    let ambient = ambient_base * arm.r * (kd_ambient * albedo + f_ambient * 0.1) + wet_env;
 
     var lo = vec3(0.0);
 
@@ -721,11 +829,18 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
         let cc_gate = select(0.0, 1.0, is_sss);
         let cc_term = min(clearcoat * radiance * n_dot_l * wet_amt * cc_mult * cc_graze * cc_bead * cc_gate,
                           vec3<f32>(2.5));
-        lo = lo + diffuse * radiance * diff_w + spec_term + sss_contrib + cc_term;
+        // 影は light[0] が方向光の時だけ（＝太陽1灯ぶん）。点光源の影は別系統(アトラス)。
+        // 遮蔽されても環境光と他ライトは残るので真っ黒にはならない。
+        var shade = 1.0;
+        if (i == 0 && light_type < 0.5) {
+            shade = calc_shadow(in.world_position, length(camera.position.xyz - in.world_position));
+        }
+        lo = lo + (diffuse * radiance * diff_w + spec_term + sss_contrib + cc_term) * shade;
     }
 
-    // Emissive（発光）
-    let emissive = albedo * emissive_strength;
+    // Emissive（発光）= スカラー係数ぶん（アルベド全体が光る）＋ エミッシブマップぶん（面の
+    // どこが光るかを絵で持つ）。マップ側に glTF の emissiveFactor は取り込み時に焼き込み済み。
+    let emissive = albedo * emissive_strength + textureSample(t_emissive, s_diffuse, in.uv).rgb;
 
     // 塗布部に淡い白の底上げ＝影側でも透けて暗くならず「白く濁った不透明な液」に見える(擬似SSS)。
     let opaque_floor = opaque_body * vec3<f32>(0.20, 0.19, 0.18);
@@ -745,7 +860,32 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     // 溶け縁の焦げ光(琥珀)＝溶かしてる最中(heat>0)だけ。境界の帯を軽く焦がし、内側を淡く発光。
     let melt_glow = melt_edge * vec3<f32>(1.7, 0.55, 0.12);
     let char_dark = 1.0 - melt_edge * 0.45;
-    let color = (ambient + lo + emissive + opaque_floor + rim) * char_dark + melt_glow;
+    let lit = (ambient + lo + emissive + opaque_floor + rim) * char_dark + melt_glow;
+
+    // 距離フォグ（大気遠近）。遠くの物ほど空気の色に溶ける＝奥行きと空間の広さが出る。
+    // 屋外では硬い地平線を空へ溶かし、屋内では廊下の奥行きを作る。密度0で完全にOFF（既定）。
+    //
+    // 指数二乗フォグ: 近距離はほぼ素通し・遠距離で急に濃くなる＝手前の被写体を濁らせずに
+    // 遠景だけ溶ける（線形フォグだと近くの人物まで白っぽくなる）。
+    // ⚠ フォグは**トーンマップ前のリニア空間**で掛けること。tonemap 後に掛けると
+    //   露出の違う色を混ぜることになり、遠景だけ白く浮く。
+    var color = lit;
+    if (camera.fog_params.x > 0.0) {
+        let d = max(length(camera.position.xyz - in.world_position) - camera.fog_params.y, 0.0);
+        let t = d * camera.fog_params.x;
+        var f = (1.0 - exp(-t * t)) * camera.fog_params.w;
+        // 太陽方向の前方散乱: 逆光側のフォグは太陽の色で明るく光る（大気遠近の要）。
+        var fog_rgb = camera.fog_color.rgb;
+        if (camera.fog_params.z > 0.0 && light_count > 0) {
+            let l0 = light_data.lights[0];
+            if (l0.direction_or_position_and_type.w < 0.5) {
+                let sun = normalize(l0.direction_or_position_and_type.xyz);
+                let towards = pow(max(dot(-v, -sun), 0.0), 6.0) * camera.fog_params.z;
+                fog_rgb = fog_rgb + l0.color_and_intensity.rgb * l0.color_and_intensity.a * towards;
+            }
+        }
+        color = mix(color, fog_rgb, clamp(f, 0.0, 1.0));
+    }
 
     // ACES トーンマッピング
     let mapped = aces_tonemap(color);

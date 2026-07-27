@@ -25,9 +25,11 @@ fn pbr_compiles() {
     check("pbr.wgsl", seimei::SHADER_SOURCE);
 }
 
+/// 空＋体積雲の背景パス。**このテストが無いと、シェーダの構文ミスは起動時 panic でしか
+/// 分からない**（実際に `if` の後ろへ return を足して「instructions after return」で落ちた）。
 #[test]
-fn pbr_shadow_compiles() {
-    check("pbr_shadow.wgsl", seimei::SHADER_WITH_SHADOW_SOURCE);
+fn sky_cloud_compiles() {
+    check("sky_cloud.wgsl", include_str!("../shaders/sky_cloud.wgsl"));
 }
 
 #[test]

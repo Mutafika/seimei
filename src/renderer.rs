@@ -45,6 +45,11 @@ pub struct MeshInstance {
     /// 体表塗布マップの色id（group 3 で合成）。この id で「色+被覆 / 塗布時法線」を束ねた
     /// paint バインドグループを引く。None なら透明(__paint_none__)。
     pub paint_texture_id: Option<String>,
+    /// モデルローカルの境界箱 [min, max]。視錐台カリングの判定に使う（頂点更新時に再計算）。
+    pub aabb: [[f32; 3]; 2],
+    /// 視錐台カリングの対象にするか。**compute シェーダが頂点を直接書き換えるメッシュ**
+    /// （GPU布など）は CPU 側の AABB が古くなるので false にすること（画面端で消える）。
+    pub cull: bool,
 }
 
 /// Splatクラウドのレンダリングインスタンス
@@ -66,6 +71,84 @@ pub struct PointShadowCaster {
 }
 
 /// レンダラー
+/// 深度パス用ライトVPの1スロット幅（wgpu の uniform dynamic offset は 256B 境界）。
+const SHADOW_VP_SLOT: u64 = 256;
+
+/// 境界箱に足す余裕（世界単位）。頂点アニメ/スキニングで CPU 側 AABB より膨らむぶんの保険。
+/// ⚠ ここをケチると、画面端で腕や髪が消える。カリングの利得は「遠くの何百メッシュ」なので
+///   1メッシュぶんの余裕は損にならない。
+const CULL_MARGIN: f32 = 500.0;
+
+/// `[i, j)` の中で「連続して可視」な区間を (開始index, 長さ) で列挙する。
+/// カリングでインスタンシングのランが分断されても、見える塊ごとに1 draw で描けるようにする。
+fn visible_runs(vis: &[bool], i: usize, j: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut k = i;
+    while k < j {
+        if !vis.get(k).copied().unwrap_or(true) {
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < j && vis.get(k).copied().unwrap_or(true) {
+            k += 1;
+        }
+        out.push((start, k - start));
+    }
+    out
+}
+
+/// メッシュのローカル境界箱を求める。
+fn mesh_aabb(mesh: &RenderMesh) -> [[f32; 3]; 2] {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for v in &mesh.vertices {
+        let p = [v.position.x as f32, v.position.y as f32, v.position.z as f32];
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    if lo[0] > hi[0] {
+        return [[0.0; 3]; 2]; // 空メッシュ
+    }
+    [lo, hi]
+}
+
+/// view-projection から視錐台6平面を取り出す（Gribb-Hartmann）。
+/// 平面は正規化していない＝`n·c + d + r` の符号判定には影響しない（両辺が同じ倍率）。
+/// z の範囲は wgpu の [0,1] なので near は row2 そのもの（OpenGL の w+z ではない）。
+fn frustum_planes(vp: glam::Mat4) -> [glam::Vec4; 6] {
+    let m = vp.to_cols_array_2d(); // m[列][行]
+    let row = |r: usize| glam::Vec4::new(m[0][r], m[1][r], m[2][r], m[3][r]);
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2]
+}
+
+/// インスタンスが視錐台に掛かるか。model 行列でローカル AABB を世界へ移してから判定する。
+fn instance_visible(planes: &[glam::Vec4; 6], model: &[[f32; 4]; 4], aabb: &[[f32; 3]; 2]) -> bool {
+    let m = glam::Mat4::from_cols_array_2d(model);
+    let lo = glam::Vec3::from(aabb[0]);
+    let hi = glam::Vec3::from(aabb[1]);
+    let center = m.transform_point3((lo + hi) * 0.5);
+    // 回転付きでも安全な世界 extent = |3x3| * ローカル extent。
+    let e = (hi - lo) * 0.5 + glam::Vec3::splat(CULL_MARGIN);
+    let a = glam::Mat3::from_mat4(m);
+    let ext = glam::Vec3::new(
+        a.x_axis.x.abs() * e.x + a.y_axis.x.abs() * e.y + a.z_axis.x.abs() * e.z,
+        a.x_axis.y.abs() * e.x + a.y_axis.y.abs() * e.y + a.z_axis.y.abs() * e.z,
+        a.x_axis.z.abs() * e.x + a.y_axis.z.abs() * e.y + a.z_axis.z.abs() * e.z,
+    );
+    for p in planes {
+        let n = p.truncate();
+        let r = ext.x * n.x.abs() + ext.y * n.y.abs() + ext.z * n.z.abs();
+        if n.dot(center) + p.w + r < 0.0 {
+            return false; // この平面の外側に完全に居る
+        }
+    }
+    true
+}
+
 pub struct Renderer {
     // GPU resources
     device: Arc<wgpu::Device>,
@@ -92,6 +175,10 @@ pub struct Renderer {
     fx_params2: [f32; 4],
     /// 溶解の焼き点 [world x, y, z, 熱(0..1)]。毎フレーム camera uniform へ注入。
     melt: [f32; 4],
+    /// 距離フォグ [密度, 開始距離, 太陽散乱, 最大濃度]。毎フレーム camera uniform へ注入。
+    fog_params: [f32; 4],
+    /// フォグ色（リニア RGB + 予備）。
+    fog_color: [f32; 4],
     camera_bind_group: wgpu::BindGroup,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     // Group 1: Lights
@@ -129,18 +216,28 @@ pub struct Renderer {
     skip_clear: bool,
     clip_min: [f32; 4],
     clip_max: [f32; 4],
-    // === Shadow Map ===
+    // === Shadow Map（方向光 light[0] 用。リソースは常設し、深度パスの実行だけを切る）===
     shadow_enabled: bool,
-    shadow_depth_texture: Option<wgpu::Texture>,
-    shadow_depth_view: Option<wgpu::TextureView>,
-    shadow_sampler: Option<wgpu::Sampler>,
-    shadow_pipeline: Option<wgpu::RenderPipeline>,
-    shadow_bind_group: Option<wgpu::BindGroup>,
-    shadow_bind_group_layout: Option<wgpu::BindGroupLayout>,
-    shadow_light_vp_buffer: Option<wgpu::Buffer>,
-    shadow_light_vp_bind_group: Option<wgpu::BindGroup>,
+    #[allow(dead_code)] // view の裏付け（drop されるとバインドが無効になる）
+    shadow_map: wgpu::Texture,
+    shadow_map_view: wgpu::TextureView,
+    shadow_vp_buffer: wgpu::Buffer,           // group1 binding3（本描画のサンプル用・全カスケード）
+    shadow_cascade_vp_buffer: wgpu::Buffer,   // 深度パス用（256B刻み・dynamic offset で切替）
+    shadow_pipeline: Option<wgpu::RenderPipeline>, // 深度のみのパス
+    shadow_pass_bind_group: Option<wgpu::BindGroup>, // 深度パスの group0 = ライトVP(dynamic offset)
+    /// 有効カスケード数（深度パスが回すタイル数）。
+    shadow_cascade_count: usize,
+    /// 各カスケードのライトVP（深度パスのカリング判定に使う）。
+    shadow_cascade_vps: [[[f32; 4]; 4]; crate::shadow::SHADOW_CASCADES],
+    /// 視錐台カリングの計測値（描いた数 / 全数）。draw は &self なので atomic で持つ。
+    cull_visible: std::sync::atomic::AtomicUsize,
+    cull_total: std::sync::atomic::AtomicUsize,
     light_view_proj: [[f32; 4]; 4],
-    main_pipeline_with_shadow: Option<wgpu::RenderPipeline>,
+    /// シャドウ深度パスから外すメッシュID。空ドーム・遠景板のような「常にカメラを包む巨大メッシュ」は
+    /// ライト正射影の箱に必ず入るので、除外しないとシーン全体を覆う影を落とす（＝真っ暗になる）。
+    shadow_exclude: std::collections::HashSet<String>,
+    /// 空＋体積雲の背景（有効時のみ）。不透明メッシュより先に全画面へ描く。
+    sky: Option<crate::sky::SkyPass>,
     // === Point Light Shadow Atlas ===
     point_shadow_atlas: Option<wgpu::Texture>,
     point_shadow_atlas_view: Option<wgpu::TextureView>,
@@ -221,12 +318,101 @@ impl Renderer {
         });
         queue.write_buffer(&light_uniform_buffer, 0, bytemuck::bytes_of(&initial_light));
 
+        // 影（方向光シャドウマップ）は**ライトの一部**として group 1 に同居させる。
+        // 別 group にしないのは max_bind_groups=4 の制限（0=camera/1=light/2=texture/3=paint で満杯）。
+        // 常設なので「影ONで別シェーダへ切替」が不要になり、塗布/濡れ/SSS と影が両立する。
+        // ライトVPが単位行列の間は uv が範囲外に落ちて影係数 1.0＝影なし（従来の見た目と一致）。
+        let shadow_map = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Directional Shadow Map"),
+            size: wgpu::Extent3d {
+                width: SHADOW_MAP_SIZE,
+                height: SHADOW_MAP_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let shadow_map_view = shadow_map.create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_cmp_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Shadow Comparison Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
+        let identity_vp: [[f32; 4]; 4] = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        // 本描画のサンプル用: 全カスケードのVP＋分割距離＋バイアスを1本のUBOに束ねる。
+        let shadow_vp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Cascades"),
+            size: std::mem::size_of::<crate::shadow::ShadowUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &shadow_vp_buffer,
+            0,
+            bytemuck::bytes_of(&crate::shadow::ShadowUniform::disabled()),
+        );
+        // 深度パス用: カスケードごとのVPを 256B 境界に並べ、dynamic offset で切り替える
+        // （1パス内でタイルを描き分けるのに bind group を4つ作らずに済む）。
+        let shadow_cascade_vp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Cascade VP (depth pass)"),
+            size: (SHADOW_VP_SLOT * crate::shadow::SHADOW_CASCADES as u64) as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        for i in 0..crate::shadow::SHADOW_CASCADES {
+            queue.write_buffer(
+                &shadow_cascade_vp_buffer,
+                i as u64 * SHADOW_VP_SLOT,
+                bytemuck::bytes_of(&identity_vp),
+            );
+        }
+
         let light_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Light Bind Group Layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
@@ -245,6 +431,18 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: light_uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&shadow_map_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&shadow_cmp_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: shadow_vp_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -409,6 +607,8 @@ impl Renderer {
             fx_params: [0.6, 4.0, 1.0, 0.0],
             fx_params2: [0.4, 0.0, 0.0, 0.0],
             melt: [0.0, 0.0, 0.0, 0.0],
+            fog_params: [0.0, 0.0, 0.0, 0.0], // 既定OFF
+            fog_color: [0.0, 0.0, 0.0, 0.0],
             camera_bind_group,
             camera_bind_group_layout,
             light_uniform_buffer,
@@ -434,21 +634,19 @@ impl Renderer {
             clip_min: [0.0; 4],
             clip_max: [0.0; 4],
             shadow_enabled: false,
-            shadow_depth_texture: None,
-            shadow_depth_view: None,
-            shadow_sampler: None,
+            shadow_map,
+            shadow_map_view,
+            shadow_vp_buffer,
+            shadow_cascade_vp_buffer,
             shadow_pipeline: None,
-            shadow_bind_group: None,
-            shadow_bind_group_layout: None,
-            shadow_light_vp_buffer: None,
-            shadow_light_vp_bind_group: None,
-            light_view_proj: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            main_pipeline_with_shadow: None,
+            shadow_pass_bind_group: None,
+            shadow_cascade_count: 0,
+            shadow_cascade_vps: [identity_vp; crate::shadow::SHADOW_CASCADES],
+            cull_visible: std::sync::atomic::AtomicUsize::new(0),
+            cull_total: std::sync::atomic::AtomicUsize::new(0),
+            light_view_proj: identity_vp,
+            shadow_exclude: std::collections::HashSet::new(),
+            sky: None,
             point_shadow_atlas: None,
             point_shadow_atlas_view: None,
             point_shadow_casters: Vec::new(),
@@ -532,13 +730,24 @@ impl Renderer {
             usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         });
 
+        let cull = self.meshes.get(id).map_or(true, |m| m.cull);
         self.meshes.insert(id.to_string(), MeshInstance {
             vertex_buffer,
             index_buffer,
             index_count: mesh.indices.len() as u32,
             texture_id,
             paint_texture_id: None,
+            aabb: mesh_aabb(mesh),
+            cull,
         });
+    }
+
+    /// 視錐台カリングの対象から外す（compute で頂点を書き換えるメッシュ用）。
+    /// 頂点更新をまたいでも保持される。
+    pub fn set_mesh_cull(&mut self, id: &str, cull: bool) {
+        if let Some(m) = self.meshes.get_mut(id) {
+            m.cull = cull;
+        }
     }
 
     /// メッシュが登録済みか確認
@@ -630,7 +839,9 @@ impl Renderer {
                 self.queue.write_buffer(&e.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
                 self.queue.write_buffer(&e.index_buffer, 0, bytemuck::cast_slice(&mesh.indices));
             }
-            self.meshes.get_mut(id).unwrap().index_count = mesh.indices.len() as u32;
+            let e = self.meshes.get_mut(id).unwrap();
+            e.index_count = mesh.indices.len() as u32;
+            e.aabb = mesh_aabb(mesh); // 形が変わったら境界箱も追随（古いままだと消える）
             return;
         }
         let texture_id = self.meshes.get(id).and_then(|m| m.texture_id.clone());
@@ -664,7 +875,18 @@ impl Renderer {
         uniform.fx_params = self.fx_params;
         uniform.fx_params2 = self.fx_params2;
         uniform.melt = self.melt;
+        uniform.fog_params = self.fog_params;
+        uniform.fog_color = self.fog_color;
         self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// 距離フォグ（大気遠近）をセット。
+    /// `params` = [密度(1/距離単位・0でOFF), 効き始める距離, 太陽方向の前方散乱強度, 最大濃度(0..1)]、
+    /// `color` = フォグ色（リニア）。屋外なら空の地平線色に合わせると遠景が空へ溶ける。
+    /// 距離の単位は呼び元の世界座標系そのまま（ticsim は mm）。
+    pub fn set_fog(&mut self, params: [f32; 4], color: [f32; 3]) {
+        self.fog_params = params;
+        self.fog_color = [color[0], color[1], color[2], 0.0];
     }
 
     /// 溶解の焼き点をセット [world 座標 point, 熱(0..1)]。次の update_camera で反映。
@@ -711,174 +933,151 @@ impl Renderer {
         self.queue.write_buffer(&self.light_uniform_buffer, 0, bytemuck::bytes_of(&uniform));
     }
 
-    // ── シャドウマップ ──
+    // ── シャドウマップ（方向光 light[0]）──
+    // リソース（深度tex/比較sampler/ライトVP）は Renderer::new で常設し group1 に同居させている。
+    // ここで切るのは「深度パスを走らせるか」だけ＝影ON/OFFでパイプラインを組み替えない
+    // （旧実装は影ONで材質表現の劣る別シェーダへ切り替わり、塗布/濡れ/SSSが落ちていた）。
 
-    /// シャドウマップを有効化
+    /// シャドウ深度パスを有効化（初回に深度パス用パイプラインを作る）。
     pub fn setup_shadow_map(&mut self) -> Result<(), RendererError> {
-        let shadow_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Shadow Map"),
-            size: wgpu::Extent3d {
-                width: SHADOW_MAP_SIZE,
-                height: SHADOW_MAP_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_view = shadow_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let shadow_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Shadow Sampler"),
-            compare: Some(wgpu::CompareFunction::LessEqual),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let light_vp_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Shadow Light VP Buffer"),
-            size: std::mem::size_of::<[[f32; 4]; 4]>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // シャドウパス用バインドグループ
-        let shadow_pass_bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Shadow Pass Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
-
-        let shadow_pass_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Shadow Pass Bind Group"),
-            layout: &shadow_pass_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_vp_buffer.as_entire_binding(),
-            }],
-        });
-
-        let shadow_pipeline = crate::create_shadow_pipeline(&self.device, &shadow_pass_bgl)?;
-
-        // メインパス用 Group 3
-        let shadow_bind_group_layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Shadow Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        if self.shadow_pipeline.is_none() {
+            let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Shadow Pass Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                        // カスケードごとに 256B 刻みで VP を切り替える。
+                        has_dynamic_offset: true,
+                        min_binding_size: wgpu::BufferSize::new(64),
                     },
                     count: None,
-                },
-            ],
-        });
-
-        let shadow_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Shadow Bind Group"),
-            layout: &shadow_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
+                }],
+            });
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Shadow Pass Bind Group"),
+                layout: &bgl,
+                entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: light_vp_buffer.as_entire_binding(),
-                },
-            ],
-        });
-
-        // シーンパスの実フォーマット/実サンプル数に合わせて構築する。
-        // 固定の surface_format / 1サンプルで作ると、MSAA やポストプロセス(HDR)が
-        // 先に有効な状態でシャドウを有効化した瞬間に
-        // 「Render pipeline targets are incompatible with render pass」で落ちる
-        // （rebuild_pipelines は品質変更時しか走らないため、こちら側でも一致が必要）。
-        let main_pipeline_with_shadow = pipeline::create_main_pipeline_with_shadow_msaa(
-            &self.device,
-            self.scene_render_format(),
-            &self.camera_bind_group_layout,
-            &self.light_bind_group_layout,
-            &self.texture_manager.bind_group_layout,
-            &shadow_bind_group_layout,
-            self.scene_sample_count(),
-        )?;
-
-        self.shadow_depth_texture = Some(shadow_texture);
-        self.shadow_depth_view = Some(shadow_view);
-        self.shadow_sampler = Some(shadow_sampler);
-        self.shadow_pipeline = Some(shadow_pipeline);
-        self.shadow_bind_group = Some(shadow_bind_group);
-        self.shadow_bind_group_layout = Some(shadow_bind_group_layout);
-        self.shadow_light_vp_buffer = Some(light_vp_buffer);
-        self.shadow_light_vp_bind_group = Some(shadow_pass_bg);
-        self.main_pipeline_with_shadow = Some(main_pipeline_with_shadow);
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.shadow_cascade_vp_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(64),
+                    }),
+                }],
+            });
+            self.shadow_pipeline = Some(crate::create_shadow_pipeline(&self.device, &bgl)?);
+            self.shadow_pass_bind_group = Some(bg);
+        }
         self.shadow_enabled = true;
-
         info!("Shadow map enabled ({}x{})", SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
         Ok(())
     }
 
-    /// シャドウマップを無効化
+    /// シャドウ深度パスを止める。ライトVPを単位行列へ戻すので本描画のサンプルも範囲外＝影なしに
+    /// 戻る（古い深度が焼き付いたままにならない）。
     pub fn disable_shadow_map(&mut self) {
         self.shadow_enabled = false;
-        self.shadow_depth_texture = None;
-        self.shadow_depth_view = None;
-        self.shadow_sampler = None;
-        self.shadow_pipeline = None;
-        self.shadow_bind_group = None;
-        self.shadow_bind_group_layout = None;
-        self.shadow_light_vp_buffer = None;
-        self.shadow_light_vp_bind_group = None;
-        self.main_pipeline_with_shadow = None;
+        self.update_shadow_matrix([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]);
     }
 
-    /// シャドウマップが有効か
+    /// シャドウ深度パスが動いているか
     pub fn is_shadow_enabled(&self) -> bool {
         self.shadow_enabled
     }
 
-    /// シャドウマップ用のライトVP行列を更新
-    pub fn update_shadow_matrix(&mut self, light_view_proj: [[f32; 4]; 4]) {
-        self.light_view_proj = light_view_proj;
-        if let Some(ref buffer) = self.shadow_light_vp_buffer {
-            self.queue.write_buffer(buffer, 0, bytemuck::bytes_of(&light_view_proj));
+    /// シャドウ深度パスから外すメッシュIDを設定（空ドーム等の「カメラを包む巨大メッシュ」用）。
+    /// 呼ばなければ全メッシュが影を落とす。
+    pub fn set_shadow_exclude<I, S>(&mut self, ids: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.shadow_exclude = ids.into_iter().map(Into::into).collect();
+    }
+
+    // ── 空＋体積雲の背景 ──
+
+    /// 空の背景パスを有効化（既に有効なら何もしない）。屋外シーン用。
+    pub fn enable_sky(&mut self) {
+        if self.sky.is_none() {
+            info!(
+                "sky: fmt={:?} samples={} pp={} size={}x{}",
+                self.scene_render_format(),
+                self.scene_sample_count(),
+                self.post_process.is_some(),
+                self.width,
+                self.height
+            );
+            self.sky = Some(crate::sky::SkyPass::new(
+                &self.device,
+                self.scene_render_format(),
+                self.width,
+                self.height,
+            ));
         }
+    }
+
+    /// 空の背景パスを外す（屋内はクリア色に戻る）。
+    pub fn disable_sky(&mut self) {
+        self.sky = None;
+    }
+
+    pub fn is_sky_enabled(&self) -> bool {
+        self.sky.is_some()
+    }
+
+    /// 空のパラメータを更新（カメラ/太陽/時刻）。毎フレーム呼ぶ。無効時は何もしない。
+    pub fn update_sky(&mut self, u: &crate::sky::SkyUniform) {
+        let (w, h) = (self.width, self.height);
+        if let Some(s) = self.sky.as_mut() {
+            s.resize(&self.device, w, h);
+            s.update(&self.queue, u);
+        }
+    }
+
+    /// 方向光のライトVP行列を更新（深度パスの投影＝本描画のサンプル座標の両方に効く）。
+    /// 単位行列を入れると uv が範囲外に落ちて影なしになる＝屋内プリセットの既定。
+    pub fn update_shadow_matrix(&mut self, light_view_proj: [[f32; 4]; 4]) {
+        // 単一VP＝カスケード1枚（遠端は実質無限）。従来の呼び元をそのまま生かす。
+        self.update_shadow_cascades(&[light_view_proj], [f32::MAX; 4], [0.0015; 4]);
+    }
+
+    /// カスケードシャドウを更新する。`vps` は手前のカスケードから順（最大 SHADOW_CASCADES）、
+    /// `splits[i]` = カスケード i がカバーするカメラからの遠端距離、`biases[i]` = そのカスケードの
+    /// 深度バイアス（箱が大きいほど1テクセルの実距離が伸びるので大きくする）。
+    ///
+    /// 空スライスを渡すと影なし（＝深度パスも本描画のサンプルも無効）に戻る。
+    pub fn update_shadow_cascades(
+        &mut self,
+        vps: &[[[f32; 4]; 4]],
+        splits: [f32; 4],
+        biases: [f32; 4],
+    ) {
+        let n = vps.len().min(crate::shadow::SHADOW_CASCADES);
+        let mut u = crate::shadow::ShadowUniform::disabled();
+        for (i, vp) in vps.iter().take(n).enumerate() {
+            u.view_proj[i] = *vp;
+            // 深度パスはカスケードごとに dynamic offset で引く。
+            self.queue.write_buffer(
+                &self.shadow_cascade_vp_buffer,
+                i as u64 * SHADOW_VP_SLOT,
+                bytemuck::bytes_of(vp),
+            );
+        }
+        u.splits = splits;
+        u.biases = biases;
+        u.params[0] = n as f32;
+        self.shadow_cascade_count = n;
+        self.shadow_cascade_vps = u.view_proj;
+        self.light_view_proj = vps.first().copied().unwrap_or(u.view_proj[0]);
+        self.queue.write_buffer(&self.shadow_vp_buffer, 0, bytemuck::bytes_of(&u));
     }
 
     /// ポイントライトシャドウアトラスを初期化
@@ -1135,6 +1334,12 @@ impl Renderer {
             self.render_shadow_pass(instances, instance_size);
         }
 
+        // 視錐台カリング: カメラに映らないインスタンスは draw ごと省く。
+        // 校舎のように数百メッシュを置くと、全部を毎フレーム投げるだけで律速するので必須。
+        let vis = self.visibility(instances, glam::Mat4::from_cols_array_2d(&crate::camera::dmat4_to_f32(
+            camera.view_projection_matrix(),
+        )));
+
         // ポストプロセス有効時は HDR テクスチャに描画
         let has_pp = self.post_process.is_some();
         let scene_target = if has_pp {
@@ -1162,12 +1367,19 @@ impl Renderer {
             depth_view
         };
 
-        // メインパス
-        let use_shadow_pipeline = self.shadow_enabled
-            && self.main_pipeline_with_shadow.is_some()
-            && self.shadow_bind_group.is_some();
-
-        let color_load = if self.skip_clear {
+        // 空(背景)パスを先に描く＝色は既に埋まっているのでメインパスは色を消さない（深度は消す）。
+        // MSAA 経路では sky のパイプラインとサンプル数が食い違うので出さない（ticsim は PP 経路＝1)。
+        let sky_drawn = if self.scene_sample_count() == 1 {
+            if let Some(sky) = self.sky.as_ref() {
+                sky.render(encoder, render_view);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let color_load = if self.skip_clear || sky_drawn {
             wgpu::LoadOp::Load
         } else {
             wgpu::LoadOp::Clear(self.clear_color)
@@ -1198,11 +1410,7 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
 
-                if use_shadow_pipeline {
-                    self.draw_opaque_meshes_with_shadow(&mut pass, instances, opaque_count, instance_size);
-                } else {
-                    self.draw_opaque_meshes(&mut pass, instances, opaque_count, instance_size);
-                }
+                self.draw_opaque_meshes(&mut pass, instances, opaque_count, instance_size, &vis);
                 self.draw_splats_points_lines(&mut pass);
             }
 
@@ -1286,11 +1494,7 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            if use_shadow_pipeline {
-                self.draw_meshes_with_shadow(&mut render_pass, instances, opaque_count, instance_size);
-            } else {
-                self.draw_meshes(&mut render_pass, instances, opaque_count, instance_size);
-            }
+            self.draw_meshes(&mut render_pass, instances, opaque_count, instance_size, &vis);
             self.draw_splats_points_lines(&mut render_pass);
         }
 
@@ -1456,6 +1660,17 @@ impl Renderer {
             || self.quality_settings.edge_bevel != settings.edge_bevel;
 
         self.quality_settings = settings.clone();
+
+        // 影の ON/OFF を実際に反映する。従来は settings.shadow を保存するだけで深度パスが一度も
+        // 走らず、品質設定の「影」が無効なノブになっていた（＝方向光の影が一枚も落ちない原因）。
+        let want_shadow = settings.shadow != crate::ShadowQuality::Off;
+        if want_shadow != self.shadow_enabled {
+            if want_shadow {
+                self.setup_shadow_map()?;
+            } else {
+                self.disable_shadow_map();
+            }
+        }
 
         // ポストプロセス再構築（パイプラインの対象フォーマット判定より先に行う＝scene_render_format が
         // post_process の有無で分岐するため）。
@@ -1664,14 +1879,9 @@ impl Renderer {
         &self.light_bind_group
     }
 
-    /// シャドウ bind group（Group 3, 有効時のみ）
-    pub fn shadow_bind_group(&self) -> Option<&wgpu::BindGroup> {
-        self.shadow_bind_group.as_ref()
-    }
-
-    /// シャドウ bind group layout（有効時のみ）
-    pub fn shadow_bind_group_layout(&self) -> Option<&wgpu::BindGroupLayout> {
-        self.shadow_bind_group_layout.as_ref()
+    /// 方向光シャドウマップの深度ビュー（影は group1=light に同居するので専用 bind group は無い）。
+    pub fn shadow_map_view(&self) -> &wgpu::TextureView {
+        &self.shadow_map_view
     }
 
     /// テクスチャ読み込みヘルパー
@@ -1692,6 +1902,19 @@ impl Renderer {
     /// RGBAデータからリニア(非sRGB)テクスチャを登録（法線マップ等の値テクスチャ用）。
     pub fn register_texture_rgba_linear(&mut self, id: &str, width: u32, height: u32, rgba: &[u8]) {
         self.texture_manager.create_from_rgba_linear(&self.device, &self.queue, id, width, height, rgba);
+    }
+
+    /// アルベドテクスチャ `id` に法線マップ / ARM マップ(r=AO,g=Rough,b=Metal) / エミッシブマップを
+    /// 結び付ける。各枚を別々に register してから呼ぶ＝登録順に依存しない。
+    /// 指定しない側は既定（平ら法線・白ARM・黒エミッシブ＝無効）のまま。
+    pub fn set_texture_maps(
+        &mut self,
+        id: &str,
+        normal_id: Option<&str>,
+        arm_id: Option<&str>,
+        emissive_id: Option<&str>,
+    ) {
+        self.texture_manager.set_material_maps(&self.device, id, normal_id, arm_id, emissive_id);
     }
 
     // ── 内部ヘルパー ──
@@ -1722,9 +1945,9 @@ impl Renderer {
     /// シャドウ深度パスを実行
     fn render_shadow_pass(&self, instances: &[(String, InstanceData)], instance_size: u64) {
         if let (Some(shadow_depth_view), Some(shadow_pipeline), Some(shadow_light_vp_bg)) = (
-            &self.shadow_depth_view,
+            Some(&self.shadow_map_view),
             &self.shadow_pipeline,
-            &self.shadow_light_vp_bind_group,
+            &self.shadow_pass_bind_group,
         ) {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Shadow Render Encoder"),
@@ -1747,25 +1970,51 @@ impl Renderer {
                 });
 
                 shadow_pass.set_pipeline(shadow_pipeline);
-                shadow_pass.set_bind_group(0, shadow_light_vp_bg, &[]);
 
-                // 深度のみのパス。連続同一 mesh_id をインスタンシングで 1 draw に統合する
-                // （深度出力は不変・約2倍だった影の draw call をランレングス分削減）。
-                let mut i = 0usize;
-                while i < instances.len() {
-                    let mesh_id = &instances[i].0;
-                    let mut j = i + 1;
-                    while j < instances.len() && &instances[j].0 == mesh_id {
-                        j += 1;
+                // 2x2 アトラス。カスケードごとにビューポート（＋念のためシザー）をタイルへ絞り、
+                // dynamic offset でそのカスケードのライトVPへ切り替えて同じジオメトリを描く。
+                // 1パスで済ませる＝深度クリアは最初の1回だけ（パスを分けると他タイルが消える）。
+                let tile = crate::shadow::SHADOW_TILE_SIZE;
+                let cascades = self.shadow_cascade_count.max(1);
+                for c in 0..cascades {
+                    // カスケードの箱の外にある物は影を落とさない＝タイルごとに間引く。
+                    // 遠いカスケードほど箱が大きいので、近距離タイルほどよく効く。
+                    let vis = self.visibility(
+                        instances,
+                        glam::Mat4::from_cols_array_2d(&self.shadow_cascade_vps[c]),
+                    );
+                    let (tx, ty) = ((c % 2) as u32 * tile, (c / 2) as u32 * tile);
+                    shadow_pass.set_viewport(tx as f32, ty as f32, tile as f32, tile as f32, 0.0, 1.0);
+                    shadow_pass.set_scissor_rect(tx, ty, tile, tile);
+                    shadow_pass.set_bind_group(
+                        0,
+                        shadow_light_vp_bg,
+                        &[(c as u64 * SHADOW_VP_SLOT) as u32],
+                    );
+
+                    // 深度のみのパス。連続同一 mesh_id をインスタンシングで 1 draw に統合する
+                    // （深度出力は不変・約2倍だった影の draw call をランレングス分削減）。
+                    let mut i = 0usize;
+                    while i < instances.len() {
+                        let mesh_id = &instances[i].0;
+                        let mut j = i + 1;
+                        while j < instances.len() && &instances[j].0 == mesh_id {
+                            j += 1;
+                        }
+                        // 除外指定(遠景板等)は影を落とさない＝シーン全体を覆う偽の影を防ぐ。
+                        if !self.shadow_exclude.contains(mesh_id.as_str()) {
+                            if let Some(mesh) = self.meshes.get(mesh_id) {
+                                shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                                shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                                for (base, run) in visible_runs(&vis, i, j) {
+                                    let offset = base as u64 * instance_size;
+                                    shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                                    shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..run as u32);
+                                }
+                            }
+                        }
+                        i = j;
                     }
-                    if let Some(mesh) = self.meshes.get(mesh_id) {
-                        let offset = i as u64 * instance_size;
-                        shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
-                        shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                        shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
-                    }
-                    i = j;
                 }
             }
 
@@ -1780,8 +2029,9 @@ impl Renderer {
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
+        vis: &[bool],
     ) {
-        self.draw_opaque_meshes(render_pass, instances, opaque_count, instance_size);
+        self.draw_opaque_meshes(render_pass, instances, opaque_count, instance_size, vis);
         self.draw_transparent_meshes(render_pass, instances, opaque_count, instance_size, false);
     }
 
@@ -1832,12 +2082,41 @@ impl Renderer {
     }
 
     /// 不透明メッシュ `[0..opaque_count)` のみを main_pipeline で描画。
+    /// 各インスタンスが `vp` の視錐台に掛かるかを一括判定する。
+    /// `cull=false` のメッシュと未登録メッシュは常に true（消えるより描く方がマシ）。
+    fn visibility(&self, instances: &[(String, InstanceData)], vp: glam::Mat4) -> Vec<bool> {
+        let planes = frustum_planes(vp);
+        let mut visible = 0usize;
+        let v: Vec<bool> = instances
+            .iter()
+            .map(|(id, inst)| match self.meshes.get(id) {
+                Some(m) if m.cull => instance_visible(&planes, &inst.model, &m.aabb),
+                _ => true,
+            })
+            .collect();
+        for b in &v {
+            visible += *b as usize;
+        }
+        self.cull_visible.store(visible, std::sync::atomic::Ordering::Relaxed);
+        self.cull_total.store(instances.len(), std::sync::atomic::Ordering::Relaxed);
+        v
+    }
+
+    /// 直近の視錐台カリング統計 (描いた数, 全数)。効いているかを実機で見るための計測口。
+    pub fn cull_stats(&self) -> (usize, usize) {
+        (
+            self.cull_visible.load(std::sync::atomic::Ordering::Relaxed),
+            self.cull_total.load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     fn draw_opaque_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
+        vis: &[bool],
     ) {
         render_pass.set_pipeline(&self.main_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -1863,11 +2142,15 @@ impl Renderer {
                 // group 3 = 体表塗布(色+被覆 / 塗布時法線 を束ねた1グループ)。無ければ透明。
                 let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                 render_pass.set_bind_group(3, paint_bg, &[]);
-                let offset = i as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
+                // 視錐台外のインスタンスを飛ばす。ランの中で「連続して見える区間」だけを
+                // まとめて描く＝インスタンシングの統合を保ったまま間引ける。
+                for (base, run) in visible_runs(vis, i, j) {
+                    let offset = base as u64 * instance_size;
+                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..run as u32);
+                }
             }
             i = j;
         }
@@ -1985,77 +2268,6 @@ impl Renderer {
         }
     }
 
-    /// メッシュ描画（シャドウ対応）
-    fn draw_meshes_with_shadow<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        instances: &[(String, InstanceData)],
-        opaque_count: usize,
-        instance_size: u64,
-    ) {
-        let pipeline = self.main_pipeline_with_shadow.as_ref().unwrap();
-        let shadow_bg = self.shadow_bind_group.as_ref().unwrap();
-
-        // 不透明パス（シャドウ付き）
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.light_bind_group, &[]);
-        render_pass.set_bind_group(3, shadow_bg, &[]);
-
-        for (idx, (mesh_id, _)) in instances[..opaque_count].iter().enumerate() {
-            if let Some(mesh) = self.meshes.get(mesh_id) {
-                let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
-                render_pass.set_bind_group(2, tex_bind_group, &[]);
-                let offset = idx as u64 * instance_size;
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
-                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
-
-        // 半透明パス（シャドウなし）。屈折なし版（単一パス描画なので scene_copy は未確定）。
-        self.draw_transparent_meshes(render_pass, instances, opaque_count, instance_size, false);
-    }
-
-    /// 不透明メッシュ（シャドウ付き）のみを描画。屈折の2パス描画でパスAに使う。
-    fn draw_opaque_meshes_with_shadow<'a>(
-        &'a self,
-        render_pass: &mut wgpu::RenderPass<'a>,
-        instances: &[(String, InstanceData)],
-        opaque_count: usize,
-        instance_size: u64,
-    ) {
-        let pipeline = self.main_pipeline_with_shadow.as_ref().unwrap();
-        let shadow_bg = self.shadow_bind_group.as_ref().unwrap();
-        render_pass.set_pipeline(pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.light_bind_group, &[]);
-        render_pass.set_bind_group(3, shadow_bg, &[]);
-
-        // 連続同一 mesh_id をインスタンシングで統合（シャドウ付き不透明パス）。
-        // group3=shadow はループ外で 1 回、group2=texture はランごとに 1 回設定。
-        let opaque = &instances[..opaque_count];
-        let mut i = 0usize;
-        while i < opaque.len() {
-            let mesh_id = &opaque[i].0;
-            let mut j = i + 1;
-            while j < opaque.len() && &opaque[j].0 == mesh_id {
-                j += 1;
-            }
-            if let Some(mesh) = self.meshes.get(mesh_id) {
-                let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
-                render_pass.set_bind_group(2, tex_bind_group, &[]);
-                let offset = i as u64 * instance_size;
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
-                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..(j - i) as u32);
-            }
-            i = j;
-        }
-    }
-
     /// パイプラインを再構築（MSAA変更時）
     /// シーン描画パイプラインの対象カラーフォーマット。ポストプロセス有効時は HDR テクスチャ
     /// (Rgba16Float) へ描くのでそれに合わせる。無効時はサーフェスフォーマット直描き。
@@ -2122,15 +2334,7 @@ impl Renderer {
             &self.camera_bind_group_layout, msaa_samples,
         )?;
 
-        if self.shadow_enabled {
-            if let Some(ref shadow_bgl) = self.shadow_bind_group_layout {
-                self.main_pipeline_with_shadow = Some(pipeline::create_main_pipeline_with_shadow_msaa(
-                    &self.device, fmt,
-                    &self.camera_bind_group_layout, &self.light_bind_group_layout,
-                    &self.texture_manager.bind_group_layout, shadow_bgl, msaa_samples,
-                )?);
-            }
-        }
+        // 影はメイン/半透明パイプラインに常設（group1 同居）なので、ここで別途組み直すものは無い。
 
         info!("パイプライン再構築完了 (format: {:?}, MSAA: {}x)", fmt, msaa_samples);
         Ok(())

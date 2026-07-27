@@ -21,6 +21,17 @@ pub const DEFAULT_TEXTURE_ID: &str = "__default_white__";
 /// 白(DEFAULT)だと alpha=1 で全面が塗られてしまうため、塗布のフォールバックは透明にする。
 pub const PAINT_NONE_ID: &str = "__paint_none__";
 
+/// 既定の法線マップ（平ら = encode((0,0,1)) = (128,128,255)）。法線マップを持たないメッシュ用。
+/// これを引くと摂動量ゼロ＝従来どおり頂点法線そのままになる（機能追加が既存の見た目を変えない）。
+pub const DEFAULT_NORMAL_ID: &str = "__default_normal__";
+/// 既定の ARM マップ（AO=1 / Roughness=1 / Metallic=1 の白）。3チャネルとも material の係数へ
+/// 乗算で作用するので、白＝恒等＝マップを持たないメッシュは従来どおり係数そのままになる。
+pub const DEFAULT_ARM_ID: &str = "__default_arm__";
+/// 既定のエミッシブマップ（黒＝発光なし）。加算で作用するので黒＝恒等。
+/// 発光は「アルベドの何割」ではなく面のどこが光っているかの絵（蛍光灯・非常口サイン・モニタ）
+/// なので、スカラー係数ではなくマップで持つ。
+pub const DEFAULT_EMISSIVE_ID: &str = "__default_emissive__";
+
 /// GPU上のテクスチャとバインドグループ
 pub struct GpuTexture {
     pub texture: wgpu::Texture,
@@ -42,30 +53,6 @@ pub struct TextureManager {
 
 impl TextureManager {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Texture Bind Group Layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        // 体表塗布 group 3 用: 色+被覆(0/1) と 塗布時法線(2/3) の2テクスチャを1グループに束ねる。
         let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -82,6 +69,18 @@ impl TextureManager {
             ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
             count: None,
         };
+        // group 2 = メッシュのマテリアル束: 0=アルベド / 1=サンプラ / 2=法線 /
+        // 3=ARM (r=AO, g=Roughness, b=Metallic) / 4=エミッシブ。
+        // グループ「数」は増やさない（max_bind_groups=4）＝枚数はこのグループ内で増やす。
+        // マップを持たないメッシュには既定(平ら法線・白ARM・黒エミッシブ)が入り、
+        // 摂動ゼロ／乗算恒等／加算恒等で既存の見た目を一切変えない。
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Texture Bind Group Layout"),
+                entries: &[tex_entry(0), samp_entry(1), tex_entry(2), tex_entry(3), tex_entry(4)],
+            });
+
+        // 体表塗布 group 3 用: 色+被覆(0/1) と 塗布時法線(2/3) の2テクスチャを1グループに束ねる。
         let paint_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Paint Bind Group Layout"),
@@ -107,8 +106,18 @@ impl TextureManager {
             sampler,
         };
 
+        // 先に「法線/ARM/エミッシブの既定」を作る＝以降に作る全テクスチャがこれを束ねられる。
+        // 法線は平ら encode((0,0,1))=(128,128,255) / ARM は白(全チャネル恒等) / エミッシブは黒。
+        // いずれも値テクスチャなのでリニア（sRGB だと値が歪む）。
+        manager.create_from_rgba_linear(device, queue, DEFAULT_NORMAL_ID, 1, 1, &[128, 128, 255, 255]);
+        manager.create_from_rgba_linear(device, queue, DEFAULT_ARM_ID, 1, 1, &[255, 255, 255, 255]);
+        manager.create_from_rgba_linear(device, queue, DEFAULT_EMISSIVE_ID, 1, 1, &[0, 0, 0, 255]);
         manager.create_from_rgba(device, queue, DEFAULT_TEXTURE_ID, 1, 1, &[255, 255, 255, 255]);
         manager.create_from_rgba(device, queue, PAINT_NONE_ID, 1, 1, &[0, 0, 0, 0]);
+        // 既定3枚は自分自身をマップに束ねた状態で作られているので、正しい既定へ張り直す。
+        for id in [DEFAULT_NORMAL_ID, DEFAULT_ARM_ID, DEFAULT_EMISSIVE_ID] {
+            manager.set_material_maps(device, id, None, None, None);
+        }
         // 塗布なしメッシュ用の既定 paint グループ（色=透明 / 法線=透明）。
         manager.build_paint_bind_group(device, PAINT_NONE_ID, PAINT_NONE_ID, PAINT_NONE_ID);
         manager
@@ -241,20 +250,10 @@ impl TextureManager {
 
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(&format!("Texture Bind Group {}", id)),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        // 法線/ARM/エミッシブは既定（平ら・白・黒）で束ねる。実素材を持つメッシュは後から
+        // set_material_maps で差し替える。初期化中（既定テクスチャ自身の作成時）は自分の view で
+        // 埋め、最後に張り直す。
+        let bind_group = self.build_bind_group(device, id, &view, None, None, None);
 
         self.textures.insert(
             id.to_string(),
@@ -262,6 +261,61 @@ impl TextureManager {
         );
 
         debug!("テクスチャ作成: {} ({}x{})", id, width, height);
+    }
+
+    /// group 2 のバインドグループを組む。`normal`/`arm`/`emissive` が None なら既定
+    /// （平ら法線・白ARM・黒エミッシブ）を使い、それすら未作成（初期化途中）なら `own` で
+    /// 埋める＝どの順で作っても壊れない。
+    fn build_bind_group(
+        &self,
+        device: &wgpu::Device,
+        id: &str,
+        own: &wgpu::TextureView,
+        normal: Option<&str>,
+        arm: Option<&str>,
+        emissive: Option<&str>,
+    ) -> wgpu::BindGroup {
+        let pick = |explicit: Option<&str>, fallback: &str| -> &wgpu::TextureView {
+            explicit
+                .and_then(|k| self.textures.get(k))
+                .or_else(|| self.textures.get(fallback))
+                .map(|t| &t.view)
+                .unwrap_or(own)
+        };
+        let nrm = pick(normal, DEFAULT_NORMAL_ID);
+        let arm_v = pick(arm, DEFAULT_ARM_ID);
+        let emis = pick(emissive, DEFAULT_EMISSIVE_ID);
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("Texture Bind Group {}", id)),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(own) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(nrm) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(arm_v) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(emis) },
+            ],
+        })
+    }
+
+    /// 既存テクスチャ `id` に法線 / ARM / エミッシブマップを結び付ける（バインドグループを組み直す）。
+    /// 各マップは別々に登録しておき、ここで束ねる＝登録順に依存しない。
+    pub fn set_material_maps(
+        &mut self,
+        device: &wgpu::Device,
+        id: &str,
+        normal_id: Option<&str>,
+        arm_id: Option<&str>,
+        emissive_id: Option<&str>,
+    ) {
+        let Some(view) = self.textures.get(id).map(|t| t.view.clone()) else {
+            warn!("set_material_maps: テクスチャ未発見 {}", id);
+            return;
+        };
+        let bg = self.build_bind_group(device, id, &view, normal_id, arm_id, emissive_id);
+        if let Some(t) = self.textures.get_mut(id) {
+            t.bind_group = bg;
+        }
     }
 
     #[cfg(feature = "gltf")]

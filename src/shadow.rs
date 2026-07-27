@@ -3,8 +3,46 @@
 use crate::{GpuVertex, InstanceData};
 use crate::pipeline::PipelineError;
 
-/// シャドウマップの解像度
-pub const SHADOW_MAP_SIZE: u32 = 2048;
+/// シャドウマップ（カスケードアトラス）の解像度。2x2 に区切って各カスケードが1タイルを使う。
+pub const SHADOW_MAP_SIZE: u32 = 4096;
+
+/// カスケード数。近距離ほど小さい箱を密に、遠距離は大きい箱を粗く覆う＝1枚では両立できない
+/// 「足元の輪郭の鋭さ」と「建物1棟ぶんの射程」を同時に満たす。2x2 アトラス前提なので 4 固定。
+pub const SHADOW_CASCADES: usize = 4;
+/// アトラス1タイルの辺（＝カスケード1枚の実効解像度）。
+pub const SHADOW_TILE_SIZE: u32 = SHADOW_MAP_SIZE / 2;
+
+/// カスケードの GPU 表現（本描画のサンプル用・group1 binding3）。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShadowUniform {
+    /// 各カスケードのライトVP（world → ライトクリップ）。
+    pub view_proj: [[[f32; 4]; 4]; SHADOW_CASCADES],
+    /// 各カスケードの遠端（カメラからの距離）。手前から順に増える。
+    pub splits: [f32; 4],
+    /// 各カスケードの深度バイアス（箱が大きいほど1テクセルが覆う実距離が伸びるので大きくする）。
+    pub biases: [f32; 4],
+    /// x=有効カスケード数(0=影なし), y=アトラス1テクセル(1/SHADOW_MAP_SIZE), z/w=予備。
+    pub params: [f32; 4],
+}
+
+impl ShadowUniform {
+    /// 影なし（カスケード数0）。ライトVPは単位行列。
+    pub fn disabled() -> Self {
+        let ident = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        Self {
+            view_proj: [ident; SHADOW_CASCADES],
+            splits: [0.0; 4],
+            biases: [0.0; 4],
+            params: [0.0, 1.0 / SHADOW_MAP_SIZE as f32, 0.0, 0.0],
+        }
+    }
+}
 
 /// ポイントライトシャドウアトラスのサイズ
 pub const POINT_SHADOW_ATLAS_SIZE: u32 = 4096;

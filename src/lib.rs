@@ -16,6 +16,7 @@ pub mod quality;
 pub mod ply;
 pub mod splat;
 pub mod shadow;
+pub mod sky;
 pub mod post_process;
 pub mod dof;
 pub mod ssr;
@@ -34,16 +35,14 @@ pub use mesh::{Vertex, RenderMesh};
 pub use ray::{Ray, RayHit};
 pub use camera::{Camera, CameraUniform};
 pub use texture::{TextureManager, GpuTexture, TextureError, DEFAULT_TEXTURE_ID};
-pub use pipeline::{SHADER_SOURCE, SHADER_WITH_SHADOW_SOURCE};
-pub use pipeline::{
-    create_main_pipeline_with_shadow, create_main_pipeline_with_shadow_msaa,
-    create_splat_pipeline,
-};
+pub use pipeline::SHADER_SOURCE;
+pub use pipeline::create_splat_pipeline;
 pub use renderer::{Renderer, RendererError, MeshInstance, PointShadowCaster};
 pub use quality::{QualityPreset, QualitySettings, ShadowQuality, MsaaSamples};
 pub use ply::{PlyLoader, PlyPointCloud, GaussianCloud, GaussianPoint, PlyError};
 pub use splat::{GpuSplat, SplatCloudData, SPLAT_SHADER_SOURCE};
 pub use shadow::{create_shadow_pipeline, SHADOW_MAP_SIZE};
+pub use sky::{SkyPass, SkyUniform};
 pub use post_process::{PostProcessPipeline, GBuffer, SsaoPass, BloomPass, EdgeBevelPass, PixelArtPass, PixelArtParams};
 pub use dof::{DofPass, DofParams};
 pub use ssr::SsrPass;
