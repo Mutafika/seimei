@@ -413,15 +413,7 @@ impl AvatarController {
         }
 
         // 外部物理オーバーレイ（PD揺れ・active-ragdoll目標等）を pose に加算。
-        for (bone, e) in overlay {
-            if let Some(p) = pose.iter_mut().find(|(n, _)| n == bone) {
-                p.1[0] += e[0];
-                p.1[1] += e[1];
-                p.1[2] += e[2];
-            } else {
-                pose.push((bone, *e));
-            }
-        }
+        merge_overlay(&mut pose, overlay);
 
         // 外部物理アンカー用に「ポーズ済み world 変換」を保存（skin_dynamic と同じ
         // pose から計算）。歩行で動く手などの生きた位置をここから取れる。
@@ -429,5 +421,46 @@ impl AvatarController {
 
         // skin_dynamic advances the spring-bone (揺れもの) sim by dt each frame.
         self.avatar.skin_dynamic(&pose, dt)
+    }
+
+    /// [`update_with_overlay`](Self::update_with_overlay) が組むのと同じベースポーズ
+    /// （現在のクリップ sample＋hips yaw＋synth 腕下ろし）に `overlay` を加算した FK world を、
+    /// **時間もシムも一切進めずに**返す。ホストが「この overlay を出したら体はどこへ来るか」を
+    /// 事前評価する口（ポーズ編集の接触クランプ等）。`world_for_pose` はバインド基準なので、
+    /// synth_arms の腕下ろし込みの表示位置とは一致しない＝必ずこちらを使う。
+    pub fn world_for_overlay(&self, overlay: &[(&str, [f32; 3])]) -> Vec<Mat4> {
+        let raw = self.player.sample();
+        let mut pose: Vec<(&str, [f32; 3])> = raw.iter().map(|(n, r)| (remap(n), *r)).collect();
+        if let Some(h) = pose.iter_mut().find(|(n, _)| *n == "hips") {
+            h.1[1] += self.body_yaw;
+        } else if self.body_yaw != 0.0 {
+            pose.push(("hips", [0.0, self.body_yaw, 0.0]));
+        }
+        if self.synth_arms {
+            let (ls, rs) = if self.gait_period > 0.0 {
+                let phase = self.player.current_time() / self.gait_period * std::f32::consts::TAU;
+                let s = ARM_SWING * self.gait_dir() * phase.sin();
+                (s, -s)
+            } else {
+                (self.arm_rest_swing, self.arm_rest_swing)
+            };
+            pose.extend(self.avatar.arms_pose(self.arm_down, ls, rs, self.arm_abduct));
+        }
+        merge_overlay(&mut pose, overlay);
+        self.avatar.world_for_pose(&pose)
+    }
+}
+
+/// overlay の各ボーン euler を pose へ加算（既存エントリには足し込み、無ければ追加）。
+/// `update_with_overlay` と `world_for_overlay` が同じ合成を共有するための共通部品。
+fn merge_overlay<'a>(pose: &mut Vec<(&'a str, [f32; 3])>, overlay: &[(&'a str, [f32; 3])]) {
+    for (bone, e) in overlay {
+        if let Some(p) = pose.iter_mut().find(|(n, _)| n == bone) {
+            p.1[0] += e[0];
+            p.1[1] += e[1];
+            p.1[2] += e[2];
+        } else {
+            pose.push((bone, *e));
+        }
     }
 }
