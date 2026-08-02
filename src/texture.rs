@@ -158,6 +158,11 @@ impl TextureManager {
             .unwrap_or_else(|| &self.paint_bind_groups[PAINT_NONE_ID])
     }
 
+    /// id のテクスチャが登録済みか（メッシュのテクスチャ結線の可否判定用）。
+    pub fn has(&self, id: &str) -> bool {
+        self.textures.contains_key(id)
+    }
+
     /// 既存テクスチャの中身だけを差し替える（バインドグループは作り直さない＝塗布マップの
     /// 毎フレーム更新を安価に）。サイズは作成時と同じである前提。未作成 id なら何もしない。
     pub fn update_rgba(&self, queue: &wgpu::Queue, id: &str, width: u32, height: u32, rgba: &[u8]) {
