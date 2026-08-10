@@ -122,6 +122,12 @@ pub struct SpringSystem {
     /// Names of the spring chains (vrm1 `springs[].name` / vrm0 group comment), indexed
     /// by `Joint::group`. Lets a host address one labelled chain by name.
     group_names: Vec<String>,
+    /// Support half-spaces the strands must stay on the outside of: `(point on plane,
+    /// outward unit normal)` in native space. Colliders are spheres/capsules parented to
+    /// bones, so a host can't express "the floor" or "the table this body lies on" with
+    /// them — long hair then falls straight through the surface it is resting on. Empty
+    /// (the default) is a no-op, so nothing changes for hosts that never set it.
+    planes: Vec<(Vec3, Vec3)>,
     /// Per-group steady external force (native space) added to every joint in that group,
     /// on top of gravity/wind. Lets a host drive one chain (e.g. a labelled secondary
     /// bone) without disturbing the others. Parallel to `group_names`; ZERO = none.
@@ -177,6 +183,7 @@ impl SpringSystem {
             wind_strength: 0.0,
             gravity_boost: 0.0,
             group_names,
+            planes: Vec::new(),
             group_drags,
             group_stiffs,
             group_forces,
@@ -473,6 +480,25 @@ impl SpringSystem {
         self.hair_drape
     }
 
+    /// Support surfaces the strands rest on: `(point on plane, outward unit normal)` in
+    /// native space. Each entry is a half-space; a joint tail that ends up behind one is
+    /// pushed back to its surface (the joint's own radius kept clear). Non-unit normals
+    /// are normalised; degenerate ones are dropped. Pass an empty slice to clear.
+    ///
+    /// Colliders come from the VRM and are parented to bones, so they can only describe
+    /// the body itself. Anything the body lies *on* — floor, bed, table — has to come
+    /// from the host, and without it long hair falls straight through that surface.
+    pub fn set_planes(&mut self, planes: &[(Vec3, Vec3)]) {
+        self.planes = planes
+            .iter()
+            .filter_map(|(p, n)| n.try_normalize().map(|n| (*p, n)))
+            .collect();
+    }
+
+    pub fn plane_count(&self) -> usize {
+        self.planes.len()
+    }
+
     /// Apply a steady external force (native space) to every joint whose chain name
     /// contains `name` (case-insensitive), on top of gravity/wind. Lets a host drive
     /// one labelled chain — e.g. orbit a force to slosh a specific secondary bone —
@@ -551,6 +577,7 @@ impl SpringSystem {
         let (wind_dir, wind_strength) = (self.wind_dir, self.wind_strength);
         let gravity_boost = self.gravity_boost;
         let hair_drape = self.hair_drape;
+        let planes = self.planes.clone();
         let group_forces = self.group_forces.clone();
         let group_drags = self.group_drags.clone();
         let group_stiffs = self.group_stiffs.clone();
@@ -692,6 +719,20 @@ impl SpringSystem {
                 next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
             }
 
+            // Support surfaces (floor / bed / table). Bone-parented colliders can't express
+            // them, so without this long hair drops straight through whatever the body is
+            // lying on. Push the tail back to the plane, then restore the bone length —
+            // same order as the collider passes above.
+            if !planes.is_empty() {
+                for (p, n) in &planes {
+                    let d = (next - *p).dot(*n) - j.radius;
+                    if d < 0.0 {
+                        next -= *n * d;
+                    }
+                }
+                next = world_pos + (next - world_pos).normalize_or_zero() * j.length;
+            }
+
             j.prev_tail = j.cur_tail;
             j.cur_tail = next;
 
@@ -807,6 +848,46 @@ mod tests {
                 jt.node
             );
         }
+    }
+
+    #[test]
+    fn support_plane_stops_strands_falling_through_it() {
+        // A strand hanging under gravity must come to rest ON a host-supplied support
+        // plane (floor / bed / table), not fall through it. Bone-parented colliders can't
+        // express such a surface, so without `set_planes` the tail sinks past it.
+        let (t, r, s, parent, world_bind) = rig();
+        let ext = json!({ "VRMC_springBone": {
+            "specVersion": "1.0",
+            "springs": [{ "name": "Hair", "joints": [
+                { "node": 1, "hitRadius": 0.0, "stiffness": 0.0, "gravityPower": 2.0, "gravityDir": [0.0,-1.0,0.0], "dragForce": 0.2 },
+                { "node": 2, "hitRadius": 0.0, "stiffness": 0.0, "gravityPower": 2.0, "gravityDir": [0.0,-1.0,0.0], "dragForce": 0.2 }
+            ]}]
+        }});
+        let settle = |sys: &mut SpringSystem| {
+            let mut world = world_bind.clone();
+            for _ in 0..240 {
+                sys.step(&mut world, 1.0 / 60.0);
+            }
+            sys.joints.iter().map(|j| j.cur_tail.y).fold(f32::MAX, f32::min)
+        };
+        // rig() anchors the strand at y=1.4 and each bone is 0.1 long, so free fall takes
+        // the lowest tail to ≈1.2. Put the plane above that and it must hold.
+        let floor = 1.3_f32;
+        let mut free = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        let low_free = settle(&mut free);
+        assert!(low_free < floor - 0.02, "no plane: strand should fall past {floor} (got {low_free})");
+
+        let mut held = SpringSystem::from_vrm1(&ext, &t, &r, &s, &parent, &world_bind).unwrap();
+        held.set_planes(&[(Vec3::new(0.0, floor, 0.0), Vec3::Y)]);
+        assert_eq!(held.plane_count(), 1);
+        let low_held = settle(&mut held);
+        assert!(low_held >= floor - 2e-3, "strand fell through the plane: {low_held} < {floor}");
+
+        // Non-unit normals are normalised, degenerate ones dropped; empty clears.
+        held.set_planes(&[(Vec3::ZERO, Vec3::new(0.0, 5.0, 0.0)), (Vec3::ZERO, Vec3::ZERO)]);
+        assert_eq!(held.plane_count(), 1, "zero normal must be dropped");
+        held.set_planes(&[]);
+        assert_eq!(held.plane_count(), 0);
     }
 
     #[test]

@@ -153,6 +153,12 @@ pub struct VrmAvatar {
     // プリセットに紐付かない morph（breast_size/waist/hips 等）にも開放する。
     body_morph_index: HashMap<String, (usize, usize)>,
     body_morph_weights: HashMap<String, f32>,  // 現在要求中の体型 morph weight
+
+    // --- スキン専用 post 回転 (twist bone 相当) ---
+    // node → 追加ローカル回転。スキン行列 `jm = world · post · inv_bind` にだけ掛かり、
+    // 子ボーンの FK には一切伝播しない＝捻り(軸回旋)を隣接ボーンの皮膚へ分散する用途。
+    // ヘルパーボーンを持たない VRM で candy-wrapper を緩める標準手筋。
+    skin_post: HashMap<usize, Mat4>,
 }
 
 impl VrmAvatar {
@@ -364,6 +370,7 @@ impl VrmAvatar {
             expr_weights: HashMap::new(),
             body_morph_index,
             body_morph_weights: HashMap::new(),
+            skin_post: HashMap::new(),
         })
     }
 
@@ -545,6 +552,17 @@ impl VrmAvatar {
         out
     }
 
+    /// スキン専用 post 回転 (twist bone 相当) を設定。`node` のスキン行列にだけローカル回転
+    /// `rot` を追加で掛ける（`Quat::IDENTITY` で解除）。FK・spring・子ボーンには影響しない＝
+    /// 軸回旋(捻り)を隣接ボーンの皮膚へ分散して candy-wrapper を緩める用途。
+    pub fn set_skin_post_rot(&mut self, node: usize, rot: Quat) {
+        if rot == Quat::IDENTITY {
+            self.skin_post.remove(&node);
+        } else {
+            self.skin_post.insert(node, Mat4::from_quat(rot));
+        }
+    }
+
     /// Skin every primitive against an already-computed node world-transform array.
     ///
     /// Public half of the **physics-insertion seam**: a consumer can do
@@ -563,7 +581,13 @@ impl VrmAvatar {
                     .joint_nodes
                     .iter()
                     .zip(&prim.inv_bind)
-                    .map(|(&node, ib)| to_row_major(world[node] * *ib))
+                    .map(|(&node, ib)| {
+                        // スキン専用 post 回転(twist 分散): world には残さないので子は不変。
+                        match self.skin_post.get(&node) {
+                            Some(p) => to_row_major(world[node] * *p * *ib),
+                            None => to_row_major(world[node] * *ib),
+                        }
+                    })
                     .collect();
                 // Apply active morph deltas to the bind positions (native space)
                 // before skinning. No active morph on this mesh → skin as-is.
@@ -659,6 +683,17 @@ impl VrmAvatar {
     pub fn set_hair_drape(&mut self, power: f32) {
         if let Some(s) = self.spring.as_mut() {
             s.set_hair_drape(power);
+        }
+    }
+
+    /// Support surfaces the 揺れもの rest on: `(point on plane, outward unit normal)` in
+    /// native space. VRM colliders are parented to bones, so they can only describe the
+    /// body; anything the body lies *on* (floor / bed / table) has to come from the host,
+    /// and without it long hair falls straight through it. Empty slice clears.
+    /// No-op if the model has no spring config.
+    pub fn set_spring_planes(&mut self, planes: &[(glam::Vec3, glam::Vec3)]) {
+        if let Some(s) = self.spring.as_mut() {
+            s.set_planes(planes);
         }
     }
 
