@@ -38,6 +38,7 @@ pub use texture::{TextureManager, GpuTexture, TextureError, DEFAULT_TEXTURE_ID};
 pub use pipeline::SHADER_SOURCE;
 pub use pipeline::create_splat_pipeline;
 pub use renderer::{Renderer, RendererError, MeshInstance, PointShadowCaster};
+pub use renderer::{depth_to_gray, depth_to_gray_over};
 pub use quality::{QualityPreset, QualitySettings, ShadowQuality, MsaaSamples};
 pub use ply::{PlyLoader, PlyPointCloud, GaussianCloud, GaussianPoint, PlyError};
 pub use splat::{GpuSplat, SplatCloudData, SPLAT_SHADER_SOURCE};

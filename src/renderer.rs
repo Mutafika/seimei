@@ -1361,6 +1361,9 @@ impl Renderer {
 
         // render_scale<1.0 かつ has_pp のときは内部 scaled 深度(self.depth_view)へ描く（色=scaled HDR と
         // サイズ一致＋SSAOのGBuffer深度と一致）。それ以外は従来どおり外部 depth_view（全解像度）。
+        if std::env::var("KASANE_DEBUG").is_ok() {
+            eprintln!("  [pass] has_pp={has_pp} render_scale={} samples={}", self.render_scale, self.scene_sample_count());
+        }
         let scene_depth: &wgpu::TextureView = if has_pp && self.render_scale < 1.0 {
             &self.depth_view
         } else {
@@ -1513,6 +1516,94 @@ impl Renderer {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, RendererError> {
+        Ok(self
+            .render_offscreen_impl(camera, instances, opaque_count, width, height, false)?
+            .0)
+    }
+
+    /// 同じ描画から **カラーと深度グレースケール**を返す。
+    ///
+    /// ★用途: 画像生成側へ渡す ControlNet-depth の制御画像。深度なら遮蔽が正しく入るので、
+    /// 腕が胴の手前を通れば腕が描かれ、後ろなら隠れる。関節をカプセルで描いて渡す方式は
+    /// 遮蔽を持てず、腕が胴に飲まれて一塊になって破綻した。
+    ///
+    /// 深度は「近い＝明るい」。ControlNet がその向きで学習されている。
+    ///
+    /// **MSAA 有効時は使えない。**マルチサンプルの深度テクスチャはバッファへコピーできず、
+    /// 深度には色のような resolve も無い。ポストプロセスが有効なら実サンプル数は 1 に
+    /// なるのでそのまま通る。
+    pub fn render_offscreen_with_depth(
+        &mut self,
+        camera: &Camera,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<u8>, Vec<u8>), RendererError> {
+        let (rgba, linear) = self.render_offscreen_with_linear_depth(
+            camera, instances, opaque_count, width, height,
+        )?;
+        Ok((rgba, depth_to_gray(&linear)))
+    }
+
+    /// 同じ描画から**カラーと線形深度**を返す。単位は視点からの距離、背景は `INFINITY`。
+    ///
+    /// ★グレースケール化を呼び出し側へ渡すため。階調は順位で配るので、床のように面積の
+    /// 大きい物が画面に入ると床が階調を持って行き、人物が狭い帯に潰れる。どの画素を基準に
+    /// 配るかを決められるのは、何が人物で何が背景かを知っているシーンの組み立て側だけ。
+    /// [`depth_to_gray_over`] と組で使う。
+    pub fn render_offscreen_with_linear_depth(
+        &mut self,
+        camera: &Camera,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        width: u32,
+        height: u32,
+    ) -> Result<(Vec<u8>, Vec<f32>), RendererError> {
+        let (rgba, depth) =
+            self.render_offscreen_impl(camera, instances, opaque_count, width, height, true)?;
+        match depth {
+            Some(d) => Ok((rgba, d)),
+            None => Err(RendererError::Rendering(
+                "depth readback needs a single-sampled scene; turn MSAA off or enable \
+                 post-processing (which already forces 1 sample)".into(),
+            )),
+        }
+    }
+
+    fn render_offscreen_impl(
+        &mut self,
+        camera: &Camera,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        width: u32,
+        height: u32,
+        want_depth: bool,
+    ) -> Result<(Vec<u8>, Option<Vec<f32>>), RendererError> {
+        // render_scale<1.0 かつポストプロセス有効のとき、シーンの深度は**内部の縮小深度**へ
+        // 描かれ、ここで渡す深度テクスチャは一度も書かれない。読み戻すと未初期化のまま
+        // ＝全面が同じ値になり、真っ白な深度マップが出る（実際そうなった）。
+        // 深度が要る間だけ等倍に戻す。色の見た目は変わらない。
+        let saved_scale = self.render_scale;
+        if want_depth && self.render_scale < 1.0 {
+            self.set_render_scale(1.0);
+        }
+        let result = self.render_offscreen_inner(camera, instances, opaque_count, width, height, want_depth);
+        if want_depth && saved_scale < 1.0 {
+            self.set_render_scale(saved_scale);
+        }
+        result
+    }
+
+    fn render_offscreen_inner(
+        &mut self,
+        camera: &Camera,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        width: u32,
+        height: u32,
+        want_depth: bool,
+    ) -> Result<(Vec<u8>, Option<Vec<f32>>), RendererError> {
         self.update_camera(camera);
 
         // シーンパスの実サンプル数（MSAA 有効なら 4 等・ポストプロセス時は 1）。
@@ -1542,7 +1633,11 @@ impl Renderer {
             sample_count: samples,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: if want_depth && samples == 1 {
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+            } else {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+            },
             view_formats: &[],
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1585,6 +1680,37 @@ impl Renderer {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+
+        // 深度は f32 1ch。同じ encoder に載せて submit を 1 回で済ませる。
+        let depth_row = (width * 4).div_ceil(align) * align;
+        let depth_buffer = (want_depth && samples == 1).then(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Offscreen Depth Output"),
+                size: (depth_row * height) as u64,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+
+        if let Some(db) = &depth_buffer {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &depth_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::DepthOnly,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: db,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(depth_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            );
+        }
 
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
@@ -1646,7 +1772,66 @@ impl Renderer {
         drop(data);
         output_buffer.unmap();
 
-        Ok(rgba)
+        let depth = match depth_buffer {
+            None => None,
+            Some(db) => Some(Self::read_depth_linear(
+                &self.device, &db, width, height, depth_row, camera,
+            )?),
+        };
+        Ok((rgba, depth))
+    }
+
+    /// 深度バッファを「近い＝明るい」8bit グレースケールへ。
+    ///
+    /// 二段階の変換が要る。深度バッファの値は透視除算後で非線形＝手前に精度が偏っており、
+    /// そのまま画像にすると被写体が一色に潰れる。まず線形化して視点からの距離へ戻す。
+    ///
+    /// 次に正規化。near/far で割ると near=0.1 far=1000 のような設定では人体が全域の
+    /// 0.1% しか占めず、やはり一色になる。**実際に描かれた範囲の最小/最大で伸ばす**ので、
+    /// シーンのスケールを知らなくても体の凹凸が階調いっぱいに広がる。何も描かれなかった
+    /// 画素(深度 1.0)は背景として 0＝黒。
+    fn read_depth_linear(
+        device: &wgpu::Device,
+        buffer: &wgpu::Buffer,
+        width: u32,
+        height: u32,
+        padded_row: u32,
+        camera: &Camera,
+    ) -> Result<Vec<f32>, RendererError> {
+        let slice = buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| RendererError::Rendering(format!("深度の map 受信に失敗: {e}")))?
+            .map_err(|e| RendererError::Rendering(format!("深度の map に失敗: {e}")))?;
+
+        let (near, far) = ((camera.near as f32).max(1e-6), camera.far as f32);
+        let data = slice.get_mapped_range();
+        let mut linear = Vec::with_capacity((width * height) as usize);
+        for row in 0..height {
+            let start = (row * padded_row) as usize;
+            for px in data[start..start + (width * 4) as usize].chunks_exact(4) {
+                let d = f32::from_le_bytes([px[0], px[1], px[2], px[3]]);
+                // wgpu のクリップ空間は 0..1。1.0 は何も描かれなかった画素。
+                linear.push(if d >= 1.0 {
+                    f32::INFINITY
+                } else {
+                    (near * far) / (far - d * (far - near))
+                });
+            }
+        }
+        drop(data);
+        buffer.unmap();
+
+        if std::env::var("KASANE_DEBUG").is_ok() {
+            let raw_min = linear.iter().copied().fold(f32::INFINITY, f32::min);
+            let n_inf = linear.iter().filter(|v| !v.is_finite()).count();
+            eprintln!("  [depth] {} px, {} at far plane, nearest linear {raw_min}", linear.len(), n_inf);
+        }
+        Ok(linear)
     }
 
     // ── 品質設定 ──
@@ -2469,6 +2654,198 @@ impl Renderer {
             }
         }
         result
+    }
+}
+
+/// 線形深度を 8bit のグレースケールへ。手前が明るく、背景は 0。
+///
+/// 最小値と最大値で線形に割り当てると、カメラを向いた部位が階調を独占する。
+/// 正座なら膝から下だけで奥行きの大半を使い切り、面積では多数派の胴体が
+/// 輝度 40 前後に潰れて、深度画像としてはほぼ平面になってしまう。外れ値の
+/// 切り捨てでは足りない ── 飛び出しているのは数画素ではなく、シルエットの
+/// 四分の一だからだ。
+///
+/// そこで割り当てを値ではなく順位で決める。描かれた画素の累積分布を通すと、
+/// どの姿勢でも階調を使い切り、面積の大きい部分ほど広い幅を得る。前後関係は
+/// 単調写像なので保たれる ── ControlNet が構造として読むのはそこだけで、
+/// 絶対距離ではない。
+pub fn depth_to_gray(linear: &[f32]) -> Vec<u8> {
+    depth_to_gray_over(linear, None)
+}
+
+/// 同じ変換を、**階調の配分を `sample` の画素だけで決めて**行う。
+///
+/// 順位で配る方式は面積の大きい物ほど広い階調を得る。人物しか写っていない間はそれが
+/// 正しいが、床を1枚入れた途端に床が画面の多数派になり、床が階調のほとんどを取って
+/// 人物が輝度20ぶんの帯に潰れる ── 実際そうなって `--floor` は使い物にならなかった。
+///
+/// `sample` に人物の画素を渡すと、累積分布は人物だけから作られ、床にはその写像が
+/// そのまま当たる（人物より奥なので暗い側へ出る）。`None` なら描画された全画素が
+/// 対象＝従来と同じ。長さは `linear` と同じでなければならない。
+pub fn depth_to_gray_over(linear: &[f32], sample: Option<&[bool]>) -> Vec<u8> {
+    /// 累積分布の分解能。8bit 出力に対して充分に細かい。
+    const BINS: usize = 4096;
+
+    // sample の長さが合わなければ無視する。呼び出し側の取り違えで深度が壊れるより、
+    // 従来どおりの絵が出た方がまだ気付ける。
+    let sample = sample.filter(|s| s.len() == linear.len());
+    let finite = || {
+        linear
+            .iter()
+            .enumerate()
+            .filter(|(i, v)| v.is_finite() && sample.map(|s| s[*i]).unwrap_or(true))
+            .map(|(_, v)| *v)
+    };
+    let lo = finite().fold(f32::INFINITY, f32::min);
+    let hi = finite().fold(f32::NEG_INFINITY, f32::max);
+    let span = hi - lo;
+    if !span.is_finite() || span <= 1e-6 {
+        // sample が空だった場合は全画素でやり直す。人物が完全に隠れている構図で
+        // 真っ白な深度を返すより、床基準でも奥行きのある絵の方がまだ使える。
+        if sample.is_some() {
+            return depth_to_gray_over(linear, None);
+        }
+        // 何も描かれていないか、完全に平らな深度。順位に意味がない。
+        return linear
+            .iter()
+            .map(|v| if v.is_finite() { 255 } else { 0 })
+            .collect();
+    }
+
+    let bin_of = |v: f32| (((v - lo) / span * (BINS - 1) as f32) as usize).min(BINS - 1);
+    let mut hist = vec![0u32; BINS];
+    for v in finite() {
+        hist[bin_of(v)] += 1;
+    }
+    // cdf[b] = そのビンの中央までの累積割合。両端が 0 と 1 に張り付かないよう、
+    // ビン内の半分を足してから割る。
+    let total = hist.iter().sum::<u32>() as f32;
+    let mut cdf = vec![0.0f32; BINS];
+    let mut acc = 0u32;
+    for b in 0..BINS {
+        cdf[b] = (acc as f32 + hist[b] as f32 * 0.5) / total;
+        acc += hist[b];
+    }
+
+    linear
+        .iter()
+        .map(|&v| {
+            if v.is_finite() {
+                // 最遠面でも 1 を残し、背景の 0 と区別できるようにする。
+                (255.0 - cdf[bin_of(v)] * 254.0).round().clamp(1.0, 255.0) as u8
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod depth_gray_tests {
+    use super::{depth_to_gray, depth_to_gray_over};
+
+    /// 背景は 0、体は 1 以上。両者が混ざらない。
+    #[test]
+    fn background_is_zero_and_body_is_not() {
+        let g = depth_to_gray(&[f32::INFINITY, 10.0, 20.0, f32::INFINITY]);
+        assert_eq!((g[0], g[3]), (0, 0));
+        assert!(g[1] >= 1 && g[2] >= 1);
+    }
+
+    /// 手前ほど明るい。
+    #[test]
+    fn nearer_is_brighter() {
+        let g = depth_to_gray(&[10.0, 20.0, 30.0]);
+        assert!(g[0] > g[1] && g[1] > g[2], "{g:?}");
+    }
+
+    /// 面積の四分の一が手前へ突き出しても、残りが潰れない ── 直した不具合。
+    ///
+    /// 線形割り当てだと胴体は輝度 40 前後まで落ちる。順位で割り当てれば、
+    /// 面積の多数派である胴体が階調の多数派を取る。
+    #[test]
+    fn protruding_limb_does_not_flatten_the_body() {
+        let mut d: Vec<f32> = (0..750).map(|i| 100.0 + i as f32 / 749.0).collect(); // 胴体
+        d.extend((0..250).map(|i| 90.0 + i as f32 / 249.0)); // 手前へ出た脚
+        let g = depth_to_gray(&d);
+        let body = &g[..750];
+        let (min, max) = (*body.iter().min().unwrap(), *body.iter().max().unwrap());
+        assert!(max - min > 120, "胴体の階調幅が {} しかない", max - min);
+    }
+
+    /// 平坦な深度でもゼロ除算にならず、体は背景と区別できる。
+    #[test]
+    fn flat_depth_is_safe() {
+        let g = depth_to_gray(&[7.0, 7.0, f32::INFINITY]);
+        assert_eq!(g, vec![255, 255, 0]);
+    }
+
+    /// 描かれた画素が一つもなくても落ちない。
+    #[test]
+    fn empty_is_safe() {
+        assert_eq!(depth_to_gray(&[f32::INFINITY; 4]), vec![0; 4]);
+    }
+
+    /// 床を1枚入れると人物の階調が潰れる ── `--floor` が使えなかった理由。
+    ///
+    /// 人物 40px の後ろに 960px の床を敷く。全画素で順位を配ると床が階調を持って行く。
+    #[test]
+    fn a_floor_flattens_the_figure_when_everything_is_sampled() {
+        let (body, floor) = figure_and_floor();
+        let d = [body.clone(), floor].concat();
+        let g = depth_to_gray(&d);
+        let f = &g[..body.len()];
+        let spread = *f.iter().max().unwrap() - *f.iter().min().unwrap();
+        assert!(spread < 40, "床込みでも人物が {spread} 階調あるなら前提が違う");
+    }
+
+    /// 人物だけを基準にすれば、床が何画素あろうと人物は階調を使い切る。
+    #[test]
+    fn sampling_the_figure_keeps_its_full_range() {
+        let (body, floor) = figure_and_floor();
+        let d = [body.clone(), floor].concat();
+        let sample: Vec<bool> = (0..d.len()).map(|i| i < body.len()).collect();
+        let g = depth_to_gray_over(&d, Some(&sample));
+        let f = &g[..body.len()];
+        let spread = *f.iter().max().unwrap() - *f.iter().min().unwrap();
+        assert!(spread > 200, "人物の階調幅が {spread} しかない");
+    }
+
+    /// 床は人物より奥なので、人物の写像を当てると人物の最暗部より暗く出る。
+    /// 前後関係が壊れていれば ControlNet は床を手前の壁として読む。
+    #[test]
+    fn the_floor_lands_behind_the_figure() {
+        let (body, floor) = figure_and_floor();
+        let d = [body.clone(), floor].concat();
+        let sample: Vec<bool> = (0..d.len()).map(|i| i < body.len()).collect();
+        let g = depth_to_gray_over(&d, Some(&sample));
+        let darkest_body = *g[..body.len()].iter().min().unwrap();
+        let brightest_floor = *g[body.len()..].iter().max().unwrap();
+        assert!(
+            brightest_floor <= darkest_body,
+            "床 {brightest_floor} が人物の最暗 {darkest_body} より明るい"
+        );
+    }
+
+    /// sample が空でも真っ白にはならない ── 全画素へ落ちるだけ。
+    #[test]
+    fn an_empty_sample_falls_back_rather_than_flattening() {
+        let d = [10.0f32, 20.0, 30.0];
+        assert_eq!(depth_to_gray_over(&d, Some(&[false; 3])), depth_to_gray(&d));
+    }
+
+    /// 長さの合わない sample は無視する。
+    #[test]
+    fn a_mismatched_sample_is_ignored() {
+        let d = [10.0f32, 20.0, 30.0];
+        assert_eq!(depth_to_gray_over(&d, Some(&[true, false])), depth_to_gray(&d));
+    }
+
+    /// 人物 40px、その奥に床 960px。床の方が面積で 24 倍ある。
+    fn figure_and_floor() -> (Vec<f32>, Vec<f32>) {
+        let body: Vec<f32> = (0..40).map(|i| 100.0 + i as f32 * 0.5).collect();
+        let floor: Vec<f32> = (0..960).map(|i| 130.0 + i as f32 * 2.0).collect();
+        (body, floor)
     }
 }
 
