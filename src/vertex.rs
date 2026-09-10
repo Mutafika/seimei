@@ -53,7 +53,7 @@ impl GpuVertex {
 
 /// シェーディングモデルID。材質チャネルの値から特殊シェーディングを推定していた旧 sentinel 方式
 /// （material.w を発光と髪/瞳/水タグに兼用・material.z の符号で肌/透過を判定）を廃し、この明示IDで
-/// 分岐する。pbr.wgsl / pbr_shadow.wgsl の M_* 定数と必ず一致させること。
+/// 分岐する。pbr.wgsl の M_* 定数と必ず一致させること。
 pub const MODEL_STANDARD: f32 = 0.0; // 革/金属/ゴム/布/石/木/プラ/環境（metallic+roughness+albedo+emissive のみ）
 pub const MODEL_SKIN: f32 = 1.0; // 肌（SSS＋全身濡れfloor＋clearcoat）
 pub const MODEL_HAIR: f32 = 2.0; // 髪（異方性ハイライト）
@@ -73,6 +73,13 @@ pub const MODEL_GEL: f32 = 8.0; // ゲル/スライム体（柔らかい半透�
 /// - `albedo テクスチャの a` = 膜厚マップ。「どこに膜が乗っているか」をここで描く
 ///   （全面へ一律に乗せると油膜、斑に乗せると曜変、縁だけなら貝殻）
 pub const MODEL_IRIDESCENT: f32 = 9.0;
+
+/// 焼き込み済み照明。vertex_color に事前計算した輝度（ラジオシティの焼き込み等）を
+/// 持たせ、ランタイムの光・影・環境・リムを一切掛けずにそのまま出す unlit 経路。
+///
+/// ⚠ 掛けると二重照明になる。焼いた絵をそのまま見せるための材質なので、
+/// ライトを足しても「明るくならない」のが正しい振る舞い。
+pub const MODEL_BAKED: f32 = 10.0;
 
 /// インスタンスデータ（要素ごとの変換・色・マテリアル）
 #[repr(C)]

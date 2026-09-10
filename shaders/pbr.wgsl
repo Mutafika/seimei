@@ -232,6 +232,7 @@ const M_GLASS: i32 = 6;
 const M_JELLY: i32 = 7;
 const M_GEL: i32 = 8;
 const M_IRIDESCENT: i32 = 9;
+const M_BAKED: i32 = 10;
 
 // 薄膜干渉。膜の表と裏で反射した光が干渉して、強め合う波長だけが残る。
 //
@@ -492,6 +493,21 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
     // アルファテスト
     if (tex_color.a < 0.01) {
         discard;
+    }
+
+    // === 焼き込み済みライティング（M_BAKED）: 照明を掛けずそのまま出す ===
+    // 頂点色にはラジオシティ等で事前計算した輝度が焼いてある（in.color =
+    // instance.color × vertex_color）。ランタイムの光・影・環境・リムは一切
+    // 掛けない — 掛けると二重照明になる。
+    // トーンマップ/ガンマは通常経路と同じ扱い＝HDR/ポストプロセスモードでは
+    // 線形のまま返し、合成シェーダに任せる。
+    if (model == M_BAKED) {
+        let baked = in.color.rgb * tex_color.rgb;
+        let baked_a = in.color.a * tex_color.a;
+        if (camera.resolution.z >= 0.5) {
+            return vec4<f32>(baked, baked_a);
+        }
+        return vec4<f32>(pow(aces_tonemap(baked), vec3(1.0 / 2.2)), baked_a);
     }
 
     // === 溶解(dissolve/melt): 表面を局所的に溶かして穴を空ける汎用機能 ===
