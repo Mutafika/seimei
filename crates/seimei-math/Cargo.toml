@@ -1,0 +1,18 @@
+[package]
+name = "seimei-math"
+version = "0.3.19"
+edition = "2024"
+description = "Geometry primitives shared by seimei — points, vectors, transforms, AABBs, rays. No wgpu."
+license = "MIT"
+authors = ["MKD"]
+
+# ⚠ このクレートに wgpu / bytemuck を足さないこと。
+# 存在理由が「型だけ借りたい利用者に描画スタックを引かせない」ことなので、
+# 描画寄りの依存が1つでも入ると意味が消える（seimei 本体に置けば済む）。
+[features]
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+glam = "0.29" # seimei 本体と同一バージョン。From<DVec3> 等の相互変換が成立する条件
+serde = { version = "1.0", features = ["derive"], optional = true }

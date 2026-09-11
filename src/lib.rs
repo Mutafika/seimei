@@ -3,11 +3,14 @@
 //! wgpu + glam ベースの PBR レンダラー。
 //! egui / sabitori など特定の UI フレームワークに依存しない。
 
-pub mod math;
+// math / ray は wgpu 非依存なので別クレートに出してある（型だけ借りる利用者に
+// 描画スタックを引かせないため）。ここで再エクスポートするので seimei::math::Point3
+// や crate::ray::Ray といった既存のパスは変わらない。
+pub use seimei_math::math;
 pub mod vertex;
 pub mod light;
 pub mod mesh;
-pub mod ray;
+pub use seimei_math::ray;
 pub mod camera;
 pub mod texture;
 pub mod pipeline;
@@ -28,7 +31,7 @@ pub use math::{Point3, BoundingBox, Transform};
 pub use vertex::{GpuVertex, InstanceData, LineVertex};
 pub use vertex::{
     MODEL_STANDARD, MODEL_SKIN, MODEL_HAIR, MODEL_EYE, MODEL_WATER, MODEL_FLUID, MODEL_GLASS,
-    MODEL_JELLY, MODEL_GEL, MODEL_IRIDESCENT,
+    MODEL_JELLY, MODEL_GEL, MODEL_IRIDESCENT, MODEL_BAKED,
 };
 pub use light::{Light, LightKind, GpuLight, LightHeader, LightStorageData, LightUniform, MAX_LIGHTS};
 pub use mesh::{Vertex, RenderMesh};

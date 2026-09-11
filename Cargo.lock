@@ -2734,7 +2734,7 @@ dependencies = [
 
 [[package]]
 name = "seimei"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "bytemuck",
  "egui",
@@ -2744,11 +2744,20 @@ dependencies = [
  "half",
  "image",
  "naga",
+ "seimei-math",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
  "wgpu",
+]
+
+[[package]]
+name = "seimei-math"
+version = "0.3.19"
+dependencies = [
+ "glam",
+ "serde",
 ]
 
 [[package]]
@@ -3500,7 +3509,7 @@ dependencies = [
 
 [[package]]
 name = "vrm-seimei"
-version = "0.3.18"
+version = "0.3.19"
 dependencies = [
  "glam",
  "rayon",
