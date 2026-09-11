@@ -1,10 +1,12 @@
 //! 3D 数学型（glam ベース）
 
 use glam::{DVec3, DMat4, Vec3};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// 3次元点（f64精度）
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Point3 {
     pub x: f64,
     pub y: f64,
@@ -83,7 +85,8 @@ impl From<Point3> for DVec3 {
 }
 
 /// 3次元ベクトル（f64精度）
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Vec3D {
     pub x: f64,
     pub y: f64,
@@ -168,7 +171,8 @@ impl From<Vec3D> for DVec3 {
 }
 
 /// 4x4 変換行列（glam ベース）
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Transform {
     /// 4x4 行列（列優先）
     pub matrix: [[f64; 4]; 4],
@@ -250,7 +254,8 @@ impl Default for Transform {
 }
 
 /// バウンディングボックス（軸並行）
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct BoundingBox {
     pub min: Point3,
     pub max: Point3,
