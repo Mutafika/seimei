@@ -207,14 +207,29 @@ impl InstanceData {
 }
 
 /// 線分用GPU頂点データ
+///
+/// `width` は線幅（画面 px）。0 または 1 以下は従来どおり 1px の LineList で描く。
+/// 1 を超える線分（2 頂点のどちらかが 1 を超える）は、画面上の四角形に展開して描く
+/// （[`LineVertex::wide_layout`]）。幅はズームに依らず一定の px（CAD の線幅表示と同じ）。
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
 pub struct LineVertex {
     pub position: [f32; 3],
     pub color: [f32; 4],
+    pub width: f32,
 }
 
 impl LineVertex {
+    /// 1px の線の頂点
+    pub fn new(position: [f32; 3], color: [f32; 4]) -> Self {
+        Self { position, color, width: 1.0 }
+    }
+
+    /// 線幅（px）を指定した頂点
+    pub fn with_width(position: [f32; 3], color: [f32; 4], width: f32) -> Self {
+        Self { position, color, width }
+    }
+
     pub fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<LineVertex>() as wgpu::BufferAddress,
@@ -230,7 +245,81 @@ impl LineVertex {
                     shader_location: 1,
                     format: wgpu::VertexFormat::Float32x4,
                 },
+                wgpu::VertexAttribute {
+                    offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress,
+                    shader_location: 2,
+                    format: wgpu::VertexFormat::Float32,
+                },
             ],
         }
+    }
+
+    /// 太線用: LineList と同じ並びのバッファを、**2 頂点 = 1 インスタンス**として読む。
+    /// 始点が location 0..2、終点が location 3..5。頂点数は増えない。
+    pub fn wide_layout() -> wgpu::VertexBufferLayout<'static> {
+        const V: u64 = std::mem::size_of::<LineVertex>() as u64;
+        const P: u64 = std::mem::size_of::<[f32; 3]>() as u64;
+        const W: u64 = std::mem::size_of::<[f32; 7]>() as u64;
+        wgpu::VertexBufferLayout {
+            array_stride: V * 2,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &[
+                wgpu::VertexAttribute { offset: 0, shader_location: 0, format: wgpu::VertexFormat::Float32x3 },
+                wgpu::VertexAttribute { offset: P, shader_location: 1, format: wgpu::VertexFormat::Float32x4 },
+                wgpu::VertexAttribute { offset: W, shader_location: 2, format: wgpu::VertexFormat::Float32 },
+                wgpu::VertexAttribute { offset: V, shader_location: 3, format: wgpu::VertexFormat::Float32x3 },
+                wgpu::VertexAttribute { offset: V + P, shader_location: 4, format: wgpu::VertexFormat::Float32x4 },
+                wgpu::VertexAttribute { offset: V + W, shader_location: 5, format: wgpu::VertexFormat::Float32 },
+            ],
+        }
+    }
+}
+
+/// LineList の頂点列を「1px の線」と「太線」に振り分ける。線分（2 頂点）単位で、
+/// どちらかの端の `width` が 1 を超えれば太線。太線が無ければコピーせず元を返す。
+/// 端数の 1 頂点は LineList と同じく描かれないが、細線側に残す。
+pub fn split_line_widths(vertices: &[LineVertex]) -> (std::borrow::Cow<'_, [LineVertex]>, Vec<LineVertex>) {
+    let is_wide = |s: &[LineVertex]| s.len() == 2 && (s[0].width > 1.0 || s[1].width > 1.0);
+    if !vertices.chunks(2).any(is_wide) {
+        return (std::borrow::Cow::Borrowed(vertices), Vec::new());
+    }
+    let (mut thin, mut wide) = (Vec::new(), Vec::new());
+    for seg in vertices.chunks(2) {
+        if is_wide(seg) { wide.extend_from_slice(seg) } else { thin.extend_from_slice(seg) }
+    }
+    (std::borrow::Cow::Owned(thin), wide)
+}
+
+#[cfg(test)]
+mod line_width_tests {
+    use super::*;
+    use std::borrow::Cow;
+
+    fn v(width: f32) -> LineVertex {
+        LineVertex::with_width([width, 0.0, 0.0], [1.0; 4], width)
+    }
+
+    #[test]
+    fn thin_only_is_borrowed_as_is() {
+        let lines = [v(0.0), v(1.0), LineVertex::new([0.0; 3], [1.0; 4]), v(0.5)];
+        let (thin, wide) = split_line_widths(&lines);
+        assert!(matches!(thin, Cow::Borrowed(_)));
+        assert!(wide.is_empty());
+    }
+
+    /// 片端でも 1 を超えれば線分ごと太線へ。順序は保つ。端数の 1 頂点は細線側。
+    #[test]
+    fn splits_per_segment_keeping_order() {
+        let lines = [v(1.0), v(1.0), v(3.0), v(1.0), v(0.0), v(0.0), v(1.0), v(2.0), v(9.0)];
+        let (thin, wide) = split_line_widths(&lines);
+        assert_eq!(&*thin, &[v(1.0), v(1.0), v(0.0), v(0.0), v(9.0)]);
+        assert_eq!(wide, vec![v(3.0), v(1.0), v(1.0), v(2.0)]);
+    }
+
+    #[test]
+    fn wide_layout_reads_two_vertices_per_instance() {
+        let l = LineVertex::wide_layout();
+        assert_eq!(l.array_stride, 2 * std::mem::size_of::<LineVertex>() as u64);
+        assert_eq!(std::mem::size_of::<LineVertex>(), 32);
     }
 }

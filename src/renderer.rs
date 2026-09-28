@@ -149,6 +149,66 @@ fn instance_visible(planes: &[glam::Vec4; 6], model: &[[f32; 4]; 4], aabb: &[[f3
     true
 }
 
+/// 線バッファ 1 組: 1px の LineList と、太線（width > 1）の組。
+/// `upload` が線分単位で振り分けるので、太線が無ければ従来とまったく同じ描画になる。
+struct LineSet {
+    thin: wgpu::Buffer,
+    thin_count: u32,
+    /// 太線が来るまで確保しない
+    wide: Option<wgpu::Buffer>,
+    wide_segments: u32,
+    label: &'static str,
+}
+
+impl LineSet {
+    fn new(device: &wgpu::Device, label: &'static str, capacity: u64) -> Self {
+        let thin = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: std::mem::size_of::<LineVertex>() as u64 * capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Self { thin, thin_count: 0, wide: None, wide_segments: 0, label }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[LineVertex]) {
+        let (thin, wide) = crate::vertex::split_line_widths(vertices);
+        self.thin_count = thin.len() as u32;
+        Renderer::update_vertex_buffer(device, queue, &mut self.thin, self.label, &thin);
+        self.wide_segments = (wide.len() / 2) as u32;
+        if !wide.is_empty() {
+            let buf = self.wide.get_or_insert_with(|| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Wide Line Buffer"),
+                    size: std::mem::size_of_val(wide.as_slice()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                })
+            });
+            Renderer::update_vertex_buffer(device, queue, buf, "Wide Line Buffer", &wide);
+        }
+    }
+
+    /// camera の bind group は呼び出し側で設定済みであること
+    fn draw<'a>(
+        &'a self,
+        pass: &mut wgpu::RenderPass<'a>,
+        thin_pipeline: &'a wgpu::RenderPipeline,
+        wide_pipeline: &'a wgpu::RenderPipeline,
+    ) {
+        if self.thin_count > 0 {
+            pass.set_pipeline(thin_pipeline);
+            pass.set_vertex_buffer(0, self.thin.slice(..));
+            pass.draw(0..self.thin_count, 0..1);
+        }
+        if let (Some(buf), n @ 1..) = (&self.wide, self.wide_segments) {
+            pass.set_pipeline(wide_pipeline);
+            pass.set_vertex_buffer(0, buf.slice(..));
+            pass.draw(0..4, 0..n);
+        }
+    }
+}
+
 pub struct Renderer {
     // GPU resources
     device: Arc<wgpu::Device>,
@@ -193,19 +253,19 @@ pub struct Renderer {
     /// 深度プリパス用(色なし・深度のみ書込)。透過メッシュを半透明色パス前に先書きしオーラ防止。
     depth_prepass_pipeline: wgpu::RenderPipeline,
     line_pipeline: wgpu::RenderPipeline,
+    /// width > 1 の線分を画面上の四角形で描くパイプライン（LineSet::wide を描く）
+    wide_line_pipeline: wgpu::RenderPipeline,
     point_pipeline: wgpu::RenderPipeline,
     // Buffers
     instance_buffer: wgpu::Buffer,
-    line_vertex_buffer: wgpu::Buffer,
-    line_vertex_count: u32,
+    lines: LineSet,
     /// プレビュー線（作図中のラバーバンド等）専用バッファ。静的線とは別に持つことで、
     /// プレビュー更新のたびに静的線を全再アップロードせずに済む（毎フレーム全再構築の根絶）。
-    preview_line_vertex_buffer: wgpu::Buffer,
-    preview_line_vertex_count: u32,
-    /// 静的線のチャンク別バッファ（chunk_id → (buffer, count)）。カテゴリ/サブチャンク
+    preview_lines: LineSet,
+    /// 静的線のチャンク別バッファ（chunk_id → LineSet）。カテゴリ/サブチャンク
     /// 単位で部分更新できるため、1 要素の編集で変化したチャンクだけ再アップロードできる。
-    /// 単一 `line_vertex_buffer` と併存し、描画時は両方を描く。
-    line_chunks: std::collections::HashMap<u32, (wgpu::Buffer, u32)>,
+    /// 単一 `lines` と併存し、描画時は両方を描く。
+    line_chunks: std::collections::HashMap<u32, LineSet>,
     point_vertex_buffer: wgpu::Buffer,
     point_vertex_count: u32,
     // Meshes
@@ -468,6 +528,9 @@ impl Renderer {
         let line_pipeline = pipeline::create_line_pipeline(
             &device, surface_format, &camera_bind_group_layout,
         )?;
+        let wide_line_pipeline = pipeline::create_wide_line_pipeline(
+            &device, surface_format, &camera_bind_group_layout,
+        )?;
         let point_pipeline = pipeline::create_point_pipeline(
             &device, surface_format, &camera_bind_group_layout,
         )?;
@@ -516,19 +579,8 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let line_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Line Vertex Buffer"),
-            size: std::mem::size_of::<LineVertex>() as u64 * 10000,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let preview_line_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Preview Line Vertex Buffer"),
-            size: std::mem::size_of::<LineVertex>() as u64 * 1024,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let lines = LineSet::new(&device, "Line Vertex Buffer", 10000);
+        let preview_lines = LineSet::new(&device, "Preview Line Vertex Buffer", 1024);
 
         let point_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Point Vertex Buffer"),
@@ -619,12 +671,11 @@ impl Renderer {
             transparent_pipeline,
             depth_prepass_pipeline,
             line_pipeline,
+            wide_line_pipeline,
             point_pipeline,
             instance_buffer,
-            line_vertex_buffer,
-            line_vertex_count: 0,
-            preview_line_vertex_buffer,
-            preview_line_vertex_count: 0,
+            lines,
+            preview_lines,
             line_chunks: std::collections::HashMap::new(),
             point_vertex_buffer,
             point_vertex_count: 0,
@@ -1152,21 +1203,13 @@ impl Renderer {
 
     /// 線分の頂点データを更新
     pub fn update_lines(&mut self, vertices: &[LineVertex]) {
-        self.line_vertex_count = vertices.len() as u32;
-        Self::update_vertex_buffer(
-            &self.device, &self.queue, &mut self.line_vertex_buffer,
-            "Line Vertex Buffer", vertices,
-        );
+        self.lines.upload(&self.device, &self.queue, vertices);
     }
 
     /// プレビュー線（作図中のラバーバンド等）の頂点データを更新。静的線とは独立に
     /// 更新できるため、プレビュー中も静的線バッファを再アップロードしない。
     pub fn update_preview_lines(&mut self, vertices: &[LineVertex]) {
-        self.preview_line_vertex_count = vertices.len() as u32;
-        Self::update_vertex_buffer(
-            &self.device, &self.queue, &mut self.preview_line_vertex_buffer,
-            "Preview Line Vertex Buffer", vertices,
-        );
+        self.preview_lines.upload(&self.device, &self.queue, vertices);
     }
 
     /// 静的線チャンク `chunk_id` の頂点を更新する。空スライスはそのチャンクを削除する。
@@ -1176,26 +1219,11 @@ impl Renderer {
             self.line_chunks.remove(&chunk_id);
             return;
         }
-        let required_size = std::mem::size_of_val(vertices) as u64;
-        let entry = self.line_chunks.entry(chunk_id).or_insert_with(|| {
-            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Line Chunk Buffer"),
-                size: required_size.max(std::mem::size_of::<LineVertex>() as u64 * 256),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            (buffer, 0)
-        });
-        if required_size > entry.0.size() {
-            entry.0 = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Line Chunk Buffer"),
-                size: required_size,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        self.queue.write_buffer(&entry.0, 0, bytemuck::cast_slice(vertices));
-        entry.1 = vertices.len() as u32;
+        let device = &self.device;
+        self.line_chunks
+            .entry(chunk_id)
+            .or_insert_with(|| LineSet::new(device, "Line Chunk Buffer", 256))
+            .upload(&self.device, &self.queue, vertices);
     }
 
     /// 静的線チャンクを削除する。
@@ -2239,31 +2267,16 @@ impl Renderer {
             render_pass.set_vertex_buffer(0, self.point_vertex_buffer.slice(..));
             render_pass.draw(0..self.point_vertex_count, 0..1);
         }
-        if self.line_vertex_count > 0 {
-            render_pass.set_pipeline(&self.line_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.line_vertex_buffer.slice(..));
-            render_pass.draw(0..self.line_vertex_count, 0..1);
-        }
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        let (thin, wide) = (&self.line_pipeline, &self.wide_line_pipeline);
+        self.lines.draw(render_pass, thin, wide);
         // 静的線チャンク（部分更新用）を同一パイプラインで描く。線は深度ソート不要なので
         // HashMap の順序で問題ない。チャンク数は数十で draw call は無害。
-        if !self.line_chunks.is_empty() {
-            render_pass.set_pipeline(&self.line_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            for (buffer, count) in self.line_chunks.values() {
-                if *count > 0 {
-                    render_pass.set_vertex_buffer(0, buffer.slice(..));
-                    render_pass.draw(0..*count, 0..1);
-                }
-            }
+        for set in self.line_chunks.values() {
+            set.draw(render_pass, thin, wide);
         }
         // プレビュー線（作図中のラバーバンド等）を静的線の直後に同一パイプラインで描く。
-        if self.preview_line_vertex_count > 0 {
-            render_pass.set_pipeline(&self.line_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.set_vertex_buffer(0, self.preview_line_vertex_buffer.slice(..));
-            render_pass.draw(0..self.preview_line_vertex_count, 0..1);
-        }
+        self.preview_lines.draw(render_pass, thin, wide);
     }
 
     /// 不透明メッシュ `[0..opaque_count)` のみを main_pipeline で描画。
@@ -2510,6 +2523,11 @@ impl Renderer {
         )?;
 
         self.line_pipeline = pipeline::create_line_pipeline_msaa(
+            &self.device, fmt,
+            &self.camera_bind_group_layout, msaa_samples,
+        )?;
+
+        self.wide_line_pipeline = pipeline::create_wide_line_pipeline_msaa(
             &self.device, fmt,
             &self.camera_bind_group_layout, msaa_samples,
         )?;
