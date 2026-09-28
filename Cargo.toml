@@ -40,3 +40,5 @@ egui-wgpu = { version = "0.31", optional = true }
 # WGSL をテスト時に検証する（シェーダは実行時までコンパイルされないので、
 # これが無いと構文エラーが「起動したら真っ黒」として出てくる）。
 naga = { version = "24", features = ["wgsl-in"] }
+# GPU を使うテスト（tests/wide_lines_gpu.rs）で wgpu の async を待つ
+pollster = "0.4"

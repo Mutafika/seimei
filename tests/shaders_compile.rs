@@ -36,3 +36,8 @@ fn sky_cloud_compiles() {
 fn refraction_compiles() {
     check("refraction.wgsl", seimei::pipeline::SHADER_REFRACTION_SOURCE);
 }
+
+#[test]
+fn wide_line_compiles() {
+    check("wide line", seimei::pipeline::WIDE_LINE_SHADER_SOURCE);
+}
