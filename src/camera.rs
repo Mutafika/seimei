@@ -5,6 +5,9 @@ use crate::ray::Ray;
 use bytemuck::{Pod, Zeroable};
 use glam::{DMat4, DVec3, DVec4};
 
+/// `fit_to_bounds` で画面の縁に残す余白（収まる範囲 = 画面の半幅 × この値）
+pub const FIT_FILL: f64 = 0.9;
+
 /// カメラ
 pub struct Camera {
     pub position: Point3,
@@ -212,24 +215,63 @@ impl Camera {
         }
     }
 
-    /// 全体表示
+    /// 全体表示 — 今の視線方向・画角・縦横比を保ったまま、箱の 8 頂点が画面の
+    /// `FIT_FILL` 以内に収まる最小の距離（正投影なら `ortho_width`）に合わせる。
+    /// 向きは変えないので、`set_*_view` → `fit_to_bounds` の順で使う。
     pub fn fit_to_bounds(&mut self, min: Point3, max: Point3) {
-        let center = min.midpoint(&max);
-        let size_x = max.x - min.x;
-        let size_y = max.y - min.y;
-        let size_z = max.z - min.z;
-        let max_size = size_x.max(size_y).max(size_z);
+        let center = min.midpoint(&max).to_dvec3();
+        let fwd = (self.target.to_dvec3() - self.position.to_dvec3())
+            .try_normalize()
+            .unwrap_or(DVec3::new(-1.0, 1.0, -1.0).normalize()); // 初期状態（position == target）だけ既定の斜め上
+        // up が視線と平行（真上から見ている等）なら、画面上方向を +Y とみなす
+        let up_hint = self
+            .up
+            .to_dvec3()
+            .try_normalize()
+            .filter(|u| u.cross(fwd).length() > 1e-6)
+            .unwrap_or(DVec3::Y);
+        let right = fwd.cross(up_hint).normalize();
+        let up = right.cross(fwd).normalize();
+        let aspect = if self.aspect.is_finite() && self.aspect > 0.0 { self.aspect } else { 16.0 / 9.0 };
 
-        let fov_rad = self.fov.to_radians();
-        let distance = (max_size / 2.0) / (fov_rad / 2.0).tan() * 1.5;
+        let (lo, hi) = (min.to_dvec3(), max.to_dvec3());
+        let corners = (0..8).map(|i| {
+            DVec3::new(
+                if i & 1 == 0 { lo.x } else { hi.x },
+                if i & 2 == 0 { lo.y } else { hi.y },
+                if i & 4 == 0 { lo.z } else { hi.z },
+            )
+        });
 
-        self.target = center;
-        self.position = Point3::new(
-            center.x + distance * 0.7,
-            center.y - distance * 0.7,
-            center.z + distance * 0.5,
-        );
-        self.up = Vec3D::new(0.0, 0.0, 1.0);
+        let dist = if self.is_orthographic {
+            // 正投影は距離で大きさが変わらない。表示幅を合わせ、距離は箱の外に出る分だけ取る
+            let (mut half_w, mut half_h, mut depth) = (0.0f64, 0.0f64, 0.0f64);
+            for c in corners {
+                let r = c - center;
+                half_w = half_w.max(r.dot(right).abs());
+                half_h = half_h.max(r.dot(up).abs());
+                depth = depth.max(r.dot(fwd).abs());
+            }
+            self.ortho_width = ((half_w * 2.0).max(half_h * 2.0 * aspect) / FIT_FILL).max(1.0);
+            self.position.distance(&self.target).max(depth * 2.0 + 1000.0)
+        } else {
+            let ty = (self.fov.to_radians() / 2.0).tan() * FIT_FILL;
+            let tx = ty * aspect;
+            // 頂点の奥行きは (d + z)。画面に収まる条件 |x| ≤ (d+z)·tx, |y| ≤ (d+z)·ty を
+            // 全頂点で満たす最小の d
+            let (mut d, mut nearest) = (0.0f64, f64::MIN);
+            for c in corners {
+                let r = c - center;
+                let (x, y, z) = (r.dot(right), r.dot(up), r.dot(fwd));
+                d = d.max(x.abs() / tx - z).max(y.abs() / ty - z);
+                nearest = nearest.max(-z);
+            }
+            // 箱の手前の面より後ろに立つ（near 面で切れないように少し下がる）
+            d.max(nearest + self.near.max(1.0) * 2.0).max(1.0)
+        };
+        self.target = Point3::from_dvec3(center);
+        self.position = Point3::from_dvec3(center - fwd * dist);
+        self.up = Vec3D::from_dvec3(up);
     }
 
     pub fn set_top_view(&mut self) {
@@ -566,5 +608,84 @@ mod lens_shift_tests {
             (a.0 - b.0, a.1 - b.1)
         };
         assert!((d0.0 - d1.0).abs() < 1e-9 && (d0.1 - d1.1).abs() < 1e-9, "相対配置は不変");
+    }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    fn corners(min: Point3, max: Point3) -> impl Iterator<Item = DVec3> {
+        (0..8).map(move |i| {
+            DVec3::new(
+                if i & 1 == 0 { min.x } else { max.x },
+                if i & 2 == 0 { min.y } else { max.y },
+                if i & 4 == 0 { min.z } else { max.z },
+            )
+        })
+    }
+
+    /// オラクル = 描画と同じ view_projection_matrix。収まっている・引きすぎていない・向きを保つ（#18, #19）
+    #[test]
+    fn fit_is_tight_and_keeps_direction_for_any_view() {
+        let (min, max) = (Point3::new(0.0, 0.0, 0.0), Point3::new(48000.0, 9000.0, 9000.0));
+        let dirs = [
+            DVec3::new(-1.0, 1.0, -1.0), // 斜め上
+            DVec3::new(0.0, 0.0, -1.0),  // 真上
+            DVec3::new(0.0, 1.0, 0.0),   // 正面
+            DVec3::new(-1.0, 0.0, 0.0),  // 右側面
+            DVec3::new(0.3, 0.8, -0.2),  // 適当
+        ];
+        for ortho in [false, true] {
+            for aspect in [16.0 / 9.0, 1.0, 0.6] {
+                for dir in dirs {
+                    let mut cam = Camera::new();
+                    cam.aspect = aspect;
+                    cam.is_orthographic = ortho;
+                    cam.target = Point3::new(0.0, 0.0, 0.0);
+                    cam.position = Point3::from_dvec3(-dir.normalize() * 5000.0);
+                    if dir.x == 0.0 && dir.y == 0.0 {
+                        cam.up = Vec3D::new(0.0, 1.0, 0.0);
+                    }
+                    cam.fit_to_bounds(min, max);
+
+                    let got = (cam.target.to_dvec3() - cam.position.to_dvec3()).normalize();
+                    assert!((got - dir.normalize()).length() < 1e-9, "向きが変わった dir={dir:?}");
+                    let mut reach = 0.0f64;
+                    for c in corners(min, max) {
+                        let v = cam.view_projection_matrix() * DVec4::new(c.x, c.y, c.z, 1.0);
+                        let (x, y) = (v.x / v.w, v.y / v.w);
+                        assert!(
+                            x.abs() <= FIT_FILL + 1e-6 && y.abs() <= FIT_FILL + 1e-6,
+                            "はみ出し ortho={ortho} aspect={aspect} dir={dir:?} ({x}, {y})"
+                        );
+                        reach = reach.max(x.abs()).max(y.abs());
+                    }
+                    assert!(reach > FIT_FILL - 0.02, "引きすぎ ortho={ortho} aspect={aspect} dir={dir:?} reach={reach}");
+                }
+            }
+        }
+    }
+
+    /// #18: 視点プリセット → 全体表示 で、プリセットの向きと up が残る
+    #[test]
+    fn top_view_survives_fit() {
+        let mut cam = Camera::new();
+        cam.set_top_view();
+        cam.fit_to_bounds(Point3::new(-5000.0, -3000.0, 0.0), Point3::new(5000.0, 3000.0, 6000.0));
+        let fwd = (cam.target.to_dvec3() - cam.position.to_dvec3()).normalize();
+        assert!((fwd - DVec3::new(0.0, 0.0, -1.0)).length() < 1e-9, "真上のまま: {fwd:?}");
+        assert!((cam.up.to_dvec3() - DVec3::Y).length() < 1e-9, "up は +Y のまま: {:?}", cam.up);
+    }
+
+    /// 初期状態（position == target）でも NaN にならず既定の斜め上に置く
+    #[test]
+    fn fit_from_degenerate_camera_is_finite() {
+        let mut cam = Camera::new();
+        cam.position = cam.target;
+        cam.fit_to_bounds(Point3::new(0.0, 0.0, 0.0), Point3::new(1000.0, 1000.0, 1000.0));
+        let p = cam.position.to_dvec3();
+        assert!(p.is_finite() && cam.up.to_dvec3().is_finite());
+        assert!(cam.position.distance(&cam.target) > 0.0);
     }
 }
