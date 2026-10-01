@@ -41,3 +41,8 @@ fn refraction_compiles() {
 fn wide_line_compiles() {
     check("wide line", seimei::pipeline::WIDE_LINE_SHADER_SOURCE);
 }
+
+#[test]
+fn line_compiles() {
+    check("line", seimei::pipeline::LINE_SHADER_SOURCE);
+}

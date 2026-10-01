@@ -255,6 +255,10 @@ pub struct Renderer {
     line_pipeline: wgpu::RenderPipeline,
     /// width > 1 の線分を画面上の四角形で描くパイプライン（LineSet::wide を描く）
     wide_line_pipeline: wgpu::RenderPipeline,
+    /// 深さ判定ありの線（1px, 太線）。`lines_depth_tested` のとき静的線に使う
+    depth_tested_line_pipelines: (wgpu::RenderPipeline, wgpu::RenderPipeline),
+    /// 静的線（`update_lines` と線チャンク）を深さ判定ありで描くか。既定 false＝常に手前
+    lines_depth_tested: bool,
     point_pipeline: wgpu::RenderPipeline,
     // Buffers
     instance_buffer: wgpu::Buffer,
@@ -531,6 +535,9 @@ impl Renderer {
         let wide_line_pipeline = pipeline::create_wide_line_pipeline(
             &device, surface_format, &camera_bind_group_layout,
         )?;
+        let depth_tested_line_pipelines = pipeline::create_depth_tested_line_pipelines(
+            &device, surface_format, &camera_bind_group_layout, 1,
+        )?;
         let point_pipeline = pipeline::create_point_pipeline(
             &device, surface_format, &camera_bind_group_layout,
         )?;
@@ -672,6 +679,8 @@ impl Renderer {
             depth_prepass_pipeline,
             line_pipeline,
             wide_line_pipeline,
+            depth_tested_line_pipelines,
+            lines_depth_tested: false,
             point_pipeline,
             instance_buffer,
             lines,
@@ -1224,6 +1233,19 @@ impl Renderer {
             .entry(chunk_id)
             .or_insert_with(|| LineSet::new(device, "Line Chunk Buffer", 256))
             .upload(&self.device, &self.queue, vertices);
+    }
+
+    /// 静的線（`update_lines` と線チャンク）を深さ判定ありで描くか。既定 false＝従来どおり
+    /// 常に手前。true にすると手前の不透明メッシュに隠れる（3D ビューで壁の向こうの床記号を
+    /// 隠す用途）。面と同一平面の線が欠けないよう、視線に沿ってわずかに手前へ寄せて描く。
+    /// プレビュー線（`update_preview_lines`）には効かず、常に手前。
+    pub fn set_lines_depth_tested(&mut self, on: bool) {
+        self.lines_depth_tested = on;
+    }
+
+    /// 静的線を深さ判定ありで描いているか
+    pub fn lines_depth_tested(&self) -> bool {
+        self.lines_depth_tested
     }
 
     /// 静的線チャンクを削除する。
@@ -2269,13 +2291,19 @@ impl Renderer {
         }
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         let (thin, wide) = (&self.line_pipeline, &self.wide_line_pipeline);
-        self.lines.draw(render_pass, thin, wide);
+        let (static_thin, static_wide) = if self.lines_depth_tested {
+            (&self.depth_tested_line_pipelines.0, &self.depth_tested_line_pipelines.1)
+        } else {
+            (thin, wide)
+        };
+        self.lines.draw(render_pass, static_thin, static_wide);
         // 静的線チャンク（部分更新用）を同一パイプラインで描く。線は深度ソート不要なので
         // HashMap の順序で問題ない。チャンク数は数十で draw call は無害。
         for set in self.line_chunks.values() {
-            set.draw(render_pass, thin, wide);
+            set.draw(render_pass, static_thin, static_wide);
         }
-        // プレビュー線（作図中のラバーバンド等）を静的線の直後に同一パイプラインで描く。
+        // プレビュー線（作図中のラバーバンド等）は深さ判定の設定に関わらず常に手前に描く
+        // （作図中の案内が面に隠れると困る）。
         self.preview_lines.draw(render_pass, thin, wide);
     }
 
@@ -2528,6 +2556,11 @@ impl Renderer {
         )?;
 
         self.wide_line_pipeline = pipeline::create_wide_line_pipeline_msaa(
+            &self.device, fmt,
+            &self.camera_bind_group_layout, msaa_samples,
+        )?;
+
+        self.depth_tested_line_pipelines = pipeline::create_depth_tested_line_pipelines(
             &self.device, fmt,
             &self.camera_bind_group_layout, msaa_samples,
         )?;
