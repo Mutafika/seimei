@@ -847,8 +847,10 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) front_facing: bool) -> @loca
                           vec3<f32>(2.5));
         // 影は light[0] が方向光の時だけ（＝太陽1灯ぶん）。点光源の影は別系統(アトラス)。
         // 遮蔽されても環境光と他ライトは残るので真っ黒にはならない。
+        // resolution.w>=0.5 は影なしのビュー（追加の RenderView。影の深度は既定のビューのカメラで
+        // 焼いてあるので、別のカメラから引くと合わない）。
         var shade = 1.0;
-        if (i == 0 && light_type < 0.5) {
+        if (i == 0 && light_type < 0.5 && camera.resolution.w < 0.5) {
             shade = calc_shadow(in.world_position, length(camera.position.xyz - in.world_position));
         }
         lo = lo + (diffuse * radiance * diff_w + spec_term + sss_contrib + cc_term) * shade;

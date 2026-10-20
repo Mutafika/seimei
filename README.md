@@ -11,6 +11,7 @@ UI-agnostic 3D rendering library — wgpu + glam.
 ## Features
 
 - PBR レンダリングパイプライン（シャドウマッピング、MSAA 対応）
+- 追加の描画ビュー（`RenderView`）: 同じシーンを別のカメラで、同じフレーム・同じ submit の中に描く（分割画面・別ウインドウのビュー用。影・空・ポストプロセスなし）
 - glTF メッシュロード（`gltf` feature、デフォルト有効）
 - プロシージャルメッシュ生成（terrain / water plane / rock）
 - ポストプロセス（SSAO / Bloom / DOF / SSR / EdgeBevel）
