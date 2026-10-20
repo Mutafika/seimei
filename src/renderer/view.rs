@@ -5,6 +5,7 @@
 //! 1 回の submit の中で別のカメラを書いても、全部のパスが最後に書いた値で描かれる。
 //! そこでカメラ uniform・インスタンス・描画先をビューごとに持たせる。メッシュ・パイプライン・
 //! ライト・線・点は共有なので、どのビューにも同じ物が（同じフレームで）写る。
+//! ビューごとに違う案内線（立面の基準線など）は、ビューだけの線（[`Renderer::update_view_lines`]）に置く。
 //!
 //! 図面のペイン向けに、追加のビューは影・空・ポストプロセスを使わない。影の深度は既定のビューの
 //! カメラに合わせて焼いてあるので、別のカメラから引くと合わない（シェーダへは
@@ -63,6 +64,8 @@ pub struct RenderView {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     instance_buffer: wgpu::Buffer,
+    /// このビューだけに描く線（[`Renderer::update_view_lines`]）
+    lines: LineSet,
     targets: ViewTargets,
 }
 
@@ -128,8 +131,16 @@ impl Renderer {
             camera_buffer,
             camera_bind_group,
             instance_buffer,
+            lines: LineSet::new(&self.device, "View Line Vertex Buffer", 64),
             targets: Self::view_targets(&self.device, width, height, format, samples),
         }
+    }
+
+    /// このビューだけに描く線を置き換える（空で消す）。ほかのビューと既定のビューには出ない。
+    /// 面に隠れず（深さ判定なし）、プレビュー線より下に描く。線幅（`LineVertex::with_width`）も効く。
+    /// ビューごとに違う案内線（立面の基準線・ほかのビューのカーソル位置など）に使う
+    pub fn update_view_lines(&self, view: &mut RenderView, vertices: &[LineVertex]) {
+        view.lines.upload(&self.device, &self.queue, vertices);
     }
 
     /// ビューの寸法を変える。同じ寸法なら何もしない。
@@ -208,6 +219,7 @@ impl Renderer {
         let b = ViewBinding {
             camera_bind_group: &view.camera_bind_group,
             instance_buffer: &view.instance_buffer,
+            view_lines: Some(&view.lines),
             lines_depth_tested: options.lines_depth_tested,
             line_chunks: options.line_chunks.clone(),
             static_lines: options.static_lines,

@@ -5,6 +5,7 @@
 //! - 追加のビューを描いても、既定のビューの絵と `cull_stats` は変わらない
 //! - 追加のビューは影を落とさない（影の深度は既定のビューのカメラに合わせて焼いてある）
 //! - 線チャンクの範囲・プレビュー線の有無をビューごとに選べる
+//! - ビューだけの線（`update_view_lines`）はそのビューにだけ出て、面より手前・プレビュー線より下
 //!
 //! MSAA なし・4x・ポストプロセス（描画先が Rgba16Float になる）の全経路で縛る。
 //! アダプタが取れない環境では何もせずに通す。
@@ -363,4 +364,56 @@ fn default_view_draws_only_its_line_chunk_range() {
         assert!(pane.0 == 0 && pane.1 > 0, "{path}: 追加のビューは自分の範囲だけ");
     }
     r.set_default_line_chunks(None);
+}
+
+/// ビューだけの線: そのビューにだけ出る（ほかのビュー・既定のビューには出ない）。面に隠れず、
+/// プレビュー線とは重なった所でプレビュー線が勝つ。空で消える
+#[test]
+fn view_lines_belong_to_one_view_and_sit_under_the_preview() {
+    let Some(mut r) = renderer() else {
+        eprintln!("GPU アダプタが無いのでスキップ");
+        return;
+    };
+    let seg = |y: f32, z: f32, color| [LineVertex::with_width([-100.0, y, z], color, 3.0), LineVertex::with_width([100.0, y, z], color, 3.0)];
+    let cam = top(0.0, 0.0, 300.0);
+    // 赤い箱（上面 z=50）の下（z=-200）を通る緑の線＝面に隠れないか。y=40 はプレビュー線（青）と同じ所
+    let instances = [baked([0.0; 3], [1.0; 3], RED)];
+    let mut green = seg(-20.0, -200.0, GREEN).to_vec();
+    green.extend(seg(40.0, 0.0, GREEN));
+    r.update_preview_lines(&seg(40.0, 0.0, BLUE));
+    for (path, q) in quality_paths() {
+        r.set_quality(q).expect("quality");
+        r.set_lines_depth_tested(true);
+        let mut a = r.create_view(N, N);
+        let mut b = r.create_view(N, N);
+        r.update_view_lines(&mut a, &green);
+        let mut enc = r.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let opts = RenderViewOptions { lines_depth_tested: true, ..Default::default() };
+        r.render_view(&mut enc, &mut a, &cam, &instances, 1, &opts);
+        r.render_view(&mut enc, &mut b, &cam, &instances, 1, &opts);
+        r.queue().submit(std::iter::once(enc.finish()));
+        let img_a = r.read_view_rgba(&a).unwrap();
+        let img_b = r.read_view_rgba(&b).unwrap();
+        let default = count(&r.render_offscreen(&cam, &instances, 1, N, N).unwrap());
+        // 画面の y（上が +Y・幅 300 を 160px）
+        let row = |img: &[u8], wy: f32| -> (usize, usize, usize) {
+            let py = ((150.0 - wy) / 300.0 * N as f32) as usize;
+            count(&img[py * N as usize * 4..(py + 1) * N as usize * 4])
+        };
+        let (a_low, a_prev) = (row(&img_a, -20.0), row(&img_a, 40.0));
+        eprintln!("{path}: A 全体 {:?} / 箱の下の線の行 {a_low:?} / プレビューと重なる行 {a_prev:?} / B {:?} / 既定 {default:?}", count(&img_a), count(&img_b));
+        // 線は幅 200（画面の 2/3 = 約 106px）。箱（幅 100 = 約 53px）の上を横切っても欠けない
+        let len = N as usize * 2 / 3;
+        assert!(a_low.1 >= len - 2, "{path}: 箱の下を通るビューの線が、箱を横切って全部出る（面に隠れない）: {a_low:?}");
+        assert!(a_prev.2 >= len - 2 && a_prev.1 == 0, "{path}: 重なった所はプレビュー線が上: {a_prev:?}");
+        assert_eq!(count(&img_b).1, 0, "{path}: ほかのビューには出ない");
+        assert_eq!(default.1, 0, "{path}: 既定のビューには出ない");
+        r.update_view_lines(&mut a, &[]);
+        let mut enc = r.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        r.render_view(&mut enc, &mut a, &cam, &instances, 1, &opts);
+        r.queue().submit(std::iter::once(enc.finish()));
+        assert_eq!(count(&r.read_view_rgba(&a).unwrap()).1, 0, "{path}: 空で消える");
+    }
+    r.set_lines_depth_tested(false);
+    r.update_preview_lines(&[]);
 }

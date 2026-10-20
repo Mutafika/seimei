@@ -214,6 +214,8 @@ impl LineSet {
 struct ViewBinding<'a> {
     camera_bind_group: &'a wgpu::BindGroup,
     instance_buffer: &'a wgpu::Buffer,
+    /// このビューだけの線（[`Renderer::update_view_lines`]）。既定のビューは None
+    view_lines: Option<&'a LineSet>,
     lines_depth_tested: bool,
     /// 描く線チャンクの id の範囲（None = 全部）
     line_chunks: Option<std::ops::Range<u32>>,
@@ -2284,6 +2286,7 @@ impl Renderer {
         ViewBinding {
             camera_bind_group: &self.camera_bind_group,
             instance_buffer: &self.instance_buffer,
+            view_lines: None,
             lines_depth_tested: self.lines_depth_tested,
             line_chunks: self.default_line_chunks.clone(),
             static_lines: true,
@@ -2342,6 +2345,10 @@ impl Renderer {
             if b.line_chunks.as_ref().is_none_or(|r| r.contains(id)) {
                 set.draw(render_pass, static_thin, static_wide);
             }
+        }
+        // ビューだけの線（基準線など）。面に隠れない・プレビュー線よりは下
+        if let Some(lines) = b.view_lines {
+            lines.draw(render_pass, thin, wide);
         }
         // プレビュー線（作図中のラバーバンド等）は深さ判定の設定に関わらず常に手前に描く
         // （作図中の案内が面に隠れると困る）。
