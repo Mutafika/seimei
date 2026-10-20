@@ -209,6 +209,23 @@ impl LineSet {
     }
 }
 
+/// 1 回の描画で「ビューごとに違うもの」。既定のビュー（`render_to_view`）は Renderer 自身のものを、
+/// 追加のビュー（`render_view`）は [`RenderView`] のものを渡す。メッシュ・パイプライン・ライトは共有。
+struct ViewBinding<'a> {
+    camera_bind_group: &'a wgpu::BindGroup,
+    instance_buffer: &'a wgpu::Buffer,
+    lines_depth_tested: bool,
+    /// 描く線チャンクの id の範囲（None = 全部）
+    line_chunks: Option<std::ops::Range<u32>>,
+    static_lines: bool,
+    preview_lines: bool,
+    points: bool,
+    splats: bool,
+}
+
+mod view;
+pub use view::{RenderView, RenderViewOptions};
+
 pub struct Renderer {
     // GPU resources
     device: Arc<wgpu::Device>,
@@ -923,21 +940,32 @@ impl Renderer {
 
     /// カメラユニフォームを更新
     pub fn update_camera(&self, camera: &Camera) {
-        let mut uniform = CameraUniform::from_camera(camera);
-        uniform.clip_min = self.clip_min;
-        uniform.clip_max = self.clip_max;
         // スクリーンスペース屈折/HDRモードのフラグ。z>=0.5 = ポストプロセス有効(HDRテクスチャへ描画)。
         // このとき各シェーダは tonemap/gamma を行わず線形のまま出力し、合成シェーダが一括で
         // tonemap+gamma する（二重処理＝ピンクのwashoutを防ぐ）。屈折のシーンカラーtexも有効。
         let hdr_flag = if self.post_process.is_some() { 1.0 } else { 0.0 };
-        uniform.resolution = [self.width as f32, self.height as f32, hdr_flag, 0.0];
+        let uniform = self.camera_uniform(
+            camera,
+            (self.clip_min, self.clip_max),
+            [self.width as f32, self.height as f32, hdr_flag, 0.0],
+        );
+        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+    }
+
+    /// カメラ uniform を組み立てる。`resolution` = [幅, 高さ, HDR(≥0.5), 影なし(≥0.5)]。
+    /// 肌・FX・溶解・フォグは Renderer の設定をそのまま使う（ビューが違っても同じ）。
+    fn camera_uniform(&self, camera: &Camera, clip: ([f32; 4], [f32; 4]), resolution: [f32; 4]) -> CameraUniform {
+        let mut uniform = CameraUniform::from_camera(camera);
+        uniform.clip_min = clip.0;
+        uniform.clip_max = clip.1;
+        uniform.resolution = resolution;
         uniform.skin_params = self.skin_params;
         uniform.fx_params = self.fx_params;
         uniform.fx_params2 = self.fx_params2;
         uniform.melt = self.melt;
         uniform.fog_params = self.fog_params;
         uniform.fog_color = self.fog_color;
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
+        uniform
     }
 
     /// 距離フォグ（大気遠近）をセット。
@@ -1442,6 +1470,7 @@ impl Renderer {
         } else {
             wgpu::LoadOp::Clear(1.0)
         };
+        let b = self.default_binding();
 
         if has_pp {
             // === スクリーンスペース屈折 2パス描画 ===
@@ -1463,8 +1492,8 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
 
-                self.draw_opaque_meshes(&mut pass, instances, opaque_count, instance_size, &vis);
-                self.draw_splats_points_lines(&mut pass);
+                self.draw_opaque_meshes(&mut pass, &b, instances, opaque_count, instance_size, &vis);
+                self.draw_splats_points_lines(&mut pass, &b);
             }
 
             // HDR シーンカラー → scene_copy へコピー（屈折で背景としてサンプルする）。
@@ -1501,7 +1530,7 @@ impl Renderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.draw_depth_prepass(&mut pass, instances, opaque_count, instance_size);
+                self.draw_depth_prepass(&mut pass, &b, instances, opaque_count, instance_size);
             }
 
             // パスB: 半透明（屈折ON）。HDR/深度は Load（clearしない）。
@@ -1521,7 +1550,7 @@ impl Renderer {
                     timestamp_writes: None,
                     occlusion_query_set: None,
                 });
-                self.draw_transparent_meshes(&mut pass, instances, opaque_count, instance_size, true);
+                self.draw_transparent_meshes(&mut pass, &b, instances, opaque_count, instance_size, true);
             }
         } else {
             // === 従来の単一パス描画（屈折なし、MSAA直描き可） ===
@@ -1547,8 +1576,8 @@ impl Renderer {
                 occlusion_query_set: None,
             });
 
-            self.draw_meshes(&mut render_pass, instances, opaque_count, instance_size, &vis);
-            self.draw_splats_points_lines(&mut render_pass);
+            self.draw_meshes(&mut render_pass, &b, instances, opaque_count, instance_size, &vis);
+            self.draw_splats_points_lines(&mut render_pass, &b);
         }
 
         // ポストプロセス
@@ -2156,25 +2185,7 @@ impl Renderer {
 
     /// インスタンスデータをGPUに書き込み
     fn upload_instances(&mut self, instances: &[(String, InstanceData)]) {
-        if instances.is_empty() {
-            return;
-        }
-        let mut all_data: Vec<u8> = Vec::with_capacity(
-            instances.len() * std::mem::size_of::<InstanceData>()
-        );
-        for (_, inst_data) in instances {
-            all_data.extend_from_slice(bytemuck::bytes_of(inst_data));
-        }
-        let required = all_data.len() as u64;
-        if required > self.instance_buffer.size() {
-            self.instance_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Instance Buffer"),
-                size: required,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-        }
-        self.queue.write_buffer(&self.instance_buffer, 0, &all_data);
+        Self::write_instances(&self.device, &self.queue, &mut self.instance_buffer, instances);
     }
 
     /// シャドウ深度パスを実行
@@ -2257,75 +2268,99 @@ impl Renderer {
         }
     }
 
+    /// 既定のビュー（`render_to_view`）の描き方: Renderer 自身のカメラとインスタンスで、線と点は全部。
+    fn default_binding(&self) -> ViewBinding<'_> {
+        ViewBinding {
+            camera_bind_group: &self.camera_bind_group,
+            instance_buffer: &self.instance_buffer,
+            lines_depth_tested: self.lines_depth_tested,
+            line_chunks: None,
+            static_lines: true,
+            preview_lines: true,
+            points: true,
+            splats: true,
+        }
+    }
+
     /// メッシュ描画（シャドウなし）
     fn draw_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
+        b: &ViewBinding<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
         vis: &[bool],
     ) {
-        self.draw_opaque_meshes(render_pass, instances, opaque_count, instance_size, vis);
-        self.draw_transparent_meshes(render_pass, instances, opaque_count, instance_size, false);
+        self.draw_opaque_meshes(render_pass, b, instances, opaque_count, instance_size, vis);
+        self.draw_transparent_meshes(render_pass, b, instances, opaque_count, instance_size, false);
     }
 
     /// Gaussian Splat / ポイント / 線分を描画（不透明寄りの補助ジオメトリ）。
     /// 屈折2パス描画ではパスA（不透明）側で描く＝屈折の背景に含める。
-    fn draw_splats_points_lines<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>) {
+    fn draw_splats_points_lines<'a>(&'a self, render_pass: &mut wgpu::RenderPass<'a>, b: &ViewBinding<'a>) {
         if let Some(splat_pipeline) = &self.splat_pipeline {
-            if !self.splat_clouds.is_empty() {
+            if b.splats && !self.splat_clouds.is_empty() {
                 render_pass.set_pipeline(splat_pipeline);
-                render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                render_pass.set_bind_group(0, b.camera_bind_group, &[]);
                 for instance in self.splat_clouds.values() {
                     render_pass.set_bind_group(1, &instance.bind_group, &[]);
                     render_pass.draw(0..4, 0..instance.data.count);
                 }
             }
         }
-        if self.point_vertex_count > 0 {
+        if b.points && self.point_vertex_count > 0 {
             render_pass.set_pipeline(&self.point_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, b.camera_bind_group, &[]);
             render_pass.set_vertex_buffer(0, self.point_vertex_buffer.slice(..));
             render_pass.draw(0..self.point_vertex_count, 0..1);
         }
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(0, b.camera_bind_group, &[]);
         let (thin, wide) = (&self.line_pipeline, &self.wide_line_pipeline);
-        let (static_thin, static_wide) = if self.lines_depth_tested {
+        let (static_thin, static_wide) = if b.lines_depth_tested {
             (&self.depth_tested_line_pipelines.0, &self.depth_tested_line_pipelines.1)
         } else {
             (thin, wide)
         };
-        self.lines.draw(render_pass, static_thin, static_wide);
+        if b.static_lines {
+            self.lines.draw(render_pass, static_thin, static_wide);
+        }
         // 静的線チャンク（部分更新用）を同一パイプラインで描く。線は深度ソート不要なので
         // HashMap の順序で問題ない。チャンク数は数十で draw call は無害。
-        for set in self.line_chunks.values() {
-            set.draw(render_pass, static_thin, static_wide);
+        for (id, set) in &self.line_chunks {
+            if b.line_chunks.as_ref().is_none_or(|r| r.contains(id)) {
+                set.draw(render_pass, static_thin, static_wide);
+            }
         }
         // プレビュー線（作図中のラバーバンド等）は深さ判定の設定に関わらず常に手前に描く
         // （作図中の案内が面に隠れると困る）。
-        self.preview_lines.draw(render_pass, thin, wide);
+        if b.preview_lines {
+            self.preview_lines.draw(render_pass, thin, wide);
+        }
     }
 
     /// 不透明メッシュ `[0..opaque_count)` のみを main_pipeline で描画。
     /// 各インスタンスが `vp` の視錐台に掛かるかを一括判定する。
     /// `cull=false` のメッシュと未登録メッシュは常に true（消えるより描く方がマシ）。
     fn visibility(&self, instances: &[(String, InstanceData)], vp: glam::Mat4) -> Vec<bool> {
+        let v = self.visibility_unrecorded(instances, vp);
+        let visible = v.iter().filter(|b| **b).count();
+        self.cull_visible.store(visible, std::sync::atomic::Ordering::Relaxed);
+        self.cull_total.store(instances.len(), std::sync::atomic::Ordering::Relaxed);
+        v
+    }
+
+    /// [`Self::visibility`] と同じ判定で、`cull_stats` を書き換えない。
+    /// 追加のビューが既定のビューの計測値を上書きしないように使う。
+    pub(crate) fn visibility_unrecorded(&self, instances: &[(String, InstanceData)], vp: glam::Mat4) -> Vec<bool> {
         let planes = frustum_planes(vp);
-        let mut visible = 0usize;
-        let v: Vec<bool> = instances
+        instances
             .iter()
             .map(|(id, inst)| match self.meshes.get(id) {
                 Some(m) if m.cull => instance_visible(&planes, &inst.model, &m.aabb),
                 _ => true,
             })
-            .collect();
-        for b in &v {
-            visible += *b as usize;
-        }
-        self.cull_visible.store(visible, std::sync::atomic::Ordering::Relaxed);
-        self.cull_total.store(instances.len(), std::sync::atomic::Ordering::Relaxed);
-        v
+            .collect()
     }
 
     /// 直近の視錐台カリング統計 (描いた数, 全数)。効いているかを実機で見るための計測口。
@@ -2339,13 +2374,14 @@ impl Renderer {
     fn draw_opaque_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
+        b: &ViewBinding<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
         vis: &[bool],
     ) {
         render_pass.set_pipeline(&self.main_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(0, b.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
 
         // 連続する同一 mesh_id をハードウェアインスタンシングで 1 draw に統合する。
@@ -2374,7 +2410,7 @@ impl Renderer {
                 // まとめて描く＝インスタンシングの統合を保ったまま間引ける。
                 for (base, run) in visible_runs(vis, i, j) {
                     let offset = base as u64 * instance_size;
-                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                    render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
                     render_pass.draw_indexed(0..mesh.index_count, 0, 0..run as u32);
                 }
             }
@@ -2412,6 +2448,7 @@ impl Renderer {
     fn draw_depth_prepass<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
+        b: &ViewBinding<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
@@ -2420,7 +2457,7 @@ impl Renderer {
             return;
         }
         render_pass.set_pipeline(&self.depth_prepass_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(0, b.camera_bind_group, &[]);
         for (i, (mesh_id, inst)) in instances[opaque_count..].iter().enumerate() {
             if inst.model_id != crate::MODEL_GLASS {
                 continue; // ガラス(誘電体透過)メッシュのみ深度先書き
@@ -2429,7 +2466,7 @@ impl Renderer {
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let offset = idx as u64 * instance_size;
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
             }
@@ -2439,6 +2476,7 @@ impl Renderer {
     fn draw_transparent_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
+        b: &ViewBinding<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
         instance_size: u64,
@@ -2460,13 +2498,13 @@ impl Renderer {
                 if want_mode != cur_mode {
                     if is_refr {
                         render_pass.set_pipeline(&self.refraction_pipeline);
-                        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        render_pass.set_bind_group(0, b.camera_bind_group, &[]);
                         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
                         // group2 = 不透明描画済みシーンカラーのコピー。
                         render_pass.set_bind_group(2, &self.scene_color_bind_group, &[]);
                     } else {
                         render_pass.set_pipeline(&self.transparent_pipeline);
-                        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                        render_pass.set_bind_group(0, b.camera_bind_group, &[]);
                         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
                     }
                     cur_mode = want_mode;
@@ -2476,7 +2514,7 @@ impl Renderer {
                     // 屈折パイプラインは group2 を scene_color に占有済み。group3 は使わない。
                     let offset = idx as u64 * instance_size;
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                    render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
                     render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 } else {
@@ -2486,7 +2524,7 @@ impl Renderer {
                     render_pass.set_bind_group(3, paint_bg, &[]);
                     let offset = idx as u64 * instance_size;
                     render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    render_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
+                    render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
                     render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                     render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
                 }
