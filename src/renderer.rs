@@ -276,6 +276,8 @@ pub struct Renderer {
     depth_tested_line_pipelines: (wgpu::RenderPipeline, wgpu::RenderPipeline),
     /// 静的線（`update_lines` と線チャンク）を深さ判定ありで描くか。既定 false＝常に手前
     lines_depth_tested: bool,
+    /// 既定のビュー（`render_to_view`）が描く線チャンクの id の範囲。None = 全部（従来どおり）
+    default_line_chunks: Option<std::ops::Range<u32>>,
     point_pipeline: wgpu::RenderPipeline,
     // Buffers
     instance_buffer: wgpu::Buffer,
@@ -698,6 +700,7 @@ impl Renderer {
             wide_line_pipeline,
             depth_tested_line_pipelines,
             lines_depth_tested: false,
+            default_line_chunks: None,
             point_pipeline,
             instance_buffer,
             lines,
@@ -1274,6 +1277,14 @@ impl Renderer {
     /// 静的線を深さ判定ありで描いているか
     pub fn lines_depth_tested(&self) -> bool {
         self.lines_depth_tested
+    }
+
+    /// 既定のビュー（`render_to_view`・`render_offscreen*`）が描く線チャンクを id の範囲で絞る。
+    /// None = 全部（既定・従来どおり）。追加のビュー（[`RenderView`]）だけが使う線の組
+    /// （例: 3D の画面と並べて出す平面図の線）を、範囲の外の id に置いて既定のビューから隠す用途。
+    /// `update_lines` の線とプレビュー線には効かない。
+    pub fn set_default_line_chunks(&mut self, range: Option<std::ops::Range<u32>>) {
+        self.default_line_chunks = range;
     }
 
     /// 静的線チャンクを削除する。
@@ -2268,13 +2279,13 @@ impl Renderer {
         }
     }
 
-    /// 既定のビュー（`render_to_view`）の描き方: Renderer 自身のカメラとインスタンスで、線と点は全部。
+    /// 既定のビュー（`render_to_view`）の描き方: Renderer 自身のカメラとインスタンスで、線チャンクは `default_line_chunks` の範囲・ほかの線と点は全部。
     fn default_binding(&self) -> ViewBinding<'_> {
         ViewBinding {
             camera_bind_group: &self.camera_bind_group,
             instance_buffer: &self.instance_buffer,
             lines_depth_tested: self.lines_depth_tested,
-            line_chunks: None,
+            line_chunks: self.default_line_chunks.clone(),
             static_lines: true,
             preview_lines: true,
             points: true,

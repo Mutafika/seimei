@@ -332,3 +332,35 @@ fn views_follow_resize_and_quality_changes() {
         }
     }
 }
+
+/// 既定のビューが描く線チャンクを範囲で絞れる（追加のビューだけが使う線の組を既定のビューに出さない）
+#[test]
+fn default_view_draws_only_its_line_chunk_range() {
+    let Some(mut r) = renderer() else {
+        eprintln!("GPU アダプタが無いのでスキップ");
+        return;
+    };
+    let seg = |y: f32, color| [LineVertex::with_width([-100.0, y, 0.0], color, 3.0), LineVertex::with_width([100.0, y, 0.0], color, 3.0)];
+    r.update_line_chunk(1, &seg(-50.0, RED)); // 既定のビューの組
+    r.update_line_chunk(1_000_001, &seg(50.0, GREEN)); // 追加のビューだけの組
+    let cam = top(0.0, 0.0, 300.0);
+    for (path, q) in quality_paths() {
+        r.set_quality(q).expect("quality");
+        r.set_default_line_chunks(None);
+        let all = count(&r.render_offscreen(&cam, &[], 0, N, N).unwrap());
+        r.set_default_line_chunks(Some(0..1_000_000));
+        let main = count(&r.render_offscreen(&cam, &[], 0, N, N).unwrap());
+        // 追加のビューは既定のビューの絞り込みと関係なく自分の範囲を描く
+        let mut view = r.create_view(N, N);
+        let mut enc = r.device().create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let opts = RenderViewOptions { line_chunks: Some(1_000_000..2_000_000), ..Default::default() };
+        r.render_view(&mut enc, &mut view, &cam, &[], 0, &opts);
+        r.queue().submit(std::iter::once(enc.finish()));
+        let pane = count(&r.read_view_rgba(&view).unwrap());
+        eprintln!("{path}: 全部 {all:?} / 既定を絞る {main:?} / 追加のビュー {pane:?}");
+        assert!(all.0 > 0 && all.1 > 0, "{path}: 絞らなければ両方の組が出る（従来どおり）");
+        assert!(main.0 > 0 && main.1 == 0, "{path}: 既定のビューは自分の範囲だけ");
+        assert!(pane.0 == 0 && pane.1 > 0, "{path}: 追加のビューは自分の範囲だけ");
+    }
+    r.set_default_line_chunks(None);
+}
