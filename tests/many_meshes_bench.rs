@@ -10,7 +10,7 @@
 //! （部材の数は `SEIMEI_BENCH_N`・既定 24000）
 
 use seimei::math::{Point3, Vec3D};
-use seimei::{Camera, InstanceData, Light, MsaaSamples, QualitySettings, Renderer, ShadowQuality};
+use seimei::{Camera, InstanceData, Light, MsaaSamples, QualitySettings, Renderer, ShadowQuality, MULTI_DRAW_FEATURES};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,8 +25,12 @@ struct Gpu {
 fn gpu() -> Option<Gpu> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    let (device, queue) =
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()?;
+    // 一括描画の機能があれば頼む（無ければ 1 メッシュ 1 命令だけ測る）
+    let features = adapter.features() & MULTI_DRAW_FEATURES;
+    let (device, queue) = pollster::block_on(
+        adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }, None),
+    )
+    .ok()?;
     Some(Gpu { device: Arc::new(device), queue: Arc::new(queue) })
 }
 
@@ -58,8 +62,9 @@ enum Shadow {
 }
 
 /// 1 つの組み合わせを測る: (記録 ms, submit ms, GPU 待ち ms) の中央値
-fn measure(g: &Gpu, n: usize, distinct: bool, shadow: Shadow) -> (f64, f64, f64) {
+fn measure(g: &Gpu, n: usize, distinct: bool, shadow: Shadow, multi: bool) -> (f64, f64, f64) {
     let mut r = Renderer::new(g.device.clone(), g.queue.clone(), wgpu::TextureFormat::Rgba8Unorm, W, H).expect("renderer");
+    r.set_multi_draw(multi);
     r.set_quality(QualitySettings {
         msaa: MsaaSamples::Off,
         shadow: if shadow == Shadow::Off { ShadowQuality::Off } else { ShadowQuality::Low },
@@ -142,8 +147,9 @@ fn many_distinct_meshes_frame_cost() {
     };
     let n: usize = std::env::var("SEIMEI_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(24_000);
     println!("部材 {n}・{W}×{H}・MSAA なし（ms・10 フレームの中央値）");
-    println!("| 形 | 影 | 記録（render_to_view） | submit | GPU 待ち |");
-    println!("|---|---|---:|---:|---:|");
+    let multi_ok = g.device.features().contains(MULTI_DRAW_FEATURES);
+    println!("| 形 | 影 | 一括描画 | 記録（render_to_view） | submit | GPU 待ち |");
+    println!("|---|---|---|---:|---:|---:|");
     for distinct in [true, false] {
         for shadow in [Shadow::Off, Shadow::Still, Shadow::Moving] {
             // 1 つだけ測る（呼び出しの木を採るとき）: SEIMEI_BENCH_ONLY=still 等
@@ -157,16 +163,22 @@ fn many_distinct_meshes_frame_cost() {
                     continue;
                 }
             }
-            let (rec, sub, wait) = measure(&g, n, distinct, shadow);
-            println!(
-                "| {} | {} | {rec:.1} | {sub:.1} | {wait:.1} |",
-                if distinct { "全部違う" } else { "全部同じ" },
-                match shadow {
-                    Shadow::Off => "なし",
-                    Shadow::Still => "4 カスケード・止まっている",
-                    Shadow::Moving => "4 カスケード・毎フレーム動く",
+            for multi in [false, true] {
+                if multi && !multi_ok {
+                    continue;
                 }
-            );
+                let (rec, sub, wait) = measure(&g, n, distinct, shadow, multi);
+                println!(
+                    "| {} | {} | {} | {rec:.1} | {sub:.1} | {wait:.1} |",
+                    if distinct { "全部違う" } else { "全部同じ" },
+                    match shadow {
+                        Shadow::Off => "なし",
+                        Shadow::Still => "4 カスケード・止まっている",
+                        Shadow::Moving => "4 カスケード・毎フレーム動く",
+                    },
+                    if multi { "あり" } else { "なし" }
+                );
+            }
         }
     }
 }
