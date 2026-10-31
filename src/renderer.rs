@@ -126,6 +126,30 @@ fn frustum_planes(vp: glam::Mat4) -> [glam::Vec4; 6] {
 }
 
 /// インスタンスが視錐台に掛かるか。model 行列でローカル AABB を世界へ移してから判定する。
+/// 影の深度パスを飛ばしてよいかの指紋（`Renderer::shadow_pass_key`）用の軽いハッシュ。FxHash と同じ混ぜ方
+struct KeyHasher(u64);
+
+impl KeyHasher {
+    fn word(&mut self, w: u64) {
+        self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    /// 長さも混ぜる（"ab"+"c" と "a"+"bc" を分ける）
+    fn bytes(&mut self, b: &[u8]) {
+        let mut chunks = b.chunks_exact(8);
+        for c in &mut chunks {
+            self.word(u64::from_le_bytes(c.try_into().unwrap_or([0; 8])));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.word(u64::from_le_bytes(last));
+        }
+        self.word(b.len() as u64);
+    }
+}
+
 fn instance_visible(planes: &[glam::Vec4; 6], model: &[[f32; 4]; 4], aabb: &[[f32; 3]; 2]) -> bool {
     let m = glam::Mat4::from_cols_array_2d(model);
     let lo = glam::Vec3::from(aabb[0]);
@@ -321,6 +345,13 @@ pub struct Renderer {
     /// シャドウ深度パスから外すメッシュID。空ドーム・遠景板のような「常にカメラを包む巨大メッシュ」は
     /// ライト正射影の箱に必ず入るので、除外しないとシーン全体を覆う影を落とす（＝真っ暗になる）。
     shadow_exclude: std::collections::HashSet<String>,
+    /// 影の深度に効くもの（メッシュの頂点・登録・削除と、影から外すメッシュ）を変えるたびに進める番号。
+    /// 影の深度パスを飛ばしてよいか（[`Self::shadow_pass_key`]）の材料
+    shadow_inputs_generation: u64,
+    /// 直前に影の深度パスを描いたときの [`Self::shadow_pass_key`]（0 = まだ描いていない／描き直しが要る）。
+    /// 同じなら影の深度は前のフレームと同じになるので描かない（2026-10-31・形が全部違う 2.4 万部材で
+    /// 4 カスケードの深度パスが 1 フレーム 60ms）
+    shadow_drawn_key: std::sync::atomic::AtomicU64,
     /// 空＋体積雲の背景（有効時のみ）。不透明メッシュより先に全画面へ描く。
     sky: Option<crate::sky::SkyPass>,
     // === Point Light Shadow Atlas ===
@@ -728,6 +759,8 @@ impl Renderer {
             cull_total: std::sync::atomic::AtomicUsize::new(0),
             light_view_proj: identity_vp,
             shadow_exclude: std::collections::HashSet::new(),
+            shadow_inputs_generation: 0,
+            shadow_drawn_key: std::sync::atomic::AtomicU64::new(0),
             sky: None,
             point_shadow_atlas: None,
             point_shadow_atlas_view: None,
@@ -813,6 +846,7 @@ impl Renderer {
         });
 
         let cull = self.meshes.get(id).map_or(true, |m| m.cull);
+        self.shadow_inputs_generation += 1;
         self.meshes.insert(id.to_string(), MeshInstance {
             vertex_buffer,
             index_buffer,
@@ -827,6 +861,7 @@ impl Renderer {
     /// 視錐台カリングの対象から外す（compute で頂点を書き換えるメッシュ用）。
     /// 頂点更新をまたいでも保持される。
     pub fn set_mesh_cull(&mut self, id: &str, cull: bool) {
+        self.shadow_inputs_generation += 1;
         if let Some(m) = self.meshes.get_mut(id) {
             m.cull = cull;
         }
@@ -916,6 +951,7 @@ impl Renderer {
             .get(id)
             .map_or(false, |e| byte_size <= e.vertex_buffer.size() && idx_size <= e.index_buffer.size());
         if reuse {
+            self.shadow_inputs_generation += 1;
             {
                 let e = self.meshes.get(id).unwrap();
                 self.queue.write_buffer(&e.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
@@ -933,11 +969,13 @@ impl Renderer {
 
     /// メッシュを削除
     pub fn remove_mesh(&mut self, id: &str) {
+        self.shadow_inputs_generation += 1;
         self.meshes.remove(id);
     }
 
     /// 全メッシュをクリア
     pub fn clear_meshes(&mut self) {
+        self.shadow_inputs_generation += 1;
         self.meshes.clear();
     }
 
@@ -1064,6 +1102,7 @@ impl Renderer {
             self.shadow_pass_bind_group = Some(bg);
         }
         self.shadow_enabled = true;
+        self.shadow_drawn_key.store(0, std::sync::atomic::Ordering::Relaxed);
         info!("Shadow map enabled ({}x{})", SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
         Ok(())
     }
@@ -1072,6 +1111,7 @@ impl Renderer {
     /// 戻る（古い深度が焼き付いたままにならない）。
     pub fn disable_shadow_map(&mut self) {
         self.shadow_enabled = false;
+        self.shadow_drawn_key.store(0, std::sync::atomic::Ordering::Relaxed);
         self.update_shadow_matrix([
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1093,6 +1133,7 @@ impl Renderer {
         S: Into<String>,
     {
         self.shadow_exclude = ids.into_iter().map(Into::into).collect();
+        self.shadow_inputs_generation += 1;
     }
 
     // ── 空＋体積雲の背景 ──
@@ -1422,7 +1463,7 @@ impl Renderer {
 
         // シャドウパス（有効時のみ、別エンコーダでsubmit）
         if self.shadow_enabled {
-            self.render_shadow_pass(instances, instance_size);
+            self.render_shadow_pass(instances);
         }
 
         // 視錐台カリング: カメラに映らないインスタンスは draw ごと省く。
@@ -1505,7 +1546,7 @@ impl Renderer {
                     occlusion_query_set: None,
                 });
 
-                self.draw_opaque_meshes(&mut pass, &b, instances, opaque_count, instance_size, &vis);
+                self.draw_opaque_meshes(&mut pass, &b, instances, opaque_count, &vis);
                 self.draw_splats_points_lines(&mut pass, &b);
             }
 
@@ -2201,8 +2242,37 @@ impl Renderer {
         Self::write_instances(&self.device, &self.queue, &mut self.instance_buffer, instances);
     }
 
-    /// シャドウ深度パスを実行
-    fn render_shadow_pass(&self, instances: &[(String, InstanceData)], instance_size: u64) {
+    /// 影の深度を決めるもの全部の指紋（0 は返さない）: 影に効くメッシュの変更の番号・カスケードのライト VP・
+    /// インスタンスの形の id と配置の行列。色・材質は影の深度パスのシェーダが読まないので入れない（選択の強調で
+    /// 描き直さない）。compute が頂点を書き換えるメッシュ（`cull == false`）があれば None（CPU から変化が
+    /// 見えないので毎フレーム描く）
+    fn shadow_pass_key(&self, instances: &[(String, InstanceData)]) -> Option<u64> {
+        if self.meshes.values().any(|m| !m.cull) {
+            return None;
+        }
+        // 毎フレーム全インスタンスを通すので軽いハッシュ（FxHash と同じ混ぜ方・8 バイトずつ）。標準の
+        // SipHash だと 2.4 万インスタンスで数 ms かかった
+        let mut h = KeyHasher(0);
+        h.word(self.shadow_inputs_generation);
+        h.word(self.shadow_cascade_count as u64);
+        h.bytes(bytemuck::cast_slice(&self.shadow_cascade_vps));
+        h.word(instances.len() as u64);
+        for (id, inst) in instances {
+            h.bytes(id.as_bytes());
+            h.bytes(bytemuck::cast_slice(&inst.model));
+        }
+        Some(h.0.max(1))
+    }
+
+    /// シャドウ深度パスを実行。影の深度を決めるものが前に描いたときと同じなら描かない（影のテクスチャには
+    /// 前の深度がそのまま残っていて、描いても同じ深度になる）
+    fn render_shadow_pass(&self, instances: &[(String, InstanceData)]) {
+        let key = self.shadow_pass_key(instances);
+        let drawn = self.shadow_drawn_key.load(std::sync::atomic::Ordering::Relaxed);
+        if key.is_some_and(|k| k == drawn) {
+            return;
+        }
+        self.shadow_drawn_key.store(key.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         if let (Some(shadow_depth_view), Some(shadow_pipeline), Some(shadow_light_vp_bg)) = (
             Some(&self.shadow_map_view),
             &self.shadow_pipeline,
@@ -2253,6 +2323,8 @@ impl Renderer {
 
                     // 深度のみのパス。連続同一 mesh_id をインスタンシングで 1 draw に統合する
                     // （深度出力は不変・約2倍だった影の draw call をランレングス分削減）。
+                    // インスタンスのバッファはカスケードの頭で 1 回つなぎ、範囲で選ぶ（本描画と同じ）
+                    shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
                     let mut i = 0usize;
                     while i < instances.len() {
                         let mesh_id = &instances[i].0;
@@ -2266,9 +2338,7 @@ impl Renderer {
                                 shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                                 shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                                 for (base, run) in visible_runs(&vis, i, j) {
-                                    let offset = base as u64 * instance_size;
-                                    shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(offset..));
-                                    shadow_pass.draw_indexed(0..mesh.index_count, 0, 0..run as u32);
+                                    shadow_pass.draw_indexed(0..mesh.index_count, 0, base as u32..(base + run) as u32);
                                 }
                             }
                         }
@@ -2306,7 +2376,7 @@ impl Renderer {
         instance_size: u64,
         vis: &[bool],
     ) {
-        self.draw_opaque_meshes(render_pass, b, instances, opaque_count, instance_size, vis);
+        self.draw_opaque_meshes(render_pass, b, instances, opaque_count, vis);
         self.draw_transparent_meshes(render_pass, b, instances, opaque_count, instance_size, false);
     }
 
@@ -2395,7 +2465,6 @@ impl Renderer {
         b: &ViewBinding<'a>,
         instances: &[(String, InstanceData)],
         opaque_count: usize,
-        instance_size: u64,
         vis: &[bool],
     ) {
         render_pass.set_pipeline(&self.main_pipeline);
@@ -2403,11 +2472,19 @@ impl Renderer {
         render_pass.set_bind_group(1, &self.light_bind_group, &[]);
 
         // 連続する同一 mesh_id をハードウェアインスタンシングで 1 draw に統合する。
-        // 同一 mesh なら texture/paint も同一なので bind group はラン先頭で 1 回設定。
         // 色・材質・finish 等の per-instance 属性は instance_buffer の連番スロットから
-        // instance_index で引かれるため、`base..base+run` の範囲描画で各インスタンスが
+        // インスタンス単位の頂点属性で引かれるため、`base..base+run` の範囲描画で各インスタンスが
         // 正しい属性を得る（bamiri 側が不透明区間を mesh_id で安定グルーピング済みなら
         // n→1、未グルーピングでもラン長 1 で従来と同一挙動＝後方互換）。
+        //
+        // 描画命令を減らす（2026-10-31・形が全部違う 2.4 万部材で 1 フレームの描画命令に 100ms）:
+        // - インスタンスのバッファはパスの頭で 1 回だけ全体をつなぎ、描く区間はインスタンスの範囲
+        //   `base..base+run`（first_instance）で選ぶ。以前はランごとにバッファを `base` の位置から
+        //   つなぎ直していた（同じ属性を読むので描画結果は同じ）
+        // - group 2 / 3 は直前と同じ bind group なら設定し直さない（テクスチャの無いメッシュはどれも同じ組）
+        render_pass.set_vertex_buffer(1, b.instance_buffer.slice(..));
+        let mut bound_tex: Option<*const wgpu::BindGroup> = None;
+        let mut bound_paint: Option<*const wgpu::BindGroup> = None;
         let opaque = &instances[..opaque_count];
         let mut i = 0usize;
         while i < opaque.len() {
@@ -2418,18 +2495,22 @@ impl Renderer {
             }
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
-                render_pass.set_bind_group(2, tex_bind_group, &[]);
+                if bound_tex != Some(tex_bind_group as *const _) {
+                    render_pass.set_bind_group(2, tex_bind_group, &[]);
+                    bound_tex = Some(tex_bind_group as *const _);
+                }
                 // group 3 = 体表塗布(色+被覆 / 塗布時法線 を束ねた1グループ)。無ければ透明。
                 let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
-                render_pass.set_bind_group(3, paint_bg, &[]);
+                if bound_paint != Some(paint_bg as *const _) {
+                    render_pass.set_bind_group(3, paint_bg, &[]);
+                    bound_paint = Some(paint_bg as *const _);
+                }
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 // 視錐台外のインスタンスを飛ばす。ランの中で「連続して見える区間」だけを
                 // まとめて描く＝インスタンシングの統合を保ったまま間引ける。
                 for (base, run) in visible_runs(vis, i, j) {
-                    let offset = base as u64 * instance_size;
-                    render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
-                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..run as u32);
+                    render_pass.draw_indexed(0..mesh.index_count, 0, base as u32..(base + run) as u32);
                 }
             }
             i = j;
