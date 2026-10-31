@@ -166,6 +166,61 @@ fn frustum_planes(vp: glam::Mat4) -> [glam::Vec4; 6] {
 }
 
 /// インスタンスが視錐台に掛かるか。model 行列でローカル AABB を世界へ移してから判定する。
+/// 一括描画に要るデバイスの機能（Apple の GPU・Vulkan・DX12 にある。WebGPU には無い）
+pub const MULTI_DRAW_FEATURES: wgpu::Features =
+    wgpu::Features::MULTI_DRAW_INDIRECT.union(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+
+/// `DrawIndexedIndirectArgs` と同じ並び（index_count, instance_count, first_index, base_vertex, first_instance）
+type IndirectEntry = [u32; 5];
+const INDIRECT_ENTRY_BYTES: u64 = std::mem::size_of::<IndirectEntry>() as u64;
+
+/// 一括描画の一覧のバッファ（足りなければ作り直す）
+struct IndirectArgs {
+    buffer: wgpu::Buffer,
+    /// 入る件数
+    capacity: u64,
+    label: &'static str,
+}
+
+impl IndirectArgs {
+    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        Self { buffer: Self::create(device, label, 64), capacity: 64, label }
+    }
+
+    fn create(device: &wgpu::Device, label: &'static str, entries: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: entries * INDIRECT_ENTRY_BYTES,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// `entries` 件が入るようにする
+    fn ensure(&mut self, device: &wgpu::Device, entries: u64) {
+        if entries > self.capacity {
+            let cap = entries.next_power_of_two();
+            self.buffer = Self::create(device, self.label, cap);
+            self.capacity = cap;
+        }
+    }
+}
+
+/// 一括描画の 1 区間（同じページ・同じ bind group の描画が続く所）
+struct DrawSegment<'a> {
+    page: u32,
+    tex: Option<&'a wgpu::BindGroup>,
+    paint: Option<&'a wgpu::BindGroup>,
+    /// 一覧の中の頭と件数
+    first: u32,
+    count: u32,
+}
+
+fn indirect_entry(mesh: &MeshInstance, base: usize, run: usize) -> IndirectEntry {
+    let (indices, base_vertex) = mesh.page_draw();
+    [indices.end - indices.start, run as u32, indices.start, base_vertex as u32, base as u32]
+}
+
 /// 影の深度パスを飛ばしてよいかの指紋（`Renderer::shadow_pass_key`）用の軽いハッシュ。FxHash と同じ混ぜ方
 struct KeyHasher(u64);
 
@@ -278,6 +333,10 @@ impl LineSet {
 struct ViewBinding<'a> {
     camera_bind_group: &'a wgpu::BindGroup,
     instance_buffer: &'a wgpu::Buffer,
+    /// 不透明の一括描画（`multi_draw_indexed_indirect`）の一覧を書くバッファ。None = 1 メッシュ 1 命令で描く
+    /// （機能の無いデバイス・追加のビュー）。1 回の submit の中で同じバッファを 2 つのパスが使うと後に書いた一覧で
+    /// 両方が描かれるので、パスごとに別のバッファ
+    indirect: Option<&'a wgpu::Buffer>,
     /// このビューだけの線（[`Renderer::update_view_lines`]）。既定のビューは None
     view_lines: Option<&'a LineSet>,
     lines_depth_tested: bool,
@@ -362,6 +421,12 @@ pub struct Renderer {
     meshes: HashMap<String, MeshInstance>,
     /// メッシュの頂点・インデックスを詰めるページ（`mesh_arena.rs`）
     mesh_arena: mesh_arena::MeshArena,
+    /// 一括描画（`multi_draw_indexed_indirect`・first_instance つき）を使うか。デバイスに
+    /// `MULTI_DRAW_INDIRECT | INDIRECT_FIRST_INSTANCE` があるときだけ true にできる（[`Self::set_multi_draw`]）
+    multi_draw: bool,
+    /// 一括描画の一覧（既定のビューの不透明・影の深度パス）
+    main_indirect: IndirectArgs,
+    shadow_indirect: IndirectArgs,
     // State
     clear_color: wgpu::Color,
     /// trueの場合、render_to_viewでClearをスキップ（外部で事前描画済みの場合）
@@ -745,6 +810,9 @@ impl Renderer {
             &scene_color_bind_group_layout, 1,
         )?;
 
+        let multi_draw = device.features().contains(MULTI_DRAW_FEATURES);
+        let main_indirect = IndirectArgs::new(&device, "Main Indirect Args");
+        let shadow_indirect = IndirectArgs::new(&device, "Shadow Indirect Args");
         Ok(Self {
             device,
             queue,
@@ -786,6 +854,9 @@ impl Renderer {
             point_vertex_count: 0,
             meshes: HashMap::new(),
             mesh_arena: mesh_arena::MeshArena::new(),
+            multi_draw,
+            main_indirect,
+            shadow_indirect,
             clear_color: wgpu::Color { r: 0.1, g: 0.1, b: 0.15, a: 1.0 },
             skip_clear: false,
             clip_min: [0.0; 4],
@@ -906,6 +977,17 @@ impl Renderer {
         if let Some(m) = self.meshes.get_mut(id) {
             m.cull = cull;
         }
+    }
+
+    /// 一括描画（`multi_draw_indexed_indirect`）を使うか。デバイスに [`MULTI_DRAW_FEATURES`] が無ければ常に使わない。
+    /// 既定は使える限り使う（描画の結果は 1 メッシュ 1 命令と同じ。比べる試験で切り替える）
+    pub fn set_multi_draw(&mut self, on: bool) {
+        self.multi_draw = on && self.device.features().contains(MULTI_DRAW_FEATURES);
+    }
+
+    /// 一括描画を使っているか
+    pub fn multi_draw(&self) -> bool {
+        self.multi_draw
     }
 
     /// メッシュが登録済みか確認
@@ -1501,6 +1583,12 @@ impl Renderer {
         // インスタンスデータ書き込み
         let instance_size = std::mem::size_of::<InstanceData>() as u64;
         self.upload_instances(instances);
+        // 一括描画の一覧は描画 1 つに 1 件（インスタンスの数を超えない）。影は 4 カスケードぶん
+        if self.multi_draw {
+            let n = instances.len() as u64;
+            self.main_indirect.ensure(&self.device, n);
+            self.shadow_indirect.ensure(&self.device, n * crate::shadow::SHADOW_CASCADES as u64);
+        }
 
         // シャドウパス（有効時のみ、別エンコーダでsubmit）
         if self.shadow_enabled {
@@ -2322,6 +2410,8 @@ impl Renderer {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Shadow Render Encoder"),
             });
+            // 一括描画の一覧（全カスケードぶん・submit の前に書く）
+            let mut shadow_entries: Vec<IndirectEntry> = Vec::new();
 
             {
                 let mut shadow_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2367,6 +2457,45 @@ impl Renderer {
                     // インスタンスのバッファはカスケードの頭で 1 回つなぎ、範囲で選ぶ（本描画と同じ）
                     shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
                     let mut bound_page: Option<u32> = None;
+                    if self.multi_draw {
+                        // 一括描画: このカスケードの一覧を積み（全カスケードぶんを submit の前にまとめて書く）、
+                        // 同じページが続く区間ごとに 1 回で描く
+                        let mut segments: Vec<(u32, u32, u32)> = Vec::new(); // (ページ, 頭, 件数)
+                        let mut i = 0usize;
+                        while i < instances.len() {
+                            let mesh_id = &instances[i].0;
+                            let mut j = i + 1;
+                            while j < instances.len() && &instances[j].0 == mesh_id {
+                                j += 1;
+                            }
+                            if !self.shadow_exclude.contains(mesh_id.as_str()) {
+                                if let Some(mesh) = self.meshes.get(mesh_id) {
+                                    for (base, run) in visible_runs(&vis, i, j) {
+                                        match segments.last_mut() {
+                                            Some(g) if g.0 == mesh.slot.page => g.2 += 1,
+                                            _ => segments.push((mesh.slot.page, shadow_entries.len() as u32, 1)),
+                                        }
+                                        shadow_entries.push(indirect_entry(mesh, base, run));
+                                    }
+                                }
+                            }
+                            i = j;
+                        }
+                        for (page, first, count) in segments {
+                            if bound_page != Some(page) {
+                                let p = self.mesh_arena.page(page);
+                                shadow_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+                                shadow_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                                bound_page = Some(page);
+                            }
+                            shadow_pass.multi_draw_indexed_indirect(
+                                &self.shadow_indirect.buffer,
+                                first as u64 * INDIRECT_ENTRY_BYTES,
+                                count,
+                            );
+                        }
+                        continue;
+                    }
                     let mut i = 0usize;
                     while i < instances.len() {
                         let mesh_id = &instances[i].0;
@@ -2389,6 +2518,9 @@ impl Renderer {
                 }
             }
 
+            if !shadow_entries.is_empty() {
+                self.queue.write_buffer(&self.shadow_indirect.buffer, 0, bytemuck::cast_slice(&shadow_entries));
+            }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
     }
@@ -2398,6 +2530,7 @@ impl Renderer {
         ViewBinding {
             camera_bind_group: &self.camera_bind_group,
             instance_buffer: &self.instance_buffer,
+            indirect: self.multi_draw.then_some(&self.main_indirect.buffer),
             view_lines: None,
             lines_depth_tested: self.lines_depth_tested,
             line_chunks: self.default_line_chunks.clone(),
@@ -2535,6 +2668,10 @@ impl Renderer {
         //   つなぎ直していた（同じ属性を読むので描画結果は同じ）
         // - group 2 / 3 は直前と同じ bind group なら設定し直さない（テクスチャの無いメッシュはどれも同じ組）
         render_pass.set_vertex_buffer(1, b.instance_buffer.slice(..));
+        if let Some(indirect) = b.indirect {
+            self.draw_opaque_indirect(render_pass, indirect, instances, opaque_count, vis);
+            return;
+        }
         let mut bound_tex: Option<*const wgpu::BindGroup> = None;
         let mut bound_paint: Option<*const wgpu::BindGroup> = None;
         // 頂点・インデックスのページも、直前と同じならつなぎ直さない（1 メッシュ 1 命令＝draw_indexed だけ）
@@ -2568,6 +2705,75 @@ impl Renderer {
                 }
             }
             i = j;
+        }
+    }
+
+    /// [`Self::draw_opaque_meshes`] の一括描画版: 描く物の一覧（インデックスの範囲・base_vertex・インスタンスの範囲）を
+    /// 作ってバッファへ書き、同じページ・同じ bind group が続く区間ごとに `multi_draw_indexed_indirect` 1 回で描く。
+    /// 描く物と順番は 1 メッシュ 1 命令の経路と同じ（絵も同じ）。wgpu の検証が呼び出し 1 回で済む
+    fn draw_opaque_indirect<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        indirect: &'a wgpu::Buffer,
+        instances: &[(String, InstanceData)],
+        opaque_count: usize,
+        vis: &[bool],
+    ) {
+        let opaque = &instances[..opaque_count];
+        let mut entries: Vec<IndirectEntry> = Vec::new();
+        let mut segments: Vec<DrawSegment<'a>> = Vec::new();
+        let mut i = 0usize;
+        while i < opaque.len() {
+            let mesh_id = &opaque[i].0;
+            let mut j = i + 1;
+            while j < opaque.len() && &opaque[j].0 == mesh_id {
+                j += 1;
+            }
+            if let Some(mesh) = self.meshes.get(mesh_id) {
+                let tex = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
+                let paint = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
+                for (base, run) in visible_runs(vis, i, j) {
+                    let same = segments.last().is_some_and(|g| {
+                        g.page == mesh.slot.page
+                            && g.tex.is_some_and(|t| std::ptr::eq(t, tex))
+                            && g.paint.is_some_and(|p| std::ptr::eq(p, paint))
+                    });
+                    if same {
+                        segments.last_mut().unwrap().count += 1;
+                    } else {
+                        segments.push(DrawSegment {
+                            page: mesh.slot.page,
+                            tex: Some(tex),
+                            paint: Some(paint),
+                            first: entries.len() as u32,
+                            count: 1,
+                        });
+                    }
+                    entries.push(indirect_entry(mesh, base, run));
+                }
+            }
+            i = j;
+        }
+        if entries.is_empty() {
+            return;
+        }
+        self.queue.write_buffer(indirect, 0, bytemuck::cast_slice(&entries));
+        let mut bound: Option<&DrawSegment<'a>> = None;
+        for g in &segments {
+            let (tex, paint) = (g.tex.expect("本描画の区間"), g.paint.expect("本描画の区間"));
+            if !bound.is_some_and(|b| b.tex.is_some_and(|t| std::ptr::eq(t, tex))) {
+                render_pass.set_bind_group(2, tex, &[]);
+            }
+            if !bound.is_some_and(|b| b.paint.is_some_and(|p| std::ptr::eq(p, paint))) {
+                render_pass.set_bind_group(3, paint, &[]);
+            }
+            if !bound.is_some_and(|b| b.page == g.page) {
+                let p = self.mesh_arena.page(g.page);
+                render_pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            }
+            render_pass.multi_draw_indexed_indirect(indirect, g.first as u64 * INDIRECT_ENTRY_BYTES, g.count);
+            bound = Some(g);
         }
     }
 

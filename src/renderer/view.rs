@@ -219,6 +219,8 @@ impl Renderer {
         let b = ViewBinding {
             camera_bind_group: &view.camera_bind_group,
             instance_buffer: &view.instance_buffer,
+            // 追加のビューは 1 メッシュ 1 命令（ペインは小さく・一覧のバッファをビューごとに持たない）
+            indirect: None,
             view_lines: Some(&view.lines),
             lines_depth_tested: options.lines_depth_tested,
             line_chunks: options.line_chunks.clone(),
