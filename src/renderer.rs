@@ -37,9 +37,18 @@ pub enum RendererError {
 }
 
 /// メッシュインスタンス（GPUバッファ参照）
+///
+/// 頂点とインデックスは、ほかのメッシュと共有の大きなバッファ（ページ）の一部に置く（v0.5.0・描画命令を減らすため）。
+/// このメッシュの範囲だけを使うときは [`Self::vertex_slice`] / [`Self::index_slice`]（インデックスはメッシュの中の
+/// 番号なので、切り出した頂点の頭が 0 番になり、`draw_indexed(0..index_count, 0, ..)` で描ける）
 pub struct MeshInstance {
-    pub vertex_buffer: wgpu::Buffer,
-    pub index_buffer: wgpu::Buffer,
+    /// このメッシュのページの中の範囲
+    slot: mesh_arena::Slot,
+    /// ページのバッファ（共有）
+    vertex_page: wgpu::Buffer,
+    index_page: wgpu::Buffer,
+    /// 頂点の数（`vertex_slice` の長さ）
+    vertex_count: u32,
     pub index_count: u32,
     pub texture_id: Option<String>,
     /// 体表塗布マップの色id（group 3 で合成）。この id で「色+被覆 / 塗布時法線」を束ねた
@@ -50,6 +59,37 @@ pub struct MeshInstance {
     /// 視錐台カリングの対象にするか。**compute シェーダが頂点を直接書き換えるメッシュ**
     /// （GPU布など）は CPU 側の AABB が古くなるので false にすること（画面端で消える）。
     pub cull: bool,
+}
+
+impl MeshInstance {
+    /// このメッシュの頂点だけの切り出し（`set_vertex_buffer` に渡す）
+    pub fn vertex_slice(&self) -> wgpu::BufferSlice<'_> {
+        let b = mesh_arena::vertex_bytes();
+        let start = self.slot.base_vertex as u64 * b;
+        self.vertex_page.slice(start..start + self.vertex_count as u64 * b)
+    }
+
+    /// このメッシュのインデックスだけの切り出し（`set_index_buffer` に渡す・`Uint32`）
+    pub fn index_slice(&self) -> wgpu::BufferSlice<'_> {
+        let start = self.slot.first_index as u64 * 4;
+        self.index_page.slice(start..start + self.index_count as u64 * 4)
+    }
+
+    /// ページをつないだまま描くときの `draw_indexed` のインデックスの範囲と `base_vertex`
+    pub(crate) fn page_draw(&self) -> (std::ops::Range<u32>, i32) {
+        let f = self.slot.first_index;
+        (f..f + self.index_count, self.slot.base_vertex as i32)
+    }
+
+    /// このメッシュの頂点の範囲をストレージとしてつなぐとき（compute で頂点を書き換える）。オフセットは 256 バイト境界
+    pub fn vertex_binding(&self) -> wgpu::BufferBinding<'_> {
+        let b = mesh_arena::vertex_bytes();
+        wgpu::BufferBinding {
+            buffer: &self.vertex_page,
+            offset: self.slot.base_vertex as u64 * b,
+            size: std::num::NonZeroU64::new(self.vertex_count as u64 * b),
+        }
+    }
 }
 
 /// Splatクラウドのレンダリングインスタンス
@@ -249,6 +289,7 @@ struct ViewBinding<'a> {
     splats: bool,
 }
 
+mod mesh_arena;
 mod view;
 pub use view::{RenderView, RenderViewOptions};
 
@@ -319,6 +360,8 @@ pub struct Renderer {
     point_vertex_count: u32,
     // Meshes
     meshes: HashMap<String, MeshInstance>,
+    /// メッシュの頂点・インデックスを詰めるページ（`mesh_arena.rs`）
+    mesh_arena: mesh_arena::MeshArena,
     // State
     clear_color: wgpu::Color,
     /// trueの場合、render_to_viewでClearをスキップ（外部で事前描画済みの場合）
@@ -742,6 +785,7 @@ impl Renderer {
             point_vertex_buffer,
             point_vertex_count: 0,
             meshes: HashMap::new(),
+            mesh_arena: mesh_arena::MeshArena::new(),
             clear_color: wgpu::Color { r: 0.1, g: 0.1, b: 0.15, a: 1.0 },
             skip_clear: false,
             clip_min: [0.0; 4],
@@ -832,24 +876,21 @@ impl Renderer {
 
         let gpu_vertices: Vec<GpuVertex> = mesh.gpu_vertices();
 
-        let vertex_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("Vertex Buffer {}", id)),
-            contents: bytemuck::cast_slice(&gpu_vertices),
-            // STORAGE: GPUオンリー経路で compute シェーダが頂点を直接書き込めるように(readback廃止)。
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-        });
-
-        let index_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(&format!("Index Buffer {}", id)),
-            contents: bytemuck::cast_slice(&mesh.indices),
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        });
-
+        // 同じ id の前のメッシュの範囲は空きに戻す（置き換え）
         let cull = self.meshes.get(id).map_or(true, |m| m.cull);
+        if let Some(old) = self.meshes.remove(id) {
+            self.mesh_arena.free(&old.slot);
+        }
+        let slot = self.mesh_arena.alloc(&self.device, gpu_vertices.len() as u32, mesh.indices.len() as u32);
+        self.mesh_arena.write(&self.queue, &slot, &gpu_vertices, &mesh.indices);
+        let page = self.mesh_arena.page(slot.page);
+        let (vertex_page, index_page) = (page.vertex_buffer.clone(), page.index_buffer.clone());
         self.shadow_inputs_generation += 1;
         self.meshes.insert(id.to_string(), MeshInstance {
-            vertex_buffer,
-            index_buffer,
+            slot,
+            vertex_page,
+            index_page,
+            vertex_count: gpu_vertices.len() as u32,
             index_count: mesh.indices.len() as u32,
             texture_id,
             paint_texture_id: None,
@@ -940,43 +981,43 @@ impl Renderer {
                     .unwrap_or([1.0, 1.0, 1.0, 1.0]),
             })
             .collect();
-        let byte_size = (std::mem::size_of::<GpuVertex>() * gpu_vertices.len()) as u64;
-        let idx_size = (std::mem::size_of::<u32>() * mesh.indices.len()) as u64;
-
-        // 既存バッファに頂点・インデックスとも収まるなら再利用（GPU 確保を避ける）。
+        // 取ってある範囲に頂点・インデックスとも収まるなら書き直すだけ（GPU 確保を避ける）。
         // 重要: 縮小時はインデックスと index_count も更新しないと、旧トポロジで古い頂点を
         // 描き続けてメッシュが消えない（潰しメッシュで隠せない）。
         let reuse = self
             .meshes
             .get(id)
-            .map_or(false, |e| byte_size <= e.vertex_buffer.size() && idx_size <= e.index_buffer.size());
+            .is_some_and(|e| e.slot.fits(gpu_vertices.len() as u32, mesh.indices.len() as u32));
         if reuse {
             self.shadow_inputs_generation += 1;
-            {
-                let e = self.meshes.get(id).unwrap();
-                self.queue.write_buffer(&e.vertex_buffer, 0, bytemuck::cast_slice(&gpu_vertices));
-                self.queue.write_buffer(&e.index_buffer, 0, bytemuck::cast_slice(&mesh.indices));
-            }
+            let slot = self.meshes[id].slot;
+            self.mesh_arena.write(&self.queue, &slot, &gpu_vertices, &mesh.indices);
             let e = self.meshes.get_mut(id).unwrap();
+            e.vertex_count = gpu_vertices.len() as u32;
             e.index_count = mesh.indices.len() as u32;
             e.aabb = mesh_aabb(mesh); // 形が変わったら境界箱も追随（古いままだと消える）
             return;
         }
         let texture_id = self.meshes.get(id).and_then(|m| m.texture_id.clone());
-        self.meshes.remove(id);
+        if let Some(old) = self.meshes.remove(id) {
+            self.mesh_arena.free(&old.slot);
+        }
         self.add_mesh(id, mesh, texture_id);
     }
 
     /// メッシュを削除
     pub fn remove_mesh(&mut self, id: &str) {
         self.shadow_inputs_generation += 1;
-        self.meshes.remove(id);
+        if let Some(old) = self.meshes.remove(id) {
+            self.mesh_arena.free(&old.slot);
+        }
     }
 
     /// 全メッシュをクリア
     pub fn clear_meshes(&mut self) {
         self.shadow_inputs_generation += 1;
         self.meshes.clear();
+        self.mesh_arena.clear();
     }
 
     // ── カメラ ──
@@ -2325,6 +2366,7 @@ impl Renderer {
                     // （深度出力は不変・約2倍だった影の draw call をランレングス分削減）。
                     // インスタンスのバッファはカスケードの頭で 1 回つなぎ、範囲で選ぶ（本描画と同じ）
                     shadow_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+                    let mut bound_page: Option<u32> = None;
                     let mut i = 0usize;
                     while i < instances.len() {
                         let mesh_id = &instances[i].0;
@@ -2335,10 +2377,10 @@ impl Renderer {
                         // 除外指定(遠景板等)は影を落とさない＝シーン全体を覆う偽の影を防ぐ。
                         if !self.shadow_exclude.contains(mesh_id.as_str()) {
                             if let Some(mesh) = self.meshes.get(mesh_id) {
-                                shadow_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                                shadow_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                                self.bind_mesh_page(&mut shadow_pass, mesh, &mut bound_page);
+                                let (indices, base_vertex) = mesh.page_draw();
                                 for (base, run) in visible_runs(&vis, i, j) {
-                                    shadow_pass.draw_indexed(0..mesh.index_count, 0, base as u32..(base + run) as u32);
+                                    shadow_pass.draw_indexed(indices.clone(), base_vertex, base as u32..(base + run) as u32);
                                 }
                             }
                         }
@@ -2459,6 +2501,16 @@ impl Renderer {
         )
     }
 
+    /// メッシュのページ（頂点とインデックスのバッファ）をつなぐ。直前につないだページと同じなら何もしない
+    fn bind_mesh_page<'a>(&'a self, pass: &mut wgpu::RenderPass<'a>, mesh: &MeshInstance, bound: &mut Option<u32>) {
+        if *bound != Some(mesh.slot.page) {
+            let p = self.mesh_arena.page(mesh.slot.page);
+            pass.set_vertex_buffer(0, p.vertex_buffer.slice(..));
+            pass.set_index_buffer(p.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+            *bound = Some(mesh.slot.page);
+        }
+    }
+
     fn draw_opaque_meshes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -2485,6 +2537,8 @@ impl Renderer {
         render_pass.set_vertex_buffer(1, b.instance_buffer.slice(..));
         let mut bound_tex: Option<*const wgpu::BindGroup> = None;
         let mut bound_paint: Option<*const wgpu::BindGroup> = None;
+        // 頂点・インデックスのページも、直前と同じならつなぎ直さない（1 メッシュ 1 命令＝draw_indexed だけ）
+        let mut bound_page: Option<u32> = None;
         let opaque = &instances[..opaque_count];
         let mut i = 0usize;
         while i < opaque.len() {
@@ -2505,12 +2559,12 @@ impl Renderer {
                     render_pass.set_bind_group(3, paint_bg, &[]);
                     bound_paint = Some(paint_bg as *const _);
                 }
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                self.bind_mesh_page(render_pass, mesh, &mut bound_page);
+                let (indices, base_vertex) = mesh.page_draw();
                 // 視錐台外のインスタンスを飛ばす。ランの中で「連続して見える区間」だけを
                 // まとめて描く＝インスタンシングの統合を保ったまま間引ける。
                 for (base, run) in visible_runs(vis, i, j) {
-                    render_pass.draw_indexed(0..mesh.index_count, 0, base as u32..(base + run) as u32);
+                    render_pass.draw_indexed(indices.clone(), base_vertex, base as u32..(base + run) as u32);
                 }
             }
             i = j;
@@ -2557,6 +2611,7 @@ impl Renderer {
         }
         render_pass.set_pipeline(&self.depth_prepass_pipeline);
         render_pass.set_bind_group(0, b.camera_bind_group, &[]);
+        let mut bound_page: Option<u32> = None;
         for (i, (mesh_id, inst)) in instances[opaque_count..].iter().enumerate() {
             if inst.model_id != crate::MODEL_GLASS {
                 continue; // ガラス(誘電体透過)メッシュのみ深度先書き
@@ -2564,10 +2619,10 @@ impl Renderer {
             let idx = opaque_count + i;
             if let Some(mesh) = self.meshes.get(mesh_id) {
                 let offset = idx as u64 * instance_size;
-                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                self.bind_mesh_page(render_pass, mesh, &mut bound_page);
                 render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
-                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                let (indices, base_vertex) = mesh.page_draw();
+                render_pass.draw_indexed(indices, base_vertex, 0..1);
             }
         }
     }
@@ -2587,6 +2642,7 @@ impl Renderer {
         // パイプライン切り替えコストを抑えるため、直前のモードを覚えておく。
         // 0=未設定 / 1=transparent / 2=refraction
         let mut cur_mode = 0u8;
+        let mut bound_page: Option<u32> = None;
 
         for (i, (mesh_id, _)) in instances[opaque_count..].iter().enumerate() {
             let idx = opaque_count + i;
@@ -2612,20 +2668,20 @@ impl Renderer {
                 if is_refr {
                     // 屈折パイプラインは group2 を scene_color に占有済み。group3 は使わない。
                     let offset = idx as u64 * instance_size;
-                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    self.bind_mesh_page(render_pass, mesh, &mut bound_page);
                     render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
-                    render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    let (indices, base_vertex) = mesh.page_draw();
+                    render_pass.draw_indexed(indices, base_vertex, 0..1);
                 } else {
                     let tex_bind_group = self.texture_manager.get_bind_group(mesh.texture_id.as_deref());
                     render_pass.set_bind_group(2, tex_bind_group, &[]);
                     let paint_bg = self.texture_manager.get_paint_bind_group(mesh.paint_texture_id.as_deref());
                     render_pass.set_bind_group(3, paint_bg, &[]);
                     let offset = idx as u64 * instance_size;
-                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    self.bind_mesh_page(render_pass, mesh, &mut bound_page);
                     render_pass.set_vertex_buffer(1, b.instance_buffer.slice(offset..));
-                    render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+                    let (indices, base_vertex) = mesh.page_draw();
+                    render_pass.draw_indexed(indices, base_vertex, 0..1);
                 }
             }
         }
