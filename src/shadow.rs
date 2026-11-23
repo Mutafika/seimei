@@ -92,8 +92,8 @@ pub fn create_shadow_pipeline(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Shadow Pipeline Layout"),
-        bind_group_layouts: &[light_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(light_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -102,7 +102,7 @@ pub fn create_shadow_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            buffers: &[Some(GpuVertex::layout()), Some(InstanceData::layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: None,
@@ -114,8 +114,8 @@ pub fn create_shadow_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState {
                 constant: 2,
@@ -124,7 +124,7 @@ pub fn create_shadow_pipeline(
             },
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 

@@ -200,8 +200,8 @@ impl DofPass {
         });
         let coc_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("CoC Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
         let coc_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("CoC Pipeline"),
@@ -228,7 +228,7 @@ impl DofPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -270,8 +270,8 @@ impl DofPass {
         });
         let blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Bokeh Blur Pipeline Layout"),
-            bind_group_layouts: &[&blur_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&blur_bgl)],
+            immediate_size: 0,
         });
         let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Bokeh Blur Pipeline"),
@@ -298,7 +298,7 @@ impl DofPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

@@ -165,10 +165,10 @@ fn frustum_planes(vp: glam::Mat4) -> [glam::Vec4; 6] {
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2]
 }
 
-/// インスタンスが視錐台に掛かるか。model 行列でローカル AABB を世界へ移してから判定する。
-/// 一括描画に要るデバイスの機能（Apple の GPU・Vulkan・DX12 にある。WebGPU には無い）
-pub const MULTI_DRAW_FEATURES: wgpu::Features =
-    wgpu::Features::MULTI_DRAW_INDIRECT.union(wgpu::Features::INDIRECT_FIRST_INSTANCE);
+/// 一括描画に要るデバイスの機能。wgpu 30 で `MULTI_DRAW_INDIRECT` は無くなり、一括描画そのものは
+/// 間接描画ができる所ならどこでも使える (ネイティブに無い所では wgpu が 1 命令ずつに展開する)。
+/// 残る条件は、インスタンスの番号を間接描画の引数で渡せること。WebGL2 には無いので、そこでは使わない。
+pub const MULTI_DRAW_FEATURES: wgpu::Features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
 
 /// `DrawIndexedIndirectArgs` と同じ並び（index_count, instance_count, first_index, base_vertex, first_instance）
 type IndirectEntry = [u32; 5];
@@ -245,6 +245,7 @@ impl KeyHasher {
     }
 }
 
+/// インスタンスが視錐台に掛かるか。model 行列でローカル AABB を世界へ移してから判定する。
 fn instance_visible(planes: &[glam::Vec4; 6], model: &[[f32; 4]; 4], aabb: &[[f32; 3]; 2]) -> bool {
     let m = glam::Mat4::from_cols_array_2d(model);
     let lo = glam::Vec3::from(aabb[0]);
@@ -422,7 +423,7 @@ pub struct Renderer {
     /// メッシュの頂点・インデックスを詰めるページ（`mesh_arena.rs`）
     mesh_arena: mesh_arena::MeshArena,
     /// 一括描画（`multi_draw_indexed_indirect`・first_instance つき）を使うか。デバイスに
-    /// `MULTI_DRAW_INDIRECT | INDIRECT_FIRST_INSTANCE` があるときだけ true にできる（[`Self::set_multi_draw`]）
+    /// [`MULTI_DRAW_FEATURES`] があるときだけ true にできる（[`Self::set_multi_draw`]）
     multi_draw: bool,
     /// 一括描画の一覧（既定のビューの不透明・影の深度パス）
     main_indirect: IndirectArgs,
@@ -1664,6 +1665,7 @@ impl Renderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: render_view,
                         resolve_target: resolve,
+                        depth_slice: None,
                         ops: wgpu::Operations { load: color_load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1673,6 +1675,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 self.draw_opaque_meshes(&mut pass, &b, instances, opaque_count, &vis);
@@ -1712,6 +1715,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 self.draw_depth_prepass(&mut pass, &b, instances, opaque_count, instance_size);
             }
@@ -1723,6 +1727,7 @@ impl Renderer {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: render_view,
                         resolve_target: resolve,
+                        depth_slice: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1732,6 +1737,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 self.draw_transparent_meshes(&mut pass, &b, instances, opaque_count, instance_size, true);
             }
@@ -1742,6 +1748,7 @@ impl Renderer {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: render_view,
                     resolve_target: resolve,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: color_load,
                         store: wgpu::StoreOp::Store,
@@ -1757,6 +1764,7 @@ impl Renderer {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             self.draw_meshes(&mut render_pass, &b, instances, opaque_count, instance_size, &vis);
@@ -2004,12 +2012,16 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Rendering(format!("GPU の完了待ちに失敗: {e}")))?;
         rx.recv()
             .map_err(|e| RendererError::Rendering(format!("Buffer map recv error: {e}")))?
             .map_err(|e| RendererError::Rendering(format!("Buffer map error: {e}")))?;
 
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| RendererError::Rendering(format!("読み戻しの範囲を取れない: {e}")))?;
         let color_format = self.surface_format;
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for row in 0..height {
@@ -2065,13 +2077,17 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        device.poll(wgpu::Maintain::Wait);
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Rendering(format!("GPU の完了待ちに失敗: {e}")))?;
         rx.recv()
             .map_err(|e| RendererError::Rendering(format!("深度の map 受信に失敗: {e}")))?
             .map_err(|e| RendererError::Rendering(format!("深度の map に失敗: {e}")))?;
 
         let (near, far) = ((camera.near as f32).max(1e-6), camera.far as f32);
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| RendererError::Rendering(format!("読み戻しの範囲を取れない: {e}")))?;
         let mut linear = Vec::with_capacity((width * height) as usize);
         for row in 0..height {
             let start = (row * padded_row) as usize;
@@ -2427,6 +2443,7 @@ impl Renderer {
                     }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
 
                 shadow_pass.set_pipeline(shadow_pipeline);

@@ -16,12 +16,11 @@ default = ["gltf"]
 gltf = ["dep:gltf", "dep:image"]
 splat = []
 post-process = []
-egui = ["dep:egui", "dep:egui-wgpu"]
 
 [dependencies]
 # 幾何プリミティブ。wgpu 非依存で、型だけ欲しい利用者はこれ単体を引ける。
 seimei-math = { path = "crates/seimei-math" }
-wgpu = { version = "24", features = ["webgl"] }
+wgpu = { version = "30", features = ["webgl"] }
 glam = "0.29"
 bytemuck = { version = "1", features = ["derive"] }
 thiserror = "2.0"
@@ -33,12 +32,10 @@ half = "2.4"
 # optional
 gltf = { version = "1.4", features = ["extras", "names", "extensions"], optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"], optional = true }
-egui = { version = "0.31", optional = true }
-egui-wgpu = { version = "0.31", optional = true }
 
 [dev-dependencies]
 # WGSL をテスト時に検証する（シェーダは実行時までコンパイルされないので、
 # これが無いと構文エラーが「起動したら真っ黒」として出てくる）。
-naga = { version = "24", features = ["wgsl-in"] }
+naga = { version = "30", features = ["wgsl-in"] }
 # GPU を使うテスト（tests/wide_lines_gpu.rs）で wgpu の async を待つ
 pollster = "0.4"
