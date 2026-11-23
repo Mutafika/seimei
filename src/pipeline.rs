@@ -62,8 +62,8 @@ pub fn create_depth_prepass_pipeline(
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Depth Prepass Layout"),
-        bind_group_layouts: &[camera_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bind_group_layout)],
+        immediate_size: 0,
     });
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("Depth Prepass Pipeline"),
@@ -71,7 +71,7 @@ pub fn create_depth_prepass_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            buffers: &[Some(GpuVertex::layout()), Some(InstanceData::layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: None, // 色出力なし＝深度だけ書く
@@ -86,8 +86,8 @@ pub fn create_depth_prepass_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -96,7 +96,7 @@ pub fn create_depth_prepass_pipeline(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     Ok(pipeline)
@@ -224,8 +224,8 @@ pub fn create_splat_pipeline(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Splat Pipeline Layout"),
-        bind_group_layouts: &[camera_bind_group_layout, splat_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bind_group_layout), Some(splat_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -269,13 +269,13 @@ pub fn create_splat_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare: wgpu::CompareFunction::Less,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -303,11 +303,11 @@ pub fn create_refraction_pipeline(
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("Refraction Pipeline Layout"),
         bind_group_layouts: &[
-            camera_bind_group_layout,
-            light_bind_group_layout,
-            scene_color_bind_group_layout,
+            Some(camera_bind_group_layout),
+            Some(light_bind_group_layout),
+            Some(scene_color_bind_group_layout),
         ],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -316,7 +316,7 @@ pub fn create_refraction_pipeline(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            buffers: &[Some(GpuVertex::layout()), Some(InstanceData::layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -340,8 +340,8 @@ pub fn create_refraction_pipeline(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false, // 半透明と同じく深度書き込みなし
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_write_enabled: Some(false), // 半透明と同じく深度書き込みなし
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState {
                 constant: -2,
@@ -354,7 +354,7 @@ pub fn create_refraction_pipeline(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -554,8 +554,8 @@ fn create_wide_line_pipeline_impl(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[camera_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bind_group_layout)],
+        immediate_size: 0,
     });
 
     // 深度は 1px の線と揃える: 書かない。判定なしは常に通す・ありは LessEqual
@@ -570,7 +570,7 @@ fn create_wide_line_pipeline_impl(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some(entry_point),
-            buffers: &[LineVertex::wide_layout()],
+            buffers: &[Some(LineVertex::wide_layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -590,8 +590,8 @@ fn create_wide_line_pipeline_impl(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: false,
-            depth_compare,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -600,7 +600,7 @@ fn create_wide_line_pipeline_impl(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -630,12 +630,12 @@ fn create_main_pipeline_impl(
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
         bind_group_layouts: &[
-            camera_bind_group_layout,
-            light_bind_group_layout, // group 1 = ライト uniform ＋ 影(深度tex/比較sampler/ライトVP)
-            texture_bind_group_layout,
-            paint_bind_group_layout, // group 3 = 体表塗布(色+被覆 / 塗布時法線 の2tex束)
+            Some(camera_bind_group_layout),
+            Some(light_bind_group_layout), // group 1 = ライト uniform ＋ 影(深度tex/比較sampler/ライトVP)
+            Some(texture_bind_group_layout),
+            Some(paint_bind_group_layout), // group 3 = 体表塗布(色+被覆 / 塗布時法線 の2tex束)
         ],
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -644,7 +644,7 @@ fn create_main_pipeline_impl(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some("vs_main"),
-            buffers: &[GpuVertex::layout(), InstanceData::layout()],
+            buffers: &[Some(GpuVertex::layout()), Some(InstanceData::layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -668,10 +668,10 @@ fn create_main_pipeline_impl(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: depth_write,
+            depth_write_enabled: Some(depth_write),
             // LessEqual: 同深度で後勝ち。VRMのBody→服のように同位置で重なる
             // メッシュを描画順で上書きできるようにする。
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            depth_compare: Some(wgpu::CompareFunction::LessEqual),
             stencil: wgpu::StencilState::default(),
             bias: if depth_write {
                 wgpu::DepthBiasState::default()
@@ -689,7 +689,7 @@ fn create_main_pipeline_impl(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 
@@ -735,8 +735,8 @@ fn create_line_pipeline_impl(
 
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
-        bind_group_layouts: &[camera_bind_group_layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(camera_bind_group_layout)],
+        immediate_size: 0,
     });
 
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -745,7 +745,7 @@ fn create_line_pipeline_impl(
         vertex: wgpu::VertexState {
             module: &shader,
             entry_point: Some(entry_point),
-            buffers: &[LineVertex::layout()],
+            buffers: &[Some(LineVertex::layout())],
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -764,8 +764,8 @@ fn create_line_pipeline_impl(
         },
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: depth_write,
-            depth_compare,
+            depth_write_enabled: Some(depth_write),
+            depth_compare: Some(depth_compare),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -774,7 +774,7 @@ fn create_line_pipeline_impl(
             mask: !0,
             alpha_to_coverage_enabled: false,
         },
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
 

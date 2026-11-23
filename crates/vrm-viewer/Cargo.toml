@@ -12,8 +12,8 @@ path = "src/main.rs"
 [dependencies]
 seimei = { path = "../.." }
 vrm-seimei = { path = "../vrm-seimei" } # VrmAvatar + AvatarController (the live-avatar driver)
-# Same Sabitori tag mearie pins — its `SceneApp` composites seimei's 3D render with a
+# its `SceneApp` composites seimei's 3D render with a
 # declarative UI overlay (the exact path mearie's persona will use).
-sabitori = { git = "https://github.com/Mutafika/sabitori.git", tag = "v0.1.5" }
-wgpu = "24"
+sabitori = { git = "https://github.com/Mutafika/sabitori.git", tag = "v0.63.0" }
+wgpu = "30"
 glam = "0.29"

@@ -239,6 +239,7 @@ impl Renderer {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target,
                 resolve_target: resolve,
+                depth_slice: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(options.clear_color), store: wgpu::StoreOp::Store },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -248,6 +249,7 @@ impl Renderer {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         let instance_size = std::mem::size_of::<InstanceData>() as u64;
         self.draw_meshes(&mut pass, &b, instances, opaque_count, instance_size, &vis);
@@ -305,12 +307,16 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |r| {
             let _ = tx.send(r);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|e| RendererError::Rendering(format!("GPU の完了待ちに失敗: {e}")))?;
         rx.recv()
             .map_err(|e| RendererError::Rendering(format!("Buffer map recv error: {e}")))?
             .map_err(|e| RendererError::Rendering(format!("Buffer map error: {e}")))?;
 
-        let data = slice.get_mapped_range();
+        let data = slice
+            .get_mapped_range()
+            .map_err(|e| RendererError::Rendering(format!("読み戻しの範囲を取れない: {e}")))?;
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         let encode_srgb = self.surface_format.is_srgb();
         for row in 0..height {

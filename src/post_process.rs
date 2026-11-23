@@ -226,8 +226,8 @@ impl SsaoPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("SSAO Pipeline Layout"),
-            bind_group_layouts: &[camera_bind_group_layout, &bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(camera_bind_group_layout), Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -255,7 +255,7 @@ impl SsaoPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -294,8 +294,8 @@ impl SsaoPass {
         let blur_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("SSAO Blur Pipeline Layout"),
-                bind_group_layouts: &[&blur_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&blur_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let blur_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -323,7 +323,7 @@ impl SsaoPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -407,6 +407,7 @@ impl SsaoPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.ssao_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: wgpu::StoreOp::Store,
@@ -415,6 +416,7 @@ impl SsaoPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, camera_bind_group, &[]);
@@ -444,6 +446,7 @@ impl SsaoPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.blurred_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                         store: wgpu::StoreOp::Store,
@@ -452,6 +455,7 @@ impl SsaoPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.blur_pipeline);
             pass.set_bind_group(0, &blur_bind_group, &[]);
@@ -521,8 +525,8 @@ impl EdgeBevelPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Edge Bevel Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -550,7 +554,7 @@ impl EdgeBevelPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -612,6 +616,7 @@ impl EdgeBevelPass {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.bevel_view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                     store: wgpu::StoreOp::Store,
@@ -620,6 +625,7 @@ impl EdgeBevelPass {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
@@ -677,8 +683,8 @@ impl BloomPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Bloom Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // 使用するフォーマット: Rgba16Float(HDR)
@@ -709,7 +715,7 @@ impl BloomPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -738,7 +744,7 @@ impl BloomPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -774,7 +780,7 @@ impl BloomPass {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -872,6 +878,7 @@ impl BloomPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.mip_textures[0].1,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -880,6 +887,7 @@ impl BloomPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.extract_pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -908,6 +916,7 @@ impl BloomPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.mip_textures[i].1,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -916,6 +925,7 @@ impl BloomPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.downsample_pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -944,6 +954,7 @@ impl BloomPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.mip_textures[i].1,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load, // 加算
                         store: wgpu::StoreOp::Store,
@@ -952,6 +963,7 @@ impl BloomPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.upsample_pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -1088,8 +1100,8 @@ impl PixelArtPass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PixelArt Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         // 3エントリポイント（fs_pixel_art / fs_dot_lo / fs_dot_up）を同レイアウト・同フォーマットで。
@@ -1119,7 +1131,7 @@ impl PixelArtPass {
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             })
         };
@@ -1248,6 +1260,7 @@ impl PixelArtPass {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.lores_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
@@ -1256,6 +1269,7 @@ impl PixelArtPass {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 pass.set_pipeline(&self.pipeline_lo);
                 pass.set_viewport(0.0, 0.0, vw, vh, 0.0, 1.0);
@@ -1270,6 +1284,7 @@ impl PixelArtPass {
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: output_view,
                         resolve_target: None,
+                        depth_slice: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
@@ -1278,6 +1293,7 @@ impl PixelArtPass {
                     depth_stencil_attachment: None,
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 pass.set_pipeline(&self.pipeline_up);
                 pass.set_bind_group(0, &bg, &[]);
@@ -1291,6 +1307,7 @@ impl PixelArtPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: output_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -1299,6 +1316,7 @@ impl PixelArtPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -1463,8 +1481,8 @@ impl PostProcessPipeline {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Composite Pipeline Layout"),
                 // group0=合成テクスチャ群, group1=camera(グレード強度 fx_params.z 用)。
-                bind_group_layouts: &[&composite_bind_group_layout, camera_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&composite_bind_group_layout), Some(camera_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let composite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1492,7 +1510,7 @@ impl PostProcessPipeline {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1508,7 +1526,7 @@ impl PostProcessPipeline {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -1543,8 +1561,8 @@ impl PostProcessPipeline {
         let fxaa_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("FXAA Pipeline Layout"),
-                bind_group_layouts: &[&fxaa_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&fxaa_bind_group_layout)],
+                immediate_size: 0,
             });
 
         let fxaa_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1572,7 +1590,7 @@ impl PostProcessPipeline {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -1668,6 +1686,7 @@ impl PostProcessPipeline {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &dummy_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
@@ -1676,6 +1695,7 @@ impl PostProcessPipeline {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         let dummy_view = dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1699,6 +1719,7 @@ impl PostProcessPipeline {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &bv,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
@@ -1707,6 +1728,7 @@ impl PostProcessPipeline {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
         }
         let black_dummy_view = black_dummy_tex.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1782,6 +1804,7 @@ impl PostProcessPipeline {
                     // FXAA中間テクスチャへ描画（最終出力はFXAAパスが行う）
                     view: &self.fxaa_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -1790,6 +1813,7 @@ impl PostProcessPipeline {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.composite_pipeline);
             pass.set_bind_group(0, &composite_bg, &[]);
@@ -1827,6 +1851,7 @@ impl PostProcessPipeline {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
                 resolve_target: None,
+                depth_slice: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                     store: wgpu::StoreOp::Store,
@@ -1835,6 +1860,7 @@ impl PostProcessPipeline {
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         fxaa_pass.set_pipeline(&self.fxaa_pipeline);
         fxaa_pass.set_bind_group(0, &fxaa_bg, &[]);

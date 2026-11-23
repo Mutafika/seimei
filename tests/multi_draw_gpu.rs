@@ -12,15 +12,14 @@ const W: u32 = 320;
 const H: u32 = 200;
 
 fn renderer() -> Option<Renderer> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     if !adapter.features().contains(MULTI_DRAW_FEATURES) {
         eprintln!("一括描画の機能が無い");
         return None;
     }
     let (device, queue) = pollster::block_on(adapter.request_device(
         &wgpu::DeviceDescriptor { required_features: MULTI_DRAW_FEATURES, ..Default::default() },
-        None,
     ))
     .ok()?;
     let mut r = Renderer::new(Arc::new(device), Arc::new(queue), wgpu::TextureFormat::Rgba8Unorm, W, H).ok()?;

@@ -16,7 +16,6 @@ UI-agnostic 3D rendering library — wgpu + glam.
 - プロシージャルメッシュ生成（terrain / water plane / rock）
 - ポストプロセス（SSAO / Bloom / DOF / SSR / EdgeBevel）
 - Gaussian Splatting（PLY ロード対応、`splat` feature）
-- 任意の egui 統合（`egui` feature）
 
 ## Usage
 
@@ -37,7 +36,7 @@ seimei = { git = "https://github.com/Mutafika/seimei", rev = "<commit-hash>" }
 ### Features
 
 ```toml
-seimei = { git = "...", default-features = false, features = ["gltf", "egui"] }
+seimei = { git = "...", default-features = false, features = ["gltf", "splat"] }
 ```
 
 | Feature        | Default | 内容                                     |
@@ -45,12 +44,11 @@ seimei = { git = "...", default-features = false, features = ["gltf", "egui"] }
 | `gltf`         | ✅      | glTF メッシュロード                      |
 | `splat`        |         | Gaussian Splatting レンダリング          |
 | `post-process` |         | ポストプロセスパス                       |
-| `egui`         |         | egui-wgpu 統合                           |
 
 ## Requirements
 
 - Rust edition 2024
-- wgpu 24
+- wgpu 30（`Renderer::new` に渡す `Device` / `Queue` は、利用側でも同じ版の wgpu で作る）
 
 ## License
 

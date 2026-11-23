@@ -174,8 +174,8 @@ impl SkyPass {
     ) -> wgpu::RenderPipeline {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(label),
-            bind_group_layouts: layouts,
-            push_constant_ranges: &[],
+            bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(),
+            immediate_size: 0,
         });
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
@@ -204,7 +204,7 @@ impl SkyPass {
             // 背景なので深度は持たない（テストも書き込みもしない）。後段のメッシュが素直に上へ乗る。
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     }
@@ -271,6 +271,7 @@ impl SkyPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.cloud_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
@@ -279,6 +280,7 @@ impl SkyPass {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             p.set_pipeline(&self.cloud_pipeline);
             p.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -290,11 +292,13 @@ impl SkyPass {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             p.set_pipeline(&self.bg_pipeline);
             p.set_bind_group(0, &self.uniform_bind_group, &[]);

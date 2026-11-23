@@ -23,12 +23,12 @@ struct Gpu {
 }
 
 fn gpu() -> Option<Gpu> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     // 一括描画の機能があれば頼む（無ければ 1 メッシュ 1 命令だけ測る）
     let features = adapter.features() & MULTI_DRAW_FEATURES;
     let (device, queue) = pollster::block_on(
-        adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }, None),
+        adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }),
     )
     .ok()?;
     Some(Gpu { device: Arc::new(device), queue: Arc::new(queue) })
@@ -125,7 +125,7 @@ fn measure(g: &Gpu, n: usize, distinct: bool, shadow: Shadow, multi: bool) -> (f
         let t1 = Instant::now();
         g.queue.submit(std::iter::once(enc.finish()));
         let t2 = Instant::now();
-        g.device.poll(wgpu::Maintain::Wait);
+        g.device.poll(wgpu::PollType::wait_indefinitely()).expect("GPU の完了待ち");
         let t3 = Instant::now();
         if frame >= 2 {
             rec.push((t1 - t0).as_secs_f64() * 1000.0);

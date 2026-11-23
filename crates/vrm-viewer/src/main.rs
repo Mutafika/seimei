@@ -105,11 +105,12 @@ impl ViewerApp {
 
     /// A labelled control button with an id.
     fn btn(id: &str, label: impl Into<String>) -> Element {
+        let label: String = label.into();
         button(label).id(id)
     }
 
     /// Build the bottom control bar (declarative UI, painted over the 3D scene).
-    fn control_bar(&self) -> Element {
+    fn control_bar(&self, ctx: &ViewContext) -> Element {
         let surface = Color::from_hex("#1a1b26");
         let text_c = Color::from_hex("#c0caf5");
         let field_bg = Color::from_hex("#414868");
@@ -147,26 +148,22 @@ impl ViewerApp {
         face.push(Self::btn("blink", format!("Blink: {}", onoff(blink))));
         let row2 = div().flex_row().gap(6.0).items_center().children(face);
 
-        // Row 3: lip-sync text box + Speak.
-        let say_text = if self.say.text.is_empty() {
-            "type Japanese or romaji…".to_string()
-        } else {
-            self.say.text.clone()
+        // Row 3: lip-sync text box + Speak. The field handles keys / IME / caret by itself
+        // once it is in the view.
+        let say_style = TextInputStyle {
+            bg: field_bg,
+            border: border_c,
+            text: text_c,
+            placeholder: border_c,
+            font_size: 13.0,
+            radius: 4.0,
+            padding: 8.0,
+            focus_border: Some(primary),
+            ..TextInputStyle::default_dark()
         };
-        let say_color = if self.say.text.is_empty() { border_c } else { text_c };
         let row3 = div().flex_row().gap(6.0).items_center().children([
             text("Say:").font_size(13.0).color(text_c),
-            div()
-                .id("say")
-                .w(Px(280.0))
-                .h(Px(28.0))
-                .bg(field_bg)
-                .rounded_px(4.0)
-                .px_pad(Px(8.0))
-                .items_center()
-                .flex_row()
-                .border(1.0, border_c)
-                .children([text(say_text).font_size(13.0).color(say_color)]),
+            div().w(Px(280.0)).children([text_input(ctx, "say", &self.say, &say_style)]),
             Self::btn("speak", "Speak"),
         ]);
 
@@ -195,7 +192,7 @@ impl DeclarativeApp for ViewerApp {
             .h(Px(ctx.height))
             .flex_col()
             .justify_end()
-            .children([self.control_bar()])
+            .children([self.control_bar(ctx)])
     }
 
     fn on_click(&mut self, id: &str) {
@@ -225,34 +222,12 @@ impl DeclarativeApp for ViewerApp {
             }
             "neutral" => c.clear_face(),
             "blink" => c.toggle_auto_blink(),
-            "speak" => c.say(&self.say.text),
+            "speak" => c.say(&self.say.text()),
             other => {
                 if let Some((_, _, p)) = EXPRS.iter().find(|(i, _, _)| *i == other) {
                     c.set_emotion(*p);
                 }
             }
-        }
-    }
-
-    fn on_focused_input(&mut self, id: &str, event: &InputEvent) -> bool {
-        if id != "say" {
-            return false;
-        }
-        match event {
-            InputEvent::CharInput(ch) => {
-                self.say.on_char(*ch);
-                true
-            }
-            InputEvent::KeyInput { key, pressed: true, modifiers } => self.say.on_key(*key, *modifiers),
-            InputEvent::ImePreedit { text, cursor } => {
-                self.say.on_ime_preedit(text.clone(), *cursor);
-                true
-            }
-            InputEvent::ImeCommit { text } => {
-                self.say.on_ime_commit(text);
-                true
-            }
-            _ => false,
         }
     }
 
